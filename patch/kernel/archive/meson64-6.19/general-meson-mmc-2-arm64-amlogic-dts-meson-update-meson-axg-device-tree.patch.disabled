@@ -36,9 +36,5 @@ index 111111111111..222222222222 100644
  				clock-names = "core", "clkin0", "clkin1";
  				resets = <&reset RESET_SD_EMMC_C>;
 +				amlogic,mmc-phase = <CLK_PHASE_270 CLK_PHASE_0 CLK_PHASE_0>;
- 			};
  
- 			nfc: nand-controller@7800 {
--- 
-Armbian
-
+ 				assigned-clocks = <&clkc CLKID_SD_EMMC_C_CLK0>;
