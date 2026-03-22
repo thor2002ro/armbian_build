@@ -513,7 +513,7 @@ function armbian_kernel_config__enable_various_filesystems() {
 	opts_m+=("F2FS_FS")            # Flash-Friendly FS - module, like btrfs (armbian-install root option)
 	opts_y+=("F2FS_FS_XATTR")      # Extended attributes for f2fs (F2FS_FS_SECURITY depends on it)
 	opts_y+=("F2FS_FS_SECURITY")   # Enables security extensions for f2fs
-	opts_m+=("EROFS_FS")           # Enhanced Read-Only FS (useful for Docker images)
+	opts_y+=("EROFS_FS")           # Enhanced Read-Only FS (useful for Docker images)
 }
 
 # Enables SMB/CIFS file sharing as modules: the client and the ksmbd server.
@@ -598,7 +598,7 @@ function armbian_kernel_config__enable_docker_support() {
 	opts_y+=("NETDEVICES")        # Enables support for network devices
 	# Namespace support
 	opts_y+=("NAMESPACES") # Enables support for namespaces (including network namespaces)
-	opts_m+=("OVERLAY_FS") # Enables support for OverlayFS
+	opts_y+=("OVERLAY_FS") # Enables support for OverlayFS
 	opts_y+=("PID_NS")     # Enables PID (Process ID) namespace support
 	# POSIX messaging
 	opts_y+=("POSIX_MQUEUE")    # Enables POSIX message queues support
