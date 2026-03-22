@@ -505,7 +505,7 @@ function armbian_kernel_config__enable_netfilter_xtables_legacy() {
 #   F2FS_FS_XATTR      - Extended attributes for f2fs (required by F2FS_FS_SECURITY)
 #   F2FS_FS_SECURITY   - Security extensions for f2fs
 function armbian_kernel_config__enable_various_filesystems() {
-	opts_m+=("BTRFS_FS")           # Enables Btrfs filesystem (copy-on-write, snapshots)
+	opts_y+=("BTRFS_FS")           # Enables Btrfs filesystem (copy-on-write, snapshots)
 	opts_y+=("BTRFS_FS_POSIX_ACL") # Enables POSIX ACL support for Btrfs
 	opts_y+=("EXT4_FS")            # Enables ext4 filesystem support
 	opts_y+=("EXT4_FS_POSIX_ACL")  # Enables POSIX ACL support for ext4
