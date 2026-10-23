@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] arm64: dts: allwinner: enable Zero 3 GPU DVFS and cooling
+
+Use the existing 306-600 MHz GPU operating points.
+Throttle the GPU at 85C before the existing critical shutdown trip.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/arch/arm64/boot/dts/allwinner/sun50i-h618-orangepi-zero3.dts b/arch/arm64/boot/dts/allwinner/sun50i-h618-orangepi-zero3.dts
+--- a/arch/arm64/boot/dts/allwinner/sun50i-h618-orangepi-zero3.dts
++++ b/arch/arm64/boot/dts/allwinner/sun50i-h618-orangepi-zero3.dts
+@@ -7,10 +7,30 @@
+ 
+ #include "sun50i-h616-orangepi-zero.dtsi"
+ #include "sun50i-h616-cpu-opp.dtsi"
++#include "sun50i-h616-gpu-opp.dtsi"
+ 
+ / {
+ 	model = "OrangePi Zero3";
+ 	compatible = "xunlong,orangepi-zero3", "allwinner,sun50i-h618";
++
++	thermal-zones {
++		gpu-thermal {
++			trips {
++				gpu_target: gpu-target {
++					temperature = <85000>;
++					hysteresis = <2000>;
++					type = "passive";
++				};
++			};
++
++			cooling-maps {
++				map0 {
++					trip = <&gpu_target>;
++					cooling-device = <&gpu THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
++				};
++			};
++		};
++	};
+ };
+ 
+ &ahub {
+@@ -34,6 +54,7 @@
+ };
+ 
+ &gpu {
++	#cooling-cells = <2>;
+ 	mali-supply = <&reg_dcdc1>;
+ 	status = "okay";
+ };
