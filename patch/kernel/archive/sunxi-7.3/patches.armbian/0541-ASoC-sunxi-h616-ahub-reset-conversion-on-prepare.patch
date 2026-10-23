@@ -1,0 +1,19 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] ASoC: sunxi: h616-ahub: reset IEC958 conversion on prepare
+
+Convert the first playback samples after prepare and underrun recovery.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/sound/soc/sunxi/sun50i-h616-ahub.c b/sound/soc/sunxi/sun50i-h616-ahub.c
+--- a/sound/soc/sunxi/sun50i-h616-ahub.c
++++ b/sound/soc/sunxi/sun50i-h616-ahub.c
+@@ -763,6 +763,7 @@
+ 	u32 enable;
+ 
+ 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
++		sdai->hdmi_appl = 0;
+ 		regmap_update_bits(ahub->regmap,
+ 				   SUN50I_AHUB_APBIF_TX_FIFO_CTRL_REG(sdai->apbif),
+ 				   SUN50I_AHUB_APBIF_TX_FIFO_CTRL_FLUSH,
