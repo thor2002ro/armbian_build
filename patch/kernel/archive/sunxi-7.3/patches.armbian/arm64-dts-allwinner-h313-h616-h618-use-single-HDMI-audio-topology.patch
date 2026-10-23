@@ -1,0 +1,203 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] arm64: dts: allwinner: use one H616/H618 HDMI audio topology
+
+Use the H616/H618 audio hub on boards with the new HDMI audio card.
+Disable vendor audio devices that share the same hardware.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/arch/arm64/boot/dts/allwinner/sun50i-h313-tanix-tx1.dts b/arch/arm64/boot/dts/allwinner/sun50i-h313-tanix-tx1.dts
+--- a/arch/arm64/boot/dts/allwinner/sun50i-h313-tanix-tx1.dts
++++ b/arch/arm64/boot/dts/allwinner/sun50i-h313-tanix-tx1.dts
+@@ -226,3 +226,21 @@
+ &usbphy {
+ 	status = "okay";
+ };
++
++/* Use the H616 audio hub for HDMI. */
++&ahub_dam_plat {
++	status = "disabled";
++};
++
++&ahub_dam_mach {
++	status = "disabled";
++};
++
++&ahub1_plat {
++	status = "disabled";
++};
++
++&ahub1_mach {
++	status = "disabled";
++};
++
+diff --git a/arch/arm64/boot/dts/allwinner/sun50i-h616-orangepi-zero2.dts b/arch/arm64/boot/dts/allwinner/sun50i-h616-orangepi-zero2.dts
+--- a/arch/arm64/boot/dts/allwinner/sun50i-h616-orangepi-zero2.dts
++++ b/arch/arm64/boot/dts/allwinner/sun50i-h616-orangepi-zero2.dts
+@@ -161,3 +161,21 @@
+ 	vcc-ph-supply = <&reg_aldo1>;
+ 	vcc-pi-supply = <&reg_aldo1>;
+ };
++
++/* Use the H616 audio hub for HDMI. */
++&ahub_dam_plat {
++	status = "disabled";
++};
++
++&ahub_dam_mach {
++	status = "disabled";
++};
++
++&ahub1_plat {
++	status = "disabled";
++};
++
++&ahub1_mach {
++	status = "disabled";
++};
++
+diff --git a/arch/arm64/boot/dts/allwinner/sun50i-h616-x96-mate.dts b/arch/arm64/boot/dts/allwinner/sun50i-h616-x96-mate.dts
+--- a/arch/arm64/boot/dts/allwinner/sun50i-h616-x96-mate.dts
++++ b/arch/arm64/boot/dts/allwinner/sun50i-h616-x96-mate.dts
+@@ -269,3 +269,21 @@
+ &usbphy {
+ 	status = "okay";
+ };
++
++/* Use the H616 audio hub for HDMI. */
++&ahub_dam_plat {
++	status = "disabled";
++};
++
++&ahub_dam_mach {
++	status = "disabled";
++};
++
++&ahub1_plat {
++	status = "disabled";
++};
++
++&ahub1_mach {
++	status = "disabled";
++};
++
+diff --git a/arch/arm64/boot/dts/allwinner/sun50i-h618-orangepi-zero3.dts b/arch/arm64/boot/dts/allwinner/sun50i-h618-orangepi-zero3.dts
+--- a/arch/arm64/boot/dts/allwinner/sun50i-h618-orangepi-zero3.dts
++++ b/arch/arm64/boot/dts/allwinner/sun50i-h618-orangepi-zero3.dts
+@@ -126,3 +126,21 @@
+ 	vcc-ph-supply = <&reg_dldo1>;
+ 	vcc-pi-supply = <&reg_dldo1>;
+ };
++
++/* Use the H616 audio hub for HDMI. */
++&ahub_dam_plat {
++	status = "disabled";
++};
++
++&ahub_dam_mach {
++	status = "disabled";
++};
++
++&ahub1_plat {
++	status = "disabled";
++};
++
++&ahub1_mach {
++	status = "disabled";
++};
++
+diff --git a/arch/arm64/boot/dts/allwinner/sun50i-h618-transpeed-8k618-t.dts b/arch/arm64/boot/dts/allwinner/sun50i-h618-transpeed-8k618-t.dts
+--- a/arch/arm64/boot/dts/allwinner/sun50i-h618-transpeed-8k618-t.dts
++++ b/arch/arm64/boot/dts/allwinner/sun50i-h618-transpeed-8k618-t.dts
+@@ -232,3 +232,21 @@
+ &usbphy {
+ 	status = "okay";
+ };
++
++/* Use the H616 audio hub for HDMI. */
++&ahub_dam_plat {
++	status = "disabled";
++};
++
++&ahub_dam_mach {
++	status = "disabled";
++};
++
++&ahub1_plat {
++	status = "disabled";
++};
++
++&ahub1_mach {
++	status = "disabled";
++};
++
+diff --git a/arch/arm64/boot/dts/allwinner/sun50i-h618-yuzukihd-chameleon.dts b/arch/arm64/boot/dts/allwinner/sun50i-h618-yuzukihd-chameleon.dts
+--- a/arch/arm64/boot/dts/allwinner/sun50i-h618-yuzukihd-chameleon.dts
++++ b/arch/arm64/boot/dts/allwinner/sun50i-h618-yuzukihd-chameleon.dts
+@@ -254,3 +254,21 @@
+ 	usb3_vbus-supply = <&reg_vcc5v>;
+ 	status = "okay";
+ };
++
++/* Use the H616 audio hub for HDMI. */
++&ahub_dam_plat {
++	status = "disabled";
++};
++
++&ahub_dam_mach {
++	status = "disabled";
++};
++
++&ahub1_plat {
++	status = "disabled";
++};
++
++&ahub1_mach {
++	status = "disabled";
++};
++
+diff --git a/arch/arm64/boot/dts/allwinner/sun50i-h618-orangepi-zero2w.dts b/arch/arm64/boot/dts/allwinner/sun50i-h618-orangepi-zero2w.dts
+--- a/arch/arm64/boot/dts/allwinner/sun50i-h618-orangepi-zero2w.dts
++++ b/arch/arm64/boot/dts/allwinner/sun50i-h618-orangepi-zero2w.dts
+@@ -386,3 +386,29 @@
+ &ddr_temp_critical {
+ 	temperature = <100000>;
+ };
++
++/* Use the H616 audio hub for HDMI. */
++&ahub_dam_plat {
++	status = "disabled";
++};
++
++&ahub_dam_mach {
++	status = "disabled";
++};
++
++&ahub1_plat {
++	status = "disabled";
++};
++
++&ahub1_mach {
++	status = "disabled";
++};
++
++&ahub {
++	status = "okay";
++};
++
++&hdmi_sound {
++	status = "okay";
++};
++
+diff --git a/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi b/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
+--- a/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
++++ b/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
+@@ -1457,7 +1457,6 @@
+ 		};
+ 
+ 		hdmi: hdmi@6000000 {
+-			#sound-dai-cells = <0>;
+ 			compatible = "allwinner,sun50i-h616-dw-hdmi",
+ 				     "allwinner,sun50i-h6-dw-hdmi";
+ 			#sound-dai-cells = <0>;
