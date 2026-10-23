@@ -1,0 +1,5213 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jernej Skrabec <jernej.skrabec@gmail.com>
+Subject: [PATCH] drm/sun4i: update DE33 for AFBC and RCQ
+
+Add H616 AFBC scanout with the newer DE33 scaler and RCQ support.
+Keep Armbian's A523 backend and display handover.
+Include writeback support and shared IOMMU mappings.
+
+Signed-off-by: Jernej Skrabec <jernej.skrabec@gmail.com>
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi b/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
+index 4f6369c..6c3964c 100644
+--- a/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
++++ b/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
+@@ -179,9 +179,43 @@
+ 				#reset-cells = <1>;
+ 			};
+ 
++			writeback: writeback@11000 {
++				compatible = "allwinner,sun50i-h616-de33-wb";
++				reg = <0x11000 0x1000>, <0x8200 0x20>;
++				reg-names = "writeback", "rcq";
++				clocks = <&display_clocks CLK_BUS_MIXER0>,
++					 <&display_clocks CLK_WB>;
++				clock-names = "bus", "mod";
++				resets = <&display_clocks RST_WB>;
++				interrupts = <GIC_SPI 88 IRQ_TYPE_LEVEL_HIGH>;
++				allwinner,top = <&display_clocks>;
++
++				ports {
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					writeback_in: port@0 {
++						#address-cells = <1>;
++						#size-cells = <0>;
++						reg = <0>;
++
++						writeback_in_mixer0: endpoint@0 {
++							reg = <0>;
++							remote-endpoint = <&mixer0_out_writeback>;
++						};
++
++						writeback_in_mixer1: endpoint@1 {
++							reg = <1>;
++							remote-endpoint = <&mixer1_out_writeback>;
++						};
++					};
++				};
++			};
++
+ 			planes: planes@100000 {
+ 				compatible = "allwinner,sun50i-h616-de33-planes";
+ 				reg = <0x100000 0x180000>;
++				iommus = <&iommu 0>;
+ 				allwinner,plane-mapping = <&display_clocks>;
+ 			};
+ 
+@@ -201,11 +235,19 @@
+ 					#size-cells = <0>;
+ 
+ 					mixer0_out: port@1 {
++						#address-cells = <1>;
++						#size-cells = <0>;
+ 						reg = <1>;
+ 
+-						mixer0_out_tcon_top_mixer0: endpoint {
++						mixer0_out_tcon_top_mixer0: endpoint@0 {
++							reg = <0>;
+ 							remote-endpoint = <&tcon_top_mixer0_in_mixer0>;
+ 						};
++
++						mixer0_out_writeback: endpoint@1 {
++							reg = <1>;
++							remote-endpoint = <&writeback_in_mixer0>;
++						};
+ 					};
+ 				};
+ 			};
+@@ -226,11 +268,19 @@
+ 					#size-cells = <0>;
+ 
+ 					mixer1_out: port@1 {
++						#address-cells = <1>;
++						#size-cells = <0>;
+ 						reg = <1>;
+ 
+-						mixer1_out_tcon_top_mixer1: endpoint {
++						mixer1_out_tcon_top_mixer1: endpoint@0 {
++							reg = <0>;
+ 							remote-endpoint = <&tcon_top_mixer1_in_mixer1>;
+ 						};
++
++						mixer1_out_writeback: endpoint@1 {
++							reg = <1>;
++							remote-endpoint = <&writeback_in_mixer1>;
++						};
+ 					};
+ 				};
+ 			};
+diff --git a/drivers/clk/sunxi-ng/ccu-sun8i-de2.c b/drivers/clk/sunxi-ng/ccu-sun8i-de2.c
+index 26d8abd..be8bc46 100644
+--- a/drivers/clk/sunxi-ng/ccu-sun8i-de2.c
++++ b/drivers/clk/sunxi-ng/ccu-sun8i-de2.c
+@@ -286,17 +286,18 @@ static const struct sunxi_ccu_desc sun50i_h616_de33_clk_desc = {
+ };
+ 
+ /*
+- * Add a regmap for the DE33 plane driver to access plane
+- * mapping registers.
++ * Add a regmap for the DE33 plane and writeback drivers to access
++ * routing registers.
+  * Only these registers are allowed to be written, to prevent
+  * overriding clock and reset configuration.
+  */
+ 
++#define SUN50I_DE33_RTWB_MUX_REG 0x20
+ #define SUN50I_DE33_CHN2CORE_REG 0x24
+ #define SUN50I_DE33_PORT12CHN_REG 0x2c
+ 
+ static const struct regmap_range sun8i_de2_ccu_regmap_accessible_ranges[] = {
+-	regmap_reg_range(SUN50I_DE33_CHN2CORE_REG, SUN50I_DE33_PORT12CHN_REG),
++	regmap_reg_range(SUN50I_DE33_RTWB_MUX_REG, SUN50I_DE33_PORT12CHN_REG),
+ };
+ 
+ static const struct regmap_access_table sun8i_de2_ccu_regmap_accessible_table = {
+diff --git a/drivers/gpu/drm/drm_gem_framebuffer_helper.c b/drivers/gpu/drm/drm_gem_framebuffer_helper.c
+index 88808e9..6114713 100644
+--- a/drivers/gpu/drm/drm_gem_framebuffer_helper.c
++++ b/drivers/gpu/drm/drm_gem_framebuffer_helper.c
+@@ -89,6 +89,11 @@ drm_gem_fb_init(struct drm_device *dev,
+ 	return ret;
+ }
+ 
++static int drm_gem_afbc_min_size(struct drm_device *dev,
++				 const struct drm_format_info *info,
++				 const struct drm_mode_fb_cmd2 *mode_cmd,
++				 struct drm_afbc_framebuffer *afbc_fb);
++
+ /**
+  * drm_gem_fb_destroy - Free GEM backed framebuffer
+  * @fb: Framebuffer
+@@ -183,9 +188,19 @@ int drm_gem_fb_init_with_funcs(struct drm_device *dev,
+ 			goto err_gem_object_put;
+ 		}
+ 
+-		min_size = (height - 1) * mode_cmd->pitches[i]
+-			 + drm_format_info_min_pitch(info, i, width)
+-			 + mode_cmd->offsets[i];
++		if (drm_is_afbc(mode_cmd->modifier[0])) {
++			struct drm_afbc_framebuffer afbc_fb = {};
++
++			ret = drm_gem_afbc_min_size(dev, info, mode_cmd,
++						    &afbc_fb);
++			if (ret)
++				goto err_gem_object_put;
++			min_size = afbc_fb.afbc_size;
++		} else {
++			min_size = (height - 1) * mode_cmd->pitches[i]
++				 + drm_format_info_min_pitch(info, i, width)
++				 + mode_cmd->offsets[i];
++		}
+ 
+ 		if (objs[i]->size < min_size) {
+ 			drm_dbg_kms(dev,
+@@ -513,6 +528,8 @@ static __u32 drm_gem_afbc_get_bpp(struct drm_device *dev,
+ 		return 12;
+ 	case DRM_FORMAT_YUV420_10BIT:
+ 		return 15;
++	case DRM_FORMAT_Y210:
++		return 20;
+ 	case DRM_FORMAT_VUY101010:
+ 		return 30;
+ 	default:
+@@ -573,6 +590,9 @@ static int drm_gem_afbc_min_size(struct drm_device *dev,
+ 	afbc_fb->afbc_size = ALIGN(n_blocks * AFBC_HEADER_SIZE, hdr_alignment);
+ 	afbc_fb->afbc_size += n_blocks * ALIGN(bpp * AFBC_SUPERBLOCK_PIXELS / 8,
+ 					       AFBC_SUPERBLOCK_ALIGNMENT);
++	if (afbc_fb->afbc_size > U32_MAX - afbc_fb->offset)
++		return -EINVAL;
++	afbc_fb->afbc_size += afbc_fb->offset;
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/sun4i/Makefile b/drivers/gpu/drm/sun4i/Makefile
+index 85f16d3..2571ba4 100644
+--- a/drivers/gpu/drm/sun4i/Makefile
++++ b/drivers/gpu/drm/sun4i/Makefile
+@@ -21,7 +21,7 @@ sun8i-mixer-y			+= sun8i_mixer.o sun8i_ui_layer.o \
+ 				   sun8i_vi_layer.o sun8i_ui_scaler.o \
+ 				   sun8i_vi_scaler.o sun8i_csc.o \
+ 				   sun55i_de.o \
+-				   sun50i_planes.o
++				   sun50i_afbc.o sun50i_planes.o sun8i_rdma.o
+ 
+ sun4i-tcon-y			+= sun4i_crtc.o
+ sun4i-tcon-y			+= sun4i_tcon_dclk.o
+@@ -41,5 +41,5 @@ endif
+ obj-$(CONFIG_DRM_SUN4I_HDMI)	+= sun4i-drm-hdmi.o
+ obj-$(CONFIG_DRM_SUN6I_DSI)	+= sun6i_mipi_dsi.o
+ obj-$(CONFIG_DRM_SUN8I_DW_HDMI)	+= sun8i-drm-hdmi.o
+-obj-$(CONFIG_DRM_SUN8I_MIXER)	+= sun8i-mixer.o
++obj-$(CONFIG_DRM_SUN8I_MIXER)	+= sun8i-mixer.o sun50i_wb.o
+ obj-$(CONFIG_DRM_SUN8I_TCON_TOP) += sun8i_tcon_top.o
+diff --git a/drivers/gpu/drm/sun4i/sun4i_crtc.c b/drivers/gpu/drm/sun4i/sun4i_crtc.c
+index a725967..9b6d4b7 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_crtc.c
++++ b/drivers/gpu/drm/sun4i/sun4i_crtc.c
+@@ -45,17 +45,40 @@ static struct drm_encoder *sun4i_crtc_get_encoder(struct drm_crtc *crtc)
+ 	return NULL;
+ }
+ 
++void sun4i_crtc_finish_page_flip(struct drm_crtc *crtc)
++{
++	struct sun4i_crtc *scrtc = drm_crtc_to_sun4i_crtc(crtc);
++	unsigned long flags;
++
++	spin_lock_irqsave(&crtc->dev->event_lock, flags);
++	if (scrtc->event) {
++		drm_crtc_send_vblank_event(crtc, scrtc->event);
++		drm_crtc_vblank_put(crtc);
++		scrtc->event = NULL;
++	} else if (crtc->state->event) {
++		drm_crtc_send_vblank_event(crtc, crtc->state->event);
++		crtc->state->event = NULL;
++	}
++	spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
++}
++
+ static int sun4i_crtc_atomic_check(struct drm_crtc *crtc,
+ 				    struct drm_atomic_commit *state)
+ {
+ 	struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(state,
+ 									  crtc);
++	struct drm_crtc_state *old_state = drm_atomic_get_old_crtc_state(state,
++									 crtc);
+ 	struct sun4i_crtc *scrtc = drm_crtc_to_sun4i_crtc(crtc);
+ 	struct sunxi_engine *engine = scrtc->engine;
+ 	int ret = 0;
+ 
+ 	if (engine && engine->ops && engine->ops->atomic_check)
+ 		ret = engine->ops->atomic_check(engine, crtc_state);
++	if (old_state->no_vblank &&
++	    (!crtc_state->connector_mask ||
++	     crtc_state->connector_mask == old_state->connector_mask))
++		crtc_state->no_vblank = true;
+ 
+ 	return ret;
+ }
+@@ -70,7 +93,7 @@ static void sun4i_crtc_atomic_begin(struct drm_crtc *crtc,
+ 	struct sunxi_engine *engine = scrtc->engine;
+ 	unsigned long flags;
+ 
+-	if (crtc->state->event) {
++	if (crtc->state->event && !crtc->state->no_vblank) {
+ 		WARN_ON(drm_crtc_vblank_get(crtc) != 0);
+ 
+ 		spin_lock_irqsave(&dev->event_lock, flags);
+@@ -91,9 +114,11 @@ static void sun4i_crtc_atomic_flush(struct drm_crtc *crtc,
+ 
+ 	DRM_DEBUG_DRIVER("Committing plane changes\n");
+ 
+-	sunxi_engine_commit(scrtc->engine, crtc, state);
++	/* Self-timed writeback commits the engine after arming writeback. */
++	if (!crtc->state->no_vblank)
++		sunxi_engine_commit(scrtc->engine, crtc, state);
+ 
+-	if (event) {
++	if (event && !crtc->state->no_vblank) {
+ 		crtc->state->event = NULL;
+ 
+ 		spin_lock_irq(&crtc->dev->event_lock);
+@@ -122,15 +147,27 @@ static void sun4i_crtc_atomic_flush(struct drm_crtc *crtc,
+ static void sun4i_crtc_atomic_disable(struct drm_crtc *crtc,
+ 				      struct drm_atomic_commit *state)
+ {
++	struct drm_crtc_state *old_state = drm_atomic_get_old_crtc_state(state,
++									 crtc);
+ 	struct drm_encoder *encoder = sun4i_crtc_get_encoder(crtc);
+ 	struct sun4i_crtc *scrtc = drm_crtc_to_sun4i_crtc(crtc);
+ 
+ 	DRM_DEBUG_DRIVER("Disabling the CRTC\n");
+ 
+-	sun4i_tcon_set_status(scrtc->tcon, encoder, false);
++	/*
++	 * Planes are only committed on active CRTCs, so they must be
++	 * disabled here. Otherwise the engine would keep scanning out
++	 * stale buffer addresses when the CRTC is enabled again.
++	 */
++	drm_atomic_helper_disable_planes_on_crtc(old_state, false);
++	sunxi_engine_commit(scrtc->engine, crtc, state);
++	sunxi_engine_sync(scrtc->engine);
++	sunxi_engine_wait_for_scanout(scrtc->engine, crtc);
+ 
+ 	drm_crtc_vblank_off(crtc);
+ 
++	sun4i_tcon_set_status(scrtc->tcon, encoder, false);
++
+ 	if (crtc->state->event && !crtc->state->active) {
+ 		spin_lock_irq(&crtc->dev->event_lock);
+ 		drm_crtc_send_vblank_event(crtc, crtc->state->event);
+diff --git a/drivers/gpu/drm/sun4i/sun4i_crtc.h b/drivers/gpu/drm/sun4i/sun4i_crtc.h
+index ed7aa7c..561c133 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_crtc.h
++++ b/drivers/gpu/drm/sun4i/sun4i_crtc.h
+@@ -25,5 +25,6 @@ static inline struct sun4i_crtc *drm_crtc_to_sun4i_crtc(struct drm_crtc *crtc)
+ struct sun4i_crtc *sun4i_crtc_init(struct drm_device *drm,
+ 				   struct sunxi_engine *engine,
+ 				   struct sun4i_tcon *tcon);
++void sun4i_crtc_finish_page_flip(struct drm_crtc *crtc);
+ 
+ #endif /* _SUN4I_CRTC_H_ */
+diff --git a/drivers/gpu/drm/sun4i/sun4i_drv.c b/drivers/gpu/drm/sun4i/sun4i_drv.c
+index d76f390..0461f1b 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_drv.c
++++ b/drivers/gpu/drm/sun4i/sun4i_drv.c
+@@ -208,6 +208,12 @@ static bool sun4i_drv_node_is_tcon_top(struct device_node *node)
+ 		!!of_match_node(sun8i_tcon_top_of_table, node);
+ }
+ 
++static bool sun4i_drv_node_is_writeback(struct device_node *node)
++{
++	return of_device_is_compatible(node, "allwinner,sun50i-h6-de3-wb") ||
++	       of_device_is_compatible(node, "allwinner,sun50i-h616-de33-wb");
++}
++
+ /*
+  * The encoder drivers use drm_of_find_possible_crtcs to get upstream
+  * crtcs from the device tree using of_graph. For the results to be
+@@ -300,6 +306,10 @@ static int sun4i_drv_add_endpoints(struct device *dev,
+ {
+ 	int count = 0;
+ 
++	/* Writeback is bound after all CRTCs have been registered. */
++	if (sun4i_drv_node_is_writeback(node))
++		return 0;
++
+ 	/*
+ 	 * The frontend has been disabled in some of our old device
+ 	 * trees. If we find a node that is the frontend and is
+@@ -405,6 +415,28 @@ static int sun4i_drv_probe(struct platform_device *pdev)
+ 		count += ret;
+ 	}
+ 
++	if (count) {
++		struct device_node *wb;
++
++		for_each_compatible_node(wb, NULL,
++					 "allwinner,sun50i-h6-de3-wb") {
++			if (of_device_is_available(wb)) {
++				component_match_add(&pdev->dev, &match,
++						    component_compare_of, wb);
++				count++;
++			}
++		}
++
++		for_each_compatible_node(wb, NULL,
++					 "allwinner,sun50i-h616-de33-wb") {
++			if (of_device_is_available(wb)) {
++				component_match_add(&pdev->dev, &match,
++						    component_compare_of, wb);
++				count++;
++			}
++		}
++	}
++
+ 	if (count)
+ 		return component_master_add_with_match(&pdev->dev,
+ 						       &sun4i_drv_master_ops,
+diff --git a/drivers/gpu/drm/sun4i/sun4i_framebuffer.c b/drivers/gpu/drm/sun4i/sun4i_framebuffer.c
+index fc822bc..f7b726c 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_framebuffer.c
++++ b/drivers/gpu/drm/sun4i/sun4i_framebuffer.c
+@@ -9,19 +9,116 @@
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_atomic_helper.h>
+ #include <drm/drm_blend.h>
++#include <drm/drm_fourcc.h>
++#include <drm/drm_framebuffer.h>
+ #include <drm/drm_gem_framebuffer_helper.h>
+ 
++#include "sun4i_crtc.h"
+ #include "sun4i_drv.h"
+ #include "sun4i_framebuffer.h"
++#include "sunxi_engine.h"
++
++static const struct drm_framebuffer_funcs sun4i_fb_funcs = {
++	.destroy	= drm_gem_fb_destroy,
++	.create_handle	= drm_gem_fb_create_handle,
++};
++
++static struct drm_framebuffer *
++sun4i_fb_create(struct drm_device *dev, struct drm_file *file,
++		const struct drm_format_info *info,
++		const struct drm_mode_fb_cmd2 *mode_cmd)
++{
++	struct drm_afbc_framebuffer *afbc_fb;
++	int ret;
++
++	if (!drm_is_afbc(mode_cmd->modifier[0]))
++		return drm_gem_fb_create(dev, file, info, mode_cmd);
++
++	afbc_fb = kzalloc_obj(*afbc_fb);
++	if (!afbc_fb)
++		return ERR_PTR(-ENOMEM);
++
++	ret = drm_gem_fb_init_with_funcs(dev, &afbc_fb->base, file, info,
++					 mode_cmd, &sun4i_fb_funcs);
++	if (ret) {
++		kfree(afbc_fb);
++		return ERR_PTR(ret);
++	}
++
++	ret = drm_gem_fb_afbc_init(dev, info, mode_cmd, afbc_fb);
++	if (ret) {
++		drm_framebuffer_put(&afbc_fb->base);
++		return ERR_PTR(ret);
++	}
++
++	return &afbc_fb->base;
++}
+ 
+ static const struct drm_mode_config_funcs sun4i_de_mode_config_funcs = {
+ 	.atomic_check		= drm_atomic_helper_check,
+ 	.atomic_commit		= drm_atomic_helper_commit,
+-	.fb_create		= drm_gem_fb_create,
++	.fb_create		= sun4i_fb_create,
+ };
+ 
++static bool
++sun4i_de_crtc_needs_scanout_wait(struct drm_atomic_commit *state,
++				 struct drm_crtc *crtc)
++{
++	struct drm_plane_state *old_plane_state;
++	struct drm_plane_state *new_plane_state;
++	struct drm_plane *plane;
++	int i;
++
++	for_each_oldnew_plane_in_state(state, plane, old_plane_state,
++				       new_plane_state, i) {
++		if (old_plane_state->crtc == crtc && old_plane_state->fb &&
++		    (new_plane_state->crtc != crtc ||
++		     new_plane_state->fb != old_plane_state->fb))
++			return true;
++	}
++
++	return false;
++}
++
++static void sun4i_de_atomic_commit_tail(struct drm_atomic_commit *state)
++{
++	struct drm_crtc_state *new_crtc_state;
++	struct drm_device *dev = state->dev;
++	struct drm_crtc *crtc;
++	int i;
++
++	drm_atomic_helper_commit_modeset_disables(dev, state);
++	drm_atomic_helper_commit_crtc_enable(dev, state);
++	drm_atomic_helper_commit_encoder_bridge_pre_enable(dev, state);
++	drm_atomic_helper_commit_planes(dev, state,
++					DRM_PLANE_COMMIT_ACTIVE_ONLY);
++	drm_atomic_helper_commit_encoder_bridge_enable(dev, state);
++	drm_atomic_helper_commit_writebacks(dev, state);
++	drm_atomic_helper_fake_vblank(state);
++	drm_atomic_helper_commit_hw_done(state);
++	/*
++	 * Wait for a vblank after the engine commit, not for the flip
++	 * event: the event can be signaled by a vblank interrupt that
++	 * fires between atomic_begin and the register queue trigger, in
++	 * which case buffers would be freed while the hardware still
++	 * scans out from them for one more frame.
++	 */
++	drm_atomic_helper_wait_for_vblanks(dev, state);
++	for_each_new_crtc_in_state(state, crtc, new_crtc_state, i) {
++		struct sun4i_crtc *scrtc;
++
++		if (!new_crtc_state->active ||
++		    !sun4i_de_crtc_needs_scanout_wait(state, crtc))
++			continue;
++
++		scrtc = drm_crtc_to_sun4i_crtc(crtc);
++		sunxi_engine_wait_for_scanout(scrtc->engine, crtc);
++	}
++	drm_atomic_helper_cleanup_planes(dev, state);
++}
++
+ static const struct drm_mode_config_helper_funcs sun4i_de_mode_config_helpers = {
+-	.atomic_commit_tail	= drm_atomic_helper_commit_tail_rpm,
++	.atomic_commit_tail	= sun4i_de_atomic_commit_tail,
+ };
+ 
+ void sun4i_framebuffer_init(struct drm_device *drm)
+diff --git a/drivers/gpu/drm/sun4i/sun4i_tcon.c b/drivers/gpu/drm/sun4i/sun4i_tcon.c
+index 478e112..b0fb06c 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_tcon.c
++++ b/drivers/gpu/drm/sun4i/sun4i_tcon.c
+@@ -889,27 +889,13 @@ void sun4i_tcon_mode_set(struct sun4i_tcon *tcon,
+ }
+ EXPORT_SYMBOL(sun4i_tcon_mode_set);
+ 
+-static void sun4i_tcon_finish_page_flip(struct drm_device *dev,
+-					struct sun4i_crtc *scrtc)
+-{
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&dev->event_lock, flags);
+-	if (scrtc->event) {
+-		drm_crtc_send_vblank_event(&scrtc->crtc, scrtc->event);
+-		drm_crtc_vblank_put(&scrtc->crtc);
+-		scrtc->event = NULL;
+-	}
+-	spin_unlock_irqrestore(&dev->event_lock, flags);
+-}
+-
+ static enum hrtimer_restart sun4i_tcon_flip_timer_cb(struct hrtimer *timer)
+ {
+ 	struct sun4i_tcon *tcon = container_of(timer,
+ 					       struct sun4i_tcon, flip_timer);
+ 
+ 	drm_crtc_handle_vblank(&tcon->crtc->crtc);
+-	sun4i_tcon_finish_page_flip(tcon->drm, tcon->crtc);
++	sun4i_crtc_finish_page_flip(&tcon->crtc->crtc);
+ 
+ 	return HRTIMER_NORESTART;
+ }
+@@ -917,7 +903,6 @@ static enum hrtimer_restart sun4i_tcon_flip_timer_cb(struct hrtimer *timer)
+ static irqreturn_t sun4i_tcon_handler(int irq, void *private)
+ {
+ 	struct sun4i_tcon *tcon = private;
+-	struct drm_device *drm = tcon->drm;
+ 	struct sun4i_crtc *scrtc = tcon->crtc;
+ 	struct sunxi_engine *engine = scrtc->engine;
+ 	unsigned int status, cur_pos = 0, cur_line;
+@@ -933,7 +918,7 @@ static irqreturn_t sun4i_tcon_handler(int irq, void *private)
+ 		hrtimer_start(&tcon->flip_timer, us_to_ktime(250), HRTIMER_MODE_REL);
+ 	} else {
+ 		drm_crtc_handle_vblank(&scrtc->crtc);
+-		sun4i_tcon_finish_page_flip(drm, scrtc);
++		sun4i_crtc_finish_page_flip(&scrtc->crtc);
+ 	}
+ 
+ 	/* Acknowledge the interrupt */
+diff --git a/drivers/gpu/drm/sun4i/sun50i_afbc.c b/drivers/gpu/drm/sun4i/sun50i_afbc.c
+new file mode 100644
+index 0000000..2101e98
+--- /dev/null
++++ b/drivers/gpu/drm/sun4i/sun50i_afbc.c
+@@ -0,0 +1,304 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/* Copyright (C) Jernej Skrabec <jernej.skrabec@gmail.com> */
++
++#include <drm/drm_blend.h>
++#include <drm/drm_fb_dma_helper.h>
++#include <drm/drm_framebuffer.h>
++#include <drm/drm_gem_dma_helper.h>
++#include <drm/drm_gem_framebuffer_helper.h>
++#include <drm/drm_plane.h>
++#include <drm/drm_print.h>
++#include <uapi/drm/drm_fourcc.h>
++
++#include "sun50i_afbc.h"
++#include "sun8i_mixer.h"
++#include "sun8i_rdma.h"
++
++#define SUN50I_AFBC_DE3_OFFSET		0x300
++#define SUN50I_AFBC_DE33_OFFSET		0x5000
++
++struct sun50i_afbc_format {
++	u32 format;
++	u8 hw_format;
++	u8 sbs0;
++	u8 sbs1;
++	u16 alpha;
++	u16 yr;
++	u16 ug;
++	u16 vb;
++	u16 ytr_yr;
++	u16 ytr_ug;
++	u16 ytr_vb;
++	bool rgb;
++	bool split;
++};
++
++static const struct sun50i_afbc_format sun50i_afbc_formats[] = {
++	{
++		.format = DRM_FORMAT_ABGR8888,
++		.hw_format = SUN50I_AFBC_RGBA_8888,
++		.sbs0 = 1, .sbs1 = 1,
++		.alpha = 255, .yr = 255, .ug = 255, .vb = 255,
++		.ytr_yr = 255, .ytr_ug = 256, .ytr_vb = 256,
++		.rgb = true, .split = true,
++	}, {
++		.format = DRM_FORMAT_BGR888,
++		.hw_format = SUN50I_AFBC_RGB_888,
++		.sbs0 = 1, .sbs1 = 1,
++		.yr = 255, .ug = 255, .vb = 255,
++		.ytr_yr = 255, .ytr_ug = 256, .ytr_vb = 256,
++		.rgb = true, .split = true,
++	}, {
++		.format = DRM_FORMAT_BGR565,
++		.hw_format = SUN50I_AFBC_RGB_565,
++		.sbs0 = 1, .sbs1 = 1,
++		.yr = 31, .ug = 63, .vb = 31,
++		.ytr_yr = 63, .ytr_ug = 64, .ytr_vb = 64,
++		.rgb = true,
++	}, {
++		.format = DRM_FORMAT_ABGR4444,
++		.hw_format = SUN50I_AFBC_RGBA_4444,
++		.sbs0 = 1, .sbs1 = 1,
++		.alpha = 15, .yr = 15, .ug = 15, .vb = 15,
++		.ytr_yr = 15, .ytr_ug = 16, .ytr_vb = 16,
++		.rgb = true,
++	}, {
++		.format = DRM_FORMAT_ABGR1555,
++		.hw_format = SUN50I_AFBC_RGBA_5551,
++		.sbs0 = 1, .sbs1 = 1,
++		.alpha = 1, .yr = 31, .ug = 31, .vb = 31,
++		.ytr_yr = 31, .ytr_ug = 32, .ytr_vb = 32,
++		.rgb = true,
++	}, {
++		.format = DRM_FORMAT_ABGR2101010,
++		.hw_format = SUN50I_AFBC_RGBA1010102,
++		.sbs0 = 1, .sbs1 = 1,
++		.alpha = 3, .yr = 1023, .ug = 1023, .vb = 1023,
++		.ytr_yr = 1023, .ytr_ug = 1024, .ytr_vb = 1024,
++		.rgb = true, .split = true,
++	}, {
++		.format = DRM_FORMAT_YUV420_8BIT,
++		.hw_format = SUN50I_AFBC_YUV420,
++		.sbs0 = 1, .sbs1 = 1,
++		.yr = 255, .ug = 128, .vb = 128,
++		.split = true,
++	}, {
++		.format = DRM_FORMAT_YUYV,
++		.hw_format = SUN50I_AFBC_YUV422,
++		.sbs0 = 1, .sbs1 = 2,
++		.yr = 255, .ug = 128, .vb = 128,
++		.split = true,
++	}, {
++		.format = DRM_FORMAT_YUV420_10BIT,
++		.hw_format = SUN50I_AFBC_P010,
++		.sbs0 = 1, .sbs1 = 2,
++		.yr = 1023, .ug = 512, .vb = 512,
++		.split = true,
++	}, {
++		.format = DRM_FORMAT_Y210,
++		.hw_format = SUN50I_AFBC_P210,
++		.sbs0 = 2, .sbs1 = 3,
++		.yr = 1023, .ug = 512, .vb = 512,
++		.split = true,
++	},
++};
++
++const u64 sun50i_afbc_modifiers[] = {
++	DRM_FORMAT_MOD_ARM_AFBC(AFBC_FORMAT_MOD_BLOCK_SIZE_16x16 |
++				AFBC_FORMAT_MOD_SPARSE),
++	DRM_FORMAT_MOD_ARM_AFBC(AFBC_FORMAT_MOD_BLOCK_SIZE_16x16 |
++				AFBC_FORMAT_MOD_YTR |
++				AFBC_FORMAT_MOD_SPARSE),
++	DRM_FORMAT_MOD_ARM_AFBC(AFBC_FORMAT_MOD_BLOCK_SIZE_16x16 |
++				AFBC_FORMAT_MOD_SPARSE |
++				AFBC_FORMAT_MOD_SPLIT),
++	DRM_FORMAT_MOD_ARM_AFBC(AFBC_FORMAT_MOD_BLOCK_SIZE_16x16 |
++				AFBC_FORMAT_MOD_YTR |
++				AFBC_FORMAT_MOD_SPARSE |
++				AFBC_FORMAT_MOD_SPLIT),
++	DRM_FORMAT_MOD_LINEAR,
++	DRM_FORMAT_MOD_INVALID,
++};
++
++static const struct reg_region sun50i_afbc_regions[] = {
++	{ 0x00, 7 },
++	{ 0x20, 2 },
++	{ 0x30, 4 },
++	{ 0x50, 2 },
++	{ }
++};
++
++static const struct reg_region sun50i_de33_afbc_regions[] = {
++	{ 0x00, 7 },
++	{ 0x20, 2 },
++	{ 0x30, 4 },
++	{ 0x50, 3 },
++	{ }
++};
++
++static const struct sun50i_afbc_format *sun50i_afbc_get_format(u32 format)
++{
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(sun50i_afbc_formats); i++)
++		if (sun50i_afbc_formats[i].format == format)
++			return &sun50i_afbc_formats[i];
++
++	return NULL;
++}
++
++static bool sun50i_afbc_supported(struct sun8i_layer *layer)
++{
++	return layer->cfg->afbc_mask & BIT(layer->channel);
++}
++
++bool sun50i_afbc_format_mod_supported(struct sun8i_layer *layer,
++				      u32 format, u64 modifier)
++{
++	const struct sun50i_afbc_format *fmt;
++	u64 mode;
++
++	if (modifier == DRM_FORMAT_MOD_INVALID)
++		return false;
++
++	if (modifier == DRM_FORMAT_MOD_LINEAR)
++		return format != DRM_FORMAT_YUV420_8BIT &&
++		       format != DRM_FORMAT_YUV420_10BIT &&
++		       format != DRM_FORMAT_Y210;
++
++	if (!sun50i_afbc_supported(layer))
++		return false;
++
++	fmt = sun50i_afbc_get_format(format);
++	if (!fmt)
++		return false;
++
++	if ((modifier & AFBC_FORMAT_MOD_SPLIT) && !fmt->split)
++		return false;
++
++	mode = modifier & ~(u64)AFBC_FORMAT_MOD_SPLIT;
++	if (mode == DRM_FORMAT_MOD_ARM_AFBC(AFBC_FORMAT_MOD_BLOCK_SIZE_16x16 |
++					    AFBC_FORMAT_MOD_SPARSE))
++		return true;
++
++	return fmt->rgb &&
++	       mode == DRM_FORMAT_MOD_ARM_AFBC(AFBC_FORMAT_MOD_BLOCK_SIZE_16x16 |
++					       AFBC_FORMAT_MOD_SPARSE |
++					       AFBC_FORMAT_MOD_YTR);
++}
++
++int sun50i_afbc_init(struct sun8i_layer *layer, struct sun8i_rdma *rdma,
++		     void __iomem *reg_base)
++{
++	const struct reg_region *regions = sun50i_afbc_regions;
++	u32 base, reg_offset, size = 0x58;
++
++	if (!sun50i_afbc_supported(layer))
++		return 0;
++
++	if (layer->cfg->de_type == SUN8I_MIXER_DE33) {
++		base = layer->channel * DE33_CH_SIZE + SUN50I_AFBC_DE33_OFFSET;
++		reg_offset = 0x100000 + base;
++		regions = sun50i_de33_afbc_regions;
++		size = 0x5c;
++	} else {
++		base = sun8i_channel_base(layer) + SUN50I_AFBC_DE3_OFFSET;
++		reg_offset = base;
++	}
++
++	layer->afbc_rdma = sun8i_rdma_add_unit(rdma, reg_base + base,
++					       reg_offset, size, regions);
++
++	return layer->afbc_rdma ? 0 : -ENOMEM;
++}
++
++void sun50i_afbc_atomic_update(struct sun8i_layer *layer,
++			       struct drm_plane *plane)
++{
++	struct drm_plane_state *state = plane->state;
++	struct drm_framebuffer *fb = state->fb;
++	const struct sun50i_afbc_format *fmt;
++	struct drm_afbc_framebuffer *afbc_fb;
++	struct drm_gem_dma_object *gem;
++	u32 val, src_w, src_h;
++	u32 def_color0, def_color1;
++	dma_addr_t dma_addr;
++	bool ytr;
++
++	fmt = sun50i_afbc_get_format(fb->format->format);
++	if (WARN_ON(!fmt))
++		return;
++
++	ytr = fb->modifier & AFBC_FORMAT_MOD_YTR;
++	sun8i_rdma_write(layer->afbc_rdma, SUN50I_FBD_FMT_SEQ,
++			 SUN50I_FBD_FMT_SEQ_CANONICAL);
++
++	src_w = drm_rect_width(&state->src) >> 16;
++	src_h = drm_rect_height(&state->src) >> 16;
++	val = SUN50I_FBD_SIZE_HEIGHT(src_h) | SUN50I_FBD_SIZE_WIDTH(src_w);
++	sun8i_rdma_write(layer->afbc_rdma, SUN50I_FBD_SIZE, val);
++
++	afbc_fb = container_of(fb, struct drm_afbc_framebuffer, base);
++	val = SUN50I_FBD_BLK_SIZE_HEIGHT(afbc_fb->aligned_height / 16) |
++	      SUN50I_FBD_BLK_SIZE_WIDTH(afbc_fb->aligned_width / 16);
++	sun8i_rdma_write(layer->afbc_rdma, SUN50I_FBD_BLK_SIZE, val);
++
++	sun8i_rdma_write(layer->afbc_rdma, SUN50I_FBD_SRC_CROP, 0);
++	val = SUN50I_FBD_LAY_CROP_TOP(state->src.y1 >> 16) |
++	      SUN50I_FBD_LAY_CROP_LEFT(state->src.x1 >> 16);
++	sun8i_rdma_write(layer->afbc_rdma, SUN50I_FBD_LAY_CROP, val);
++
++	val = SUN50I_FBD_FMT_SBS1(fmt->sbs1) |
++	      SUN50I_FBD_FMT_SBS0(fmt->sbs0) |
++	      SUN50I_FBD_FMT_IN_FMT(fmt->hw_format);
++	if (ytr)
++		val |= SUN50I_FBD_FMT_YUV_TRAN;
++	sun8i_rdma_write(layer->afbc_rdma, SUN50I_FBD_FMT, val);
++
++	gem = drm_fb_dma_get_gem_obj(fb, 0);
++	dma_addr = gem->dma_addr + fb->offsets[0];
++	DRM_DEBUG_DRIVER("Using AFBC GEM @ %pad\n", &dma_addr);
++	sun8i_rdma_write(layer->afbc_rdma, SUN50I_FBD_LADDR,
++			 lower_32_bits(dma_addr));
++	sun8i_rdma_write(layer->afbc_rdma, SUN50I_FBD_HADDR,
++			 upper_32_bits(dma_addr));
++
++	val = SUN50I_FBD_OVL_SIZE_HEIGHT(src_h) |
++	      SUN50I_FBD_OVL_SIZE_WIDTH(src_w);
++	sun8i_rdma_write(layer->afbc_rdma, SUN50I_FBD_OVL_SIZE, val);
++	sun8i_rdma_write(layer->afbc_rdma, SUN50I_FBD_OVL_COOR, 0);
++	sun8i_rdma_write(layer->afbc_rdma, SUN50I_FBD_OVL_BG_COLOR,
++			 SUN8I_MIXER_BLEND_COLOR_BLACK);
++
++	if (ytr) {
++		def_color0 = SUN50I_FBD_DEFAULT_COLOR0_ALPHA(fmt->alpha) |
++			     SUN50I_FBD_DEFAULT_COLOR0_YR(fmt->ytr_yr);
++		def_color1 = SUN50I_FBD_DEFAULT_COLOR1_UG(fmt->ytr_ug) |
++			     SUN50I_FBD_DEFAULT_COLOR1_VB(fmt->ytr_vb);
++	} else {
++		def_color0 = SUN50I_FBD_DEFAULT_COLOR0_ALPHA(fmt->alpha) |
++			     SUN50I_FBD_DEFAULT_COLOR0_YR(fmt->yr);
++		def_color1 = SUN50I_FBD_DEFAULT_COLOR1_UG(fmt->ug) |
++			     SUN50I_FBD_DEFAULT_COLOR1_VB(fmt->vb);
++	}
++	sun8i_rdma_write(layer->afbc_rdma, SUN50I_FBD_DEFAULT_COLOR0,
++			 def_color0);
++	sun8i_rdma_write(layer->afbc_rdma, SUN50I_FBD_DEFAULT_COLOR1,
++			 def_color1);
++
++	val = SUN50I_FBD_CTL_GLB_ALPHA(state->alpha >> 8) |
++	      SUN50I_FBD_CTL_CLK_GATE | SUN50I_FBD_CTL_FBD_EN;
++	if (!fb->format->has_alpha)
++		val |= SUN50I_FBD_CTL_ALPHA_MODE_LAYER;
++	else if (state->alpha == DRM_BLEND_ALPHA_OPAQUE)
++		val |= SUN50I_FBD_CTL_ALPHA_MODE_PIXEL;
++	else
++		val |= SUN50I_FBD_CTL_ALPHA_MODE_COMBINED;
++	sun8i_rdma_write(layer->afbc_rdma, SUN50I_FBD_CTL, val);
++}
++
++void sun50i_afbc_disable(struct sun8i_layer *layer)
++{
++	if (layer->afbc_rdma)
++		sun8i_rdma_write(layer->afbc_rdma, SUN50I_FBD_CTL, 0);
++}
+diff --git a/drivers/gpu/drm/sun4i/sun50i_afbc.h b/drivers/gpu/drm/sun4i/sun50i_afbc.h
+new file mode 100644
+index 0000000..dfd1399
+--- /dev/null
++++ b/drivers/gpu/drm/sun4i/sun50i_afbc.h
+@@ -0,0 +1,89 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/* Copyright (C) Jernej Skrabec <jernej.skrabec@gmail.com> */
++
++#ifndef _SUN50I_AFBC_H_
++#define _SUN50I_AFBC_H_
++
++#include <linux/bits.h>
++#include <linux/types.h>
++
++#define SUN50I_AFBC_RGBA_8888		0x02
++#define SUN50I_AFBC_RGB_888		0x08
++#define SUN50I_AFBC_RGB_565		0x0a
++#define SUN50I_AFBC_RGBA_4444		0x0e
++#define SUN50I_AFBC_RGBA_5551		0x12
++#define SUN50I_AFBC_RGBA1010102		0x16
++#define SUN50I_AFBC_YUV422		0x26
++#define SUN50I_AFBC_YUV420		0x2a
++#define SUN50I_AFBC_P010		0x30
++#define SUN50I_AFBC_P210		0x32
++
++#define SUN50I_FBD_CTL			0x00
++#define SUN50I_FBD_CTL_GLB_ALPHA(v)	((v) << 24)
++#define SUN50I_FBD_CTL_CLK_GATE		BIT(4)
++#define SUN50I_FBD_CTL_ALPHA_MODE_PIXEL	(0 << 2)
++#define SUN50I_FBD_CTL_ALPHA_MODE_LAYER	BIT(2)
++#define SUN50I_FBD_CTL_ALPHA_MODE_COMBINED	(2 << 2)
++#define SUN50I_FBD_CTL_FBD_EN		BIT(0)
++
++#define SUN50I_FBD_FMT_SEQ		0x04
++#define SUN50I_FBD_FMT_SEQ_CANONICAL	0x3210
++
++#define SUN50I_FBD_SIZE			0x08
++#define SUN50I_FBD_SIZE_HEIGHT(v)	(((v) - 1) << 16)
++#define SUN50I_FBD_SIZE_WIDTH(v)	(((v) - 1) << 0)
++
++#define SUN50I_FBD_BLK_SIZE		0x0c
++#define SUN50I_FBD_BLK_SIZE_HEIGHT(v)	((v) << 16)
++#define SUN50I_FBD_BLK_SIZE_WIDTH(v)	((v) << 0)
++
++#define SUN50I_FBD_SRC_CROP		0x10
++#define SUN50I_FBD_SRC_CROP_TOP(v)	((v) << 16)
++#define SUN50I_FBD_SRC_CROP_LEFT(v)	((v) << 0)
++
++#define SUN50I_FBD_LAY_CROP		0x14
++#define SUN50I_FBD_LAY_CROP_TOP(v)	((v) << 16)
++#define SUN50I_FBD_LAY_CROP_LEFT(v)	((v) << 0)
++
++#define SUN50I_FBD_FMT			0x18
++#define SUN50I_FBD_FMT_SBS1(v)		((v) << 18)
++#define SUN50I_FBD_FMT_SBS0(v)		((v) << 16)
++#define SUN50I_FBD_FMT_YUV_TRAN		BIT(7)
++#define SUN50I_FBD_FMT_IN_FMT(v)	((v) << 0)
++
++#define SUN50I_FBD_LADDR		0x20
++#define SUN50I_FBD_HADDR		0x24
++
++#define SUN50I_FBD_OVL_SIZE		0x30
++#define SUN50I_FBD_OVL_SIZE_HEIGHT(v)	(((v) - 1) << 16)
++#define SUN50I_FBD_OVL_SIZE_WIDTH(v)	(((v) - 1) << 0)
++
++#define SUN50I_FBD_OVL_COOR		0x34
++#define SUN50I_FBD_OVL_COOR_Y(v)	((v) << 16)
++#define SUN50I_FBD_OVL_COOR_X(v)	((v) << 0)
++
++#define SUN50I_FBD_OVL_BG_COLOR		0x38
++
++#define SUN50I_FBD_DEFAULT_COLOR0	0x50
++#define SUN50I_FBD_DEFAULT_COLOR0_ALPHA(v) ((v) << 16)
++#define SUN50I_FBD_DEFAULT_COLOR0_YR(v)	((v) << 0)
++
++#define SUN50I_FBD_DEFAULT_COLOR1	0x54
++#define SUN50I_FBD_DEFAULT_COLOR1_UG(v)	((v) << 16)
++#define SUN50I_FBD_DEFAULT_COLOR1_VB(v)	((v) << 0)
++
++struct drm_plane;
++struct sun8i_layer;
++struct sun8i_rdma;
++
++extern const u64 sun50i_afbc_modifiers[];
++
++bool sun50i_afbc_format_mod_supported(struct sun8i_layer *layer,
++				      u32 format, u64 modifier);
++int sun50i_afbc_init(struct sun8i_layer *layer, struct sun8i_rdma *rdma,
++		     void __iomem *reg_base);
++void sun50i_afbc_atomic_update(struct sun8i_layer *layer,
++			       struct drm_plane *plane);
++void sun50i_afbc_disable(struct sun8i_layer *layer);
++
++#endif
+diff --git a/drivers/gpu/drm/sun4i/sun50i_planes.c b/drivers/gpu/drm/sun4i/sun50i_planes.c
+index 6469de1..fd0bfa4 100644
+--- a/drivers/gpu/drm/sun4i/sun50i_planes.c
++++ b/drivers/gpu/drm/sun4i/sun50i_planes.c
+@@ -4,15 +4,17 @@
+ #include <drm/drm_device.h>
+ 
+ #include <linux/device.h>
++#include <linux/dma-mapping.h>
+ #include <linux/io.h>
+-#include <linux/mfd/syscon.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/of_graph.h>
++#include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/regmap.h>
+ 
+ #include "sun50i_planes.h"
++#include "sun8i_rdma.h"
+ #include "sun8i_ui_layer.h"
+ #include "sun8i_vi_layer.h"
+ 
+@@ -29,12 +31,18 @@ static const struct sun50i_planes_quirks sun50i_h616_planes_quirks = {
+ 	},
+ 	.cfg = {
+ 		.de_type	= SUN8I_MIXER_DE33,
+-		/*
+-		 * TODO: All planes support scaling, but driver needs
+-		 * improvements to properly support it.
+-		 */
+-		.scaler_mask    = 0,
+-		.scanline_yuv	= 4096,
++		.afbc_mask	= BIT(0),
++		.scaler_type    = {
++			[0] = SUN8I_SCALER_VI_ED,
++			[1] = SUN8I_SCALER_VI_8,
++			[2] = SUN8I_SCALER_VI_8,
++			[6] = SUN8I_SCALER_VI_8,
++			[7] = SUN8I_SCALER_VI_8,
++			[8] = SUN8I_SCALER_VI_8,
++		},
++		.scanline_yuv	= {4096, 2048, 2048},
++		.scanline_rgb	= {4096, 2048, 2048, 0, 0, 0, 2048, 2048, 2048},
++		.scanline_ed	= {4096},
+ 	},
+ };
+ 
+@@ -49,7 +57,7 @@ MODULE_DEVICE_TABLE(of, sun50i_planes_of_table);
+ 
+ struct drm_plane **
+ sun50i_planes_setup(struct device *dev, struct drm_device *drm,
+-		    unsigned int mixer)
++		    unsigned int mixer, struct sun8i_rdma *rdma)
+ {
+ 	struct sun50i_planes *planes = dev_get_drvdata(dev);
+ 	const struct sun50i_planes_quirks *quirks;
+@@ -91,13 +99,15 @@ sun50i_planes_setup(struct device *dev, struct drm_device *drm,
+ 			type = DRM_PLANE_TYPE_OVERLAY;
+ 
+ 		if (phy_ch < UI_PLANE_OFFSET)
+-			layer = sun8i_vi_layer_init_one(drm, type, planes->regs,
+-							i, phy_ch, map->num_ch,
+-							&quirks->cfg);
++			layer = sun8i_vi_layer_init_one(drm, type, i, phy_ch,
++							map->num_ch,
++							&quirks->cfg, rdma,
++							planes->base);
+ 		else
+-			layer = sun8i_ui_layer_init_one(drm, type, planes->regs,
+-							i, phy_ch, map->num_ch,
+-							&quirks->cfg);
++			layer = sun8i_ui_layer_init_one(drm, type, i, phy_ch,
++							map->num_ch,
++							&quirks->cfg, rdma,
++							planes->base);
+ 
+ 		if (IS_ERR(layer)) {
+ 			dev_err(drm->dev,
+@@ -110,7 +120,6 @@ sun50i_planes_setup(struct device *dev, struct drm_device *drm,
+ 
+ 	return drm_planes;
+ }
+-EXPORT_SYMBOL(sun50i_planes_setup);
+ 
+ static void sun50i_planes_init_mapping(struct sun50i_planes *planes)
+ {
+@@ -144,58 +153,61 @@ static void sun50i_planes_init_mapping(struct sun50i_planes *planes)
+ 	}
+ }
+ 
+-static const struct regmap_config sun50i_planes_regmap_config = {
+-	.name		= "planes",
+-	.reg_bits	= 32,
+-	.val_bits	= 32,
+-	.reg_stride	= 4,
+-	.max_register	= 0x17fffc,
+-};
+-
+ static int sun50i_planes_probe(struct platform_device *pdev)
+ {
++	struct platform_device *clk_pdev;
+ 	struct device *dev = &pdev->dev;
+ 	struct sun50i_planes *planes;
+-	void __iomem *regs;
++	struct device_node *np;
++	int ret;
++
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(40));
++	if (ret)
++		return dev_err_probe(dev, ret, "Cannot set DMA mask\n");
+ 
+ 	planes = devm_kzalloc(dev, sizeof(*planes), GFP_KERNEL);
+ 	if (!planes)
+ 		return -ENOMEM;
+ 
+-	planes->quirks = of_device_get_match_data(&pdev->dev);
++	planes->quirks = of_device_get_match_data(dev);
+ 	if (!planes->quirks)
+ 		return dev_err_probe(dev, -EINVAL, "Unable to get quirks\n");
+ 
+-	planes->mapping = syscon_regmap_lookup_by_phandle(dev->of_node,
+-							  "allwinner,plane-mapping");
+-	if (IS_ERR(planes->mapping))
+-		return dev_err_probe(dev, PTR_ERR(planes->mapping),
+-				     "Unable to get mapping\n");
+-
+-	regs = devm_platform_ioremap_resource(pdev, 0);
+-	if (IS_ERR(regs))
+-		return PTR_ERR(regs);
++	np = of_parse_phandle(dev->of_node,
++			      "allwinner,plane-mapping", 0);
++	clk_pdev = of_find_device_by_node(np);
++	of_node_put(np);
++	if (!clk_pdev)
++		return dev_err_probe(dev, -EPROBE_DEFER, "Unable to get mapping\n");
++
++	planes->mapping = dev_get_regmap(&clk_pdev->dev, NULL);
++	if (!planes->mapping) {
++		platform_device_put(clk_pdev);
++		return dev_err_probe(dev, -EINVAL, "Unable to get regmap\n");
++	}
+ 
+-	planes->regs = devm_regmap_init_mmio(dev, regs, &sun50i_planes_regmap_config);
+-	if (IS_ERR(planes->regs))
+-		return PTR_ERR(planes->regs);
++	if (!device_link_add(dev, &clk_pdev->dev,
++			     DL_FLAG_AUTOREMOVE_CONSUMER)) {
++		platform_device_put(clk_pdev);
++		return dev_err_probe(dev, -EINVAL, "Failed to create link\n");
++	}
++	platform_device_put(clk_pdev);
+ 
+-	dev_set_drvdata(dev, planes);
++	planes->base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(planes->base))
++		return PTR_ERR(planes->base);
+ 
+ 	sun50i_planes_init_mapping(planes);
+ 
++	dev_set_drvdata(dev, planes);
++
+ 	return 0;
+ }
+ 
+-static struct platform_driver sun50i_planes_platform_driver = {
++struct platform_driver sun50i_planes_platform_driver = {
+ 	.probe		= sun50i_planes_probe,
+ 	.driver		= {
+ 		.name		= "sun50i-planes",
+ 		.of_match_table	= sun50i_planes_of_table,
+ 	},
+ };
+-module_platform_driver(sun50i_planes_platform_driver);
+-
+-MODULE_AUTHOR("Jernej Skrabec <jernej.skrabec@gmail.com>");
+-MODULE_DESCRIPTION("Allwinner DE33 planes driver");
+-MODULE_LICENSE("GPL");
+diff --git a/drivers/gpu/drm/sun4i/sun50i_planes.h b/drivers/gpu/drm/sun4i/sun50i_planes.h
+index e5b54ed..76c2f35 100644
+--- a/drivers/gpu/drm/sun4i/sun50i_planes.h
++++ b/drivers/gpu/drm/sun4i/sun50i_planes.h
+@@ -12,11 +12,11 @@
+ #define SUNXI_DE33_DE_PORT12CHN_MUX_REG	0x2c
+ 
+ #define MAX_DISP	2
+-#define MAX_CHANNELS	8
+ #define UI_PLANE_OFFSET	6
+ 
+ struct regmap;
+ struct drm_device;
++struct sun8i_rdma;
+ 
+ struct default_map {
+ 	unsigned int map[MAX_CHANNELS];
+@@ -29,13 +29,15 @@ struct sun50i_planes_quirks {
+ };
+ 
+ struct sun50i_planes {
+-	struct regmap				*regs;
+ 	struct regmap				*mapping;
+ 	const struct sun50i_planes_quirks	*quirks;
++	void __iomem				*base;
+ };
+ 
+ struct drm_plane **
+ sun50i_planes_setup(struct device *dev, struct drm_device *drm,
+-		    unsigned int mixer);
++		    unsigned int mixer, struct sun8i_rdma *rdma);
++
++extern struct platform_driver sun50i_planes_platform_driver;
+ 
+ #endif /* _SUN50I_PLANES_H_ */
+diff --git a/drivers/gpu/drm/sun4i/sun50i_wb.c b/drivers/gpu/drm/sun4i/sun50i_wb.c
+new file mode 100644
+index 0000000..f64165b
+--- /dev/null
++++ b/drivers/gpu/drm/sun4i/sun50i_wb.c
+@@ -0,0 +1,914 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Allwinner DE3 real-time write-back (RT-WB) as a DRM writeback connector.
++ *
++ * The RT-WB engine captures the blender output of a mixer (pre-TCON),
++ * optionally converts or scales it, and writes it to memory.
++ *
++ * Copyright (C) 2026 Jernej Skrabec <jernej.skrabec@gmail.com>
++ */
++
++#include <linux/clk.h>
++#include <linux/completion.h>
++#include <linux/component.h>
++#include <linux/dma-fence.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/math64.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/reset.h>
++
++#include <drm/drm_atomic.h>
++#include <drm/drm_atomic_helper.h>
++#include <drm/drm_drv.h>
++#include <drm/drm_edid.h>
++#include <drm/drm_fb_dma_helper.h>
++#include <drm/drm_fourcc.h>
++#include <drm/drm_framebuffer.h>
++#include <drm/drm_gem_dma_helper.h>
++#include <drm/drm_of.h>
++#include <drm/drm_print.h>
++#include <drm/drm_probe_helper.h>
++#include <drm/drm_vblank.h>
++#include <drm/drm_writeback.h>
++
++#include "sun4i_crtc.h"
++#include "sunxi_engine.h"
++
++#define WB_GCTRL		0x00
++#define WB_GCTRL_CLK_GATE	BIT(29)
++#define WB_GCTRL_AUTO_GATE	BIT(28)
++#define WB_GCTRL_PORT(p)	((p) << 16)
++#define WB_GCTRL_SOFT_RESET	BIT(4)
++#define WB_GCTRL_START		BIT(0)
++
++#define WB_SIZE			0x04
++#define WB_CROP_COORD		0x08
++#define WB_CROP_SIZE		0x0c
++#define WB_A_CH0_ADDR		0x10
++#define WB_A_CH1_ADDR		0x14
++#define WB_A_CH2_ADDR		0x18
++#define WB_A_HIGH_ADDR		0x1c
++#define WB_CH0_PITCH		0x30
++#define WB_CH12_PITCH		0x34
++#define WB_ADDR_SWITCH		0x40
++#define WB_FORMAT		0x44
++#define WB_FORMAT_RGB888	0x0
++#define WB_FORMAT_BGR888	0x1
++#define WB_FORMAT_XRGB8888	0x4
++#define WB_FORMAT_XBGR8888	0x5
++#define WB_FORMAT_BGRX8888	0x6
++#define WB_FORMAT_RGBX8888	0x7
++#define WB_FORMAT_YUV420P	0x8
++#define WB_FORMAT_NV12		0xc
++#define WB_FORMAT_NV21		0xd
++#define WB_FORMAT_10BIT		BIT(4)
++#define WB_INT			0x48
++#define WB_STATUS		0x4c
++#define WB_STATUS_BUSY		BIT(8)
++#define WB_STATUS_TIMEOUT	BIT(6)
++#define WB_STATUS_OVERFLOW	BIT(5)
++#define WB_STATUS_FINISH	BIT(4)
++#define WB_STATUS_IRQ		BIT(0)
++#define WB_STATUS_W1C		(WB_STATUS_TIMEOUT | WB_STATUS_OVERFLOW | \
++				 WB_STATUS_FINISH | WB_STATUS_IRQ)
++#define WB_SFTM			0x50
++#define WB_BYPASS		0x54
++#define WB_DE3_CSC_EN		BIT(0)
++#define WB_COARSE_EN		BIT(1)
++#define WB_FINE_EN		BIT(2)
++#define WB_CS_HORZ		0x70
++#define WB_CS_VERT		0x74
++#define WB_FS_INSIZE		0x80
++#define WB_FS_OUTSIZE		0x84
++#define WB_FS_HSTEP		0x88
++#define WB_FS_VSTEP		0x8c
++#define WB_CSC_CTL		0x90
++#define WB_CSC_D(n)		(0x94 + (n) * 4)
++#define WB_CSC_COEFF(n)	(0xa0 + (n) * 4)
++#define WB_START		0xe0
++#define WB_YHCOEFF(n)		(0x200 + (n) * 4)
++#define WB_CHCOEFF(n)		(0x280 + (n) * 4)
++
++#define WB_MAX_INPUTS		2
++#define WB_MAX_CRTCS		32
++#define WB_MAX_WIDTH		4096
++#define WB_MAX_HEIGHT		4096
++#define WB_MIN_WIDTH		8
++#define WB_MIN_HEIGHT		4
++#define WB_YUV_MAX_WIDTH	2048
++
++#define DE33_RTWB_MUX		0x20
++#define DE33_RTWB_FROM_DSC	BIT(0)
++#define DE33_RTWB_START		BIT(4)
++#define DE33_RTWB_SELF_TIMING	BIT(5)
++#define DE33_WB_OFFSET		0x11000
++
++#define WB_RCQ_STATUS		0x04
++#define WB_RCQ_STATUS_FINISH	BIT(2)
++#define WB_RCQ_STATUS_W1C	GENMASK(3, 2)
++#define WB_RCQ_CTL		0x10
++
++struct sun50i_wb_rcq_head {
++	u32 low_addr;
++	u32 len_hi;
++	u32 dirty;
++	u32 reg_offset;
++};
++
++struct sun50i_wb_cfg {
++	const u32 *formats;
++	unsigned int format_count;
++	unsigned int max_output_width;
++	bool has_rcq;
++};
++
++struct sun50i_wb {
++	struct drm_writeback_connector	wb_conn;
++	void __iomem			*regs;
++	struct clk			*bus_clk;
++	struct clk			*mod_clk;
++	struct reset_control		*reset;
++	struct device			*dev;
++	struct device			*dma_dev;
++	const struct sun50i_wb_cfg	*cfg;
++	struct regmap			*top;
++	void __iomem			*rcq;
++	void				*shadow;
++	dma_addr_t			shadow_dma;
++	struct sun50i_wb_rcq_head	*heads;
++	dma_addr_t			heads_dma;
++	u8				crtc_port[WB_MAX_CRTCS];
++	u32				rtwb_mux;
++	struct drm_crtc			*self_timing_crtc;
++	struct drm_crtc_commit		*self_timing_commit;
++	struct completion		job_done;
++};
++
++static const u32 sun50i_wb_formats[] = {
++	DRM_FORMAT_RGB888,
++	DRM_FORMAT_BGR888,
++	DRM_FORMAT_XRGB8888,
++	DRM_FORMAT_XBGR8888,
++	DRM_FORMAT_RGBX8888,
++	DRM_FORMAT_BGRX8888,
++	DRM_FORMAT_XRGB2101010,
++	DRM_FORMAT_YUV420,
++	DRM_FORMAT_NV12,
++	DRM_FORMAT_NV21,
++};
++
++static const u32 sun50i_h616_wb_formats[] = {
++	DRM_FORMAT_RGB888,
++	DRM_FORMAT_BGR888,
++	DRM_FORMAT_XRGB8888,
++	DRM_FORMAT_ARGB8888,
++	DRM_FORMAT_XBGR8888,
++	DRM_FORMAT_ABGR8888,
++	DRM_FORMAT_RGBX8888,
++	DRM_FORMAT_RGBA8888,
++	DRM_FORMAT_BGRX8888,
++	DRM_FORMAT_BGRA8888,
++	DRM_FORMAT_XRGB2101010,
++	DRM_FORMAT_AYUV,
++	DRM_FORMAT_YUV420,
++	DRM_FORMAT_NV12,
++	DRM_FORMAT_NV21,
++};
++
++static const struct sun50i_wb_cfg sun50i_h6_wb_cfg = {
++	.formats = sun50i_wb_formats,
++	.format_count = ARRAY_SIZE(sun50i_wb_formats),
++	.max_output_width = WB_MAX_WIDTH,
++};
++
++static const struct sun50i_wb_cfg sun50i_h616_wb_cfg = {
++	.formats = sun50i_h616_wb_formats,
++	.format_count = ARRAY_SIZE(sun50i_h616_wb_formats),
++	.max_output_width = WB_YUV_MAX_WIDTH,
++	.has_rcq = true,
++};
++
++static const u32 sun50i_wb_coeff_up[] = {
++	0x00004000, 0x00033ffe, 0x00063efc, 0x000a3bfb,
++	0xff0f37fb, 0xfe1433fb, 0xfd192ffb, 0xfd1f29fb,
++	0xfc2424fc, 0xfb291ffd, 0xfb2f19fd, 0xfb3314fe,
++	0xfb370fff, 0xfb3b0a00, 0xfc3e0600, 0xfe3f0300,
++};
++
++static const u32 sun50i_wb_coeff_down[] = {
++	0x000e240e, 0x0010240c, 0x0013230a, 0x00142309,
++	0x00162208, 0x01182106, 0x011a2005, 0x021b1f04,
++	0x031d1d03, 0x041e1c02, 0x05201a01, 0x06211801,
++	0x07221601, 0x09231400, 0x0a231300, 0x0c231100,
++};
++
++/* Full-range RGB to limited-range YCbCr, using DE33's 17-bit factors. */
++static const u32 sun50i_wb_rgb2yuv[2][12] = {
++	[DRM_COLOR_YCBCR_BT601] = {
++		0x0000837a, 0x0001021d, 0x00003221, 0x00000040,
++		0xffffb41c, 0xffff6b03, 0x0000e0e1, 0x00000200,
++		0x0000e0e1, 0xffff43b1, 0xffffdb6e, 0x00000200,
++	},
++	[DRM_COLOR_YCBCR_BT709] = {
++		0x00005d7c, 0x00013a7c, 0x00001fbf, 0x00000040,
++		0xffffcc78, 0xffff52a7, 0x0000e0e1, 0x00000200,
++		0x0000e0e1, 0xffff33be, 0xffffeb61, 0x00000200,
++	},
++};
++
++static struct sun50i_wb *conn_to_wb(struct drm_connector *conn)
++{
++	struct drm_writeback_connector *wb_conn =
++		container_of(conn, struct drm_writeback_connector, base);
++
++	return container_of(wb_conn, struct sun50i_wb, wb_conn);
++}
++
++static struct sun50i_wb *encoder_to_wb(struct drm_encoder *encoder)
++{
++	struct drm_writeback_connector *wb_conn;
++
++	wb_conn = container_of(encoder, struct drm_writeback_connector, encoder);
++	return container_of(wb_conn, struct sun50i_wb, wb_conn);
++}
++
++static void sun50i_wb_write(struct sun50i_wb *wb, u32 reg, u32 value)
++{
++	if (wb->cfg->has_rcq)
++		*(u32 *)(wb->shadow + reg) = value;
++	else
++		writel(value, wb->regs + reg);
++}
++
++static void sun50i_wb_submit_rcq(struct sun50i_wb *wb)
++{
++	unsigned int i;
++
++	writel(0, wb->rcq + WB_RCQ_CTL);
++	writel(WB_RCQ_STATUS_W1C, wb->rcq + WB_RCQ_STATUS);
++	for (i = 0; i < 4; i++)
++		wb->heads[i].dirty = 1;
++	dma_wmb();
++	writel(1, wb->rcq + WB_RCQ_CTL);
++}
++
++static int sun50i_wb_init_rcq(struct sun50i_wb *wb)
++{
++	static const struct {
++		u32 offset;
++		u32 size;
++		u32 reg_offset;
++	} blocks[] = {
++		{ 0x000, 0x0d0, DE33_WB_OFFSET + 0x000 },
++		{ 0x200, 0x040, DE33_WB_OFFSET + 0x200 },
++		{ 0x280, 0x040, DE33_WB_OFFSET + 0x280 },
++		/* The start value is stored at 0xe0 but targets GCTRL. */
++		{ 0x0e0, 0x004, DE33_WB_OFFSET + 0x000 },
++	};
++	unsigned int i;
++
++	wb->shadow = dmam_alloc_coherent(wb->dma_dev, 0x300, &wb->shadow_dma,
++					 GFP_KERNEL);
++	if (!wb->shadow)
++		return -ENOMEM;
++
++	wb->heads = dmam_alloc_coherent(wb->dma_dev, sizeof(*wb->heads) * 4,
++					&wb->heads_dma, GFP_KERNEL);
++	if (!wb->heads)
++		return -ENOMEM;
++
++	for (i = 0; i < ARRAY_SIZE(blocks); i++) {
++		dma_addr_t addr = wb->shadow_dma + blocks[i].offset;
++
++		wb->heads[i].low_addr = lower_32_bits(addr);
++		wb->heads[i].len_hi = blocks[i].size |
++					 (upper_32_bits(addr) << 24);
++		wb->heads[i].reg_offset = blocks[i].reg_offset;
++	}
++
++	writel(lower_32_bits(wb->heads_dma), wb->rcq + 0x14);
++	writel(upper_32_bits(wb->heads_dma), wb->rcq + 0x18);
++	writel(sizeof(*wb->heads) * 4, wb->rcq + 0x1c);
++
++	return 0;
++}
++
++static u32 sun50i_wb_format(u32 format)
++{
++	switch (format) {
++	case DRM_FORMAT_RGB888:
++		return WB_FORMAT_RGB888;
++	case DRM_FORMAT_BGR888:
++		return WB_FORMAT_BGR888;
++	case DRM_FORMAT_XRGB8888:
++	case DRM_FORMAT_ARGB8888:
++		return WB_FORMAT_XRGB8888;
++	case DRM_FORMAT_XBGR8888:
++	case DRM_FORMAT_ABGR8888:
++		return WB_FORMAT_XBGR8888;
++	case DRM_FORMAT_BGRX8888:
++	case DRM_FORMAT_BGRA8888:
++		return WB_FORMAT_BGRX8888;
++	case DRM_FORMAT_RGBX8888:
++	case DRM_FORMAT_RGBA8888:
++		return WB_FORMAT_RGBX8888;
++	case DRM_FORMAT_XRGB2101010:
++		return WB_FORMAT_10BIT;
++	case DRM_FORMAT_AYUV:
++		return WB_FORMAT_XRGB8888;
++	case DRM_FORMAT_YUV420:
++		return WB_FORMAT_YUV420P;
++	case DRM_FORMAT_NV12:
++		return WB_FORMAT_NV12;
++	case DRM_FORMAT_NV21:
++		return WB_FORMAT_NV21;
++	default:
++		return U32_MAX;
++	}
++}
++
++static void sun50i_wb_set_scaler(struct sun50i_wb *wb, u32 in_w, u32 in_h,
++				 u32 out_w, u32 out_h,
++				 const struct drm_format_info *format)
++{
++	bool subsampled = format->hsub > 1 || format->vsub > 1;
++	unsigned int i;
++	const u32 *c_coeff;
++	const u32 *y_coeff;
++	u32 control = format->is_yuv && !wb->cfg->has_rcq ?
++		      WB_DE3_CSC_EN : 0;
++	u32 step_h;
++	u32 step_v;
++	u32 mid_h = in_h;
++	u32 mid_w = in_w;
++
++	if (in_w > 2 * out_w) {
++		sun50i_wb_write(wb, WB_CS_HORZ, in_w | (out_w << 17));
++		mid_w = 2 * out_w;
++		control |= WB_COARSE_EN;
++	} else {
++		sun50i_wb_write(wb, WB_CS_HORZ, 0);
++	}
++
++	if (in_h > 2 * out_h) {
++		sun50i_wb_write(wb, WB_CS_VERT, in_h | (out_h << 17));
++		mid_h = 2 * out_h;
++		control |= WB_COARSE_EN;
++	} else {
++		sun50i_wb_write(wb, WB_CS_VERT, 0);
++	}
++
++	if (mid_w != out_w || mid_h != out_h || subsampled) {
++		control |= WB_FINE_EN;
++		step_h = div_u64((u64)mid_w << 18, out_w) << 2;
++		step_v = div_u64((u64)mid_h << 18, out_h) << 2;
++		y_coeff = (mid_w > out_w || mid_h > out_h) ?
++			sun50i_wb_coeff_down : sun50i_wb_coeff_up;
++		c_coeff = (mid_w > out_w / format->hsub ||
++			   mid_h > out_h / format->vsub) ?
++			sun50i_wb_coeff_down : sun50i_wb_coeff_up;
++		for (i = 0; i < ARRAY_SIZE(sun50i_wb_coeff_up); i++) {
++			sun50i_wb_write(wb, WB_YHCOEFF(i), y_coeff[i]);
++			sun50i_wb_write(wb, WB_CHCOEFF(i), c_coeff[i]);
++		}
++	} else {
++		step_h = 1 << 20;
++		step_v = 1 << 20;
++	}
++
++	sun50i_wb_write(wb, WB_FS_INSIZE,
++			(mid_h - 1) << 16 | (mid_w - 1));
++	sun50i_wb_write(wb, WB_FS_OUTSIZE,
++			(out_h - 1) << 16 | (out_w - 1));
++	sun50i_wb_write(wb, WB_FS_HSTEP, step_h);
++	sun50i_wb_write(wb, WB_FS_VSTEP, step_v);
++	sun50i_wb_write(wb, WB_BYPASS, control);
++}
++
++static void sun50i_wb_set_csc(struct sun50i_wb *wb,
++			      const struct drm_format_info *format,
++			      u32 width, u32 height)
++{
++	enum drm_color_encoding encoding;
++	const u32 *coeff;
++	unsigned int i;
++
++	if (!wb->cfg->has_rcq)
++		return;
++
++	if (!format->is_yuv) {
++		sun50i_wb_write(wb, WB_CSC_CTL, 0);
++		return;
++	}
++
++	encoding = width <= 736 && height <= 576 ?
++		   DRM_COLOR_YCBCR_BT601 : DRM_COLOR_YCBCR_BT709;
++	coeff = sun50i_wb_rgb2yuv[encoding];
++
++	sun50i_wb_write(wb, WB_CSC_CTL, 1);
++	for (i = 0; i < 3; i++)
++		sun50i_wb_write(wb, WB_CSC_D(i), 0);
++	for (i = 0; i < 12; i++)
++		sun50i_wb_write(wb, WB_CSC_COEFF(i), coeff[i]);
++}
++
++static irqreturn_t sun50i_wb_irq(int irq, void *data)
++{
++	struct sun50i_wb *wb = data;
++	u32 status = readl(wb->regs + WB_STATUS);
++	int ret;
++
++	if (!(status & WB_STATUS_IRQ))
++		return IRQ_NONE;
++
++	if (status & WB_STATUS_FINISH)
++		ret = 0;
++	else
++		ret = -EIO;
++
++	writel(WB_STATUS_W1C, wb->regs + WB_STATUS);
++	if (wb->cfg->has_rcq)
++		regmap_write(wb->top, DE33_RTWB_MUX, wb->rtwb_mux);
++	writel(0, wb->regs + WB_INT);
++
++	/*
++	 * Stop and reset the engine, like the vendor driver does after
++	 * every capture. Leaving it merely idle keeps it attached to the
++	 * blender output and can stall the whole mixer pipeline.
++	 */
++	writel(WB_GCTRL_CLK_GATE | WB_GCTRL_SOFT_RESET, wb->regs + WB_GCTRL);
++
++	if (wb->self_timing_crtc) {
++		drm_crtc_handle_vblank(wb->self_timing_crtc);
++		sun4i_crtc_finish_page_flip(wb->self_timing_crtc);
++		wb->self_timing_crtc = NULL;
++	}
++	if (wb->self_timing_commit) {
++		complete_all(&wb->self_timing_commit->flip_done);
++		drm_crtc_commit_put(wb->self_timing_commit);
++		wb->self_timing_commit = NULL;
++	}
++	drm_writeback_signal_completion(&wb->wb_conn, ret);
++	complete(&wb->job_done);
++
++	return IRQ_HANDLED;
++}
++
++static int sun50i_wb_encoder_atomic_check(struct drm_encoder *encoder,
++					  struct drm_crtc_state *crtc_state,
++					  struct drm_connector_state *conn_state)
++{
++	struct sun50i_wb *wb = encoder_to_wb(encoder);
++	struct drm_framebuffer *fb;
++
++	if (wb->cfg->has_rcq &&
++	    crtc_state->connector_mask ==
++	    drm_connector_mask(&wb->wb_conn.base))
++		crtc_state->no_vblank = true;
++
++	if (!conn_state->writeback_job)
++		return 0;
++
++	fb = conn_state->writeback_job->fb;
++	if (sun50i_wb_format(fb->format->format) == U32_MAX)
++		return -EINVAL;
++
++	if (crtc_state->mode.hdisplay < WB_MIN_WIDTH ||
++	    crtc_state->mode.hdisplay > WB_MAX_WIDTH ||
++	    crtc_state->mode.vdisplay < WB_MIN_HEIGHT ||
++	    crtc_state->mode.vdisplay > WB_MAX_HEIGHT)
++		return -EINVAL;
++
++	if (fb->width < WB_MIN_WIDTH || fb->height < WB_MIN_HEIGHT ||
++	    fb->width > crtc_state->mode.hdisplay ||
++	    fb->height > crtc_state->mode.vdisplay ||
++	    fb->width > wb->cfg->max_output_width)
++		return -EINVAL;
++
++	if (fb->format->is_yuv && fb->width > WB_YUV_MAX_WIDTH)
++		return -EINVAL;
++
++	if (fb->width % fb->format->hsub || fb->height % fb->format->vsub)
++		return -EINVAL;
++
++	if (fb->format->format == DRM_FORMAT_YUV420 &&
++	    fb->pitches[1] != fb->pitches[2])
++		return -EINVAL;
++
++	if (fb->format->format == DRM_FORMAT_XRGB2101010 &&
++	    (fb->width != crtc_state->mode.hdisplay ||
++	     fb->height != crtc_state->mode.vdisplay))
++		return -EINVAL;
++
++	return 0;
++}
++
++static bool sun50i_wb_has_external_timing(struct sun50i_wb *wb,
++					  struct drm_crtc *crtc)
++{
++	struct drm_connector_list_iter iter;
++	struct drm_connector *connector;
++	bool has_timing = false;
++
++	drm_connector_list_iter_begin(crtc->dev, &iter);
++	drm_for_each_connector_iter(connector, &iter) {
++		if (connector != &wb->wb_conn.base &&
++		    connector->state->crtc == crtc) {
++			has_timing = true;
++			break;
++		}
++	}
++	drm_connector_list_iter_end(&iter);
++
++	return has_timing;
++}
++
++static bool sun50i_wb_prepare_rtwb(struct sun50i_wb *wb,
++				   struct drm_crtc *crtc)
++{
++	unsigned int crtc_index = drm_crtc_index(crtc);
++	bool external_timing;
++
++	wb->rtwb_mux = wb->crtc_port[crtc_index] * 2;
++	external_timing = sun50i_wb_has_external_timing(wb, crtc);
++	if (!external_timing)
++		wb->rtwb_mux |= DE33_RTWB_FROM_DSC |
++				  DE33_RTWB_SELF_TIMING;
++	regmap_write(wb->top, DE33_RTWB_MUX, wb->rtwb_mux);
++
++	return external_timing;
++}
++
++static void
++sun50i_wb_encoder_atomic_mode_set(struct drm_encoder *encoder,
++				  struct drm_crtc_state *crtc_state,
++				  struct drm_connector_state *conn_state)
++{
++	struct sun50i_wb *wb = encoder_to_wb(encoder);
++
++	if (wb->cfg->has_rcq)
++		sun50i_wb_prepare_rtwb(wb, conn_state->crtc);
++}
++
++static const struct drm_encoder_helper_funcs sun50i_wb_encoder_helper_funcs = {
++	.atomic_check	= sun50i_wb_encoder_atomic_check,
++	.atomic_mode_set = sun50i_wb_encoder_atomic_mode_set,
++};
++
++static void sun50i_wb_atomic_commit(struct drm_connector *conn,
++				    struct drm_atomic_commit *state)
++{
++	struct drm_connector_state *conn_state =
++		drm_atomic_get_new_connector_state(state, conn);
++	struct drm_writeback_job *job = conn_state->writeback_job;
++	struct drm_gem_dma_object *gem;
++	struct drm_framebuffer *fb;
++	struct sun50i_wb *wb = conn_to_wb(conn);
++	struct drm_crtc *crtc = conn_state->crtc;
++	dma_addr_t addr[3] = {};
++	unsigned int crtc_index;
++	unsigned int i;
++	u32 format;
++	u32 gctrl;
++	u32 out_h;
++	u32 out_w;
++	u32 high = 0;
++	u32 port;
++	u32 h;
++	u32 w;
++	bool external_timing;
++
++	if (!job || !job->fb || !crtc)
++		return;
++
++	if (!wait_for_completion_timeout(&wb->job_done, HZ)) {
++		drm_err(conn->dev, "previous writeback job never completed\n");
++
++		/* Quiesce the interrupt and consider the old job lost. */
++		writel(0, wb->regs + WB_INT);
++		writel(WB_STATUS_W1C, wb->regs + WB_STATUS);
++		if (wb->cfg->has_rcq)
++			regmap_write(wb->top, DE33_RTWB_MUX, wb->rtwb_mux);
++		wb->self_timing_crtc = NULL;
++		if (wb->self_timing_commit) {
++			complete_all(&wb->self_timing_commit->flip_done);
++			drm_crtc_commit_put(wb->self_timing_commit);
++			wb->self_timing_commit = NULL;
++		}
++		drm_writeback_signal_completion(&wb->wb_conn, -ETIMEDOUT);
++	}
++	reinit_completion(&wb->job_done);
++
++	fb = job->fb;
++	w = crtc->state->mode.hdisplay;
++	h = crtc->state->mode.vdisplay;
++	out_w = fb->width;
++	out_h = fb->height;
++	external_timing = !wb->cfg->has_rcq ||
++			  sun50i_wb_prepare_rtwb(wb, crtc);
++	crtc_index = drm_crtc_index(crtc);
++	port = wb->crtc_port[crtc_index];
++	format = sun50i_wb_format(fb->format->format);
++
++	for (i = 0; i < fb->format->num_planes; i++) {
++		gem = drm_fb_dma_get_gem_obj(fb, i);
++		addr[i] = gem->dma_addr + fb->offsets[i];
++		high |= (upper_32_bits(addr[i]) & 0xff) << (8 * i);
++	}
++
++	gctrl = WB_GCTRL_CLK_GATE | WB_GCTRL_AUTO_GATE;
++	if (wb->cfg->has_rcq) {
++		gctrl = WB_GCTRL_AUTO_GATE;
++		if (!external_timing) {
++			wb->self_timing_crtc = crtc;
++			wb->self_timing_commit =
++				drm_crtc_commit_get(state->crtcs[crtc_index].commit);
++		} else {
++			wb->self_timing_crtc = NULL;
++			wb->self_timing_commit = NULL;
++		}
++	} else {
++		gctrl |= WB_GCTRL_PORT(port);
++	}
++	sun50i_wb_write(wb, WB_GCTRL, gctrl);
++
++	sun50i_wb_write(wb, WB_SIZE, (h - 1) << 16 | (w - 1));
++	sun50i_wb_write(wb, WB_CROP_COORD, 0);
++	sun50i_wb_write(wb, WB_CROP_SIZE, (h - 1) << 16 | (w - 1));
++
++	sun50i_wb_write(wb, WB_A_CH0_ADDR, lower_32_bits(addr[0]));
++	sun50i_wb_write(wb, WB_A_CH1_ADDR, lower_32_bits(addr[1]));
++	sun50i_wb_write(wb, WB_A_CH2_ADDR, lower_32_bits(addr[2]));
++	sun50i_wb_write(wb, WB_A_HIGH_ADDR, high);
++	sun50i_wb_write(wb, WB_CH0_PITCH, fb->pitches[0]);
++	sun50i_wb_write(wb, WB_CH12_PITCH,
++			fb->format->num_planes > 1 ? fb->pitches[1] : 0);
++
++	sun50i_wb_write(wb, WB_ADDR_SWITCH, 0); /* group A, no auto switch */
++	sun50i_wb_write(wb, WB_FORMAT, format);
++	sun50i_wb_write(wb, WB_INT, 1);
++	if (wb->cfg->has_rcq)
++		sun50i_wb_write(wb, WB_SFTM, 0x20);
++
++	sun50i_wb_set_scaler(wb, w, h, out_w, out_h, fb->format);
++	sun50i_wb_set_csc(wb, fb->format, out_w, out_h);
++	if (wb->cfg->has_rcq)
++		sun50i_wb_write(wb, WB_START,
++				WB_GCTRL_AUTO_GATE | WB_GCTRL_START);
++
++	writel(WB_STATUS_W1C, wb->regs + WB_STATUS);
++
++	drm_writeback_queue_job(&wb->wb_conn, conn_state);
++
++	/* capture starts with the next frame */
++	if (wb->cfg->has_rcq) {
++		struct sun4i_crtc *scrtc = drm_crtc_to_sun4i_crtc(crtc);
++		u32 status;
++		int ret;
++
++		/*
++		 * Both the mixer and the writeback have their own register
++		 * command queues, but they share one fetch engine.
++		 * Triggering one queue while the other fetch is still in
++		 * flight can corrupt either update, so serialize them.
++		 */
++		sunxi_engine_sync(scrtc->engine);
++		sun50i_wb_submit_rcq(wb);
++		ret = readl_poll_timeout(wb->rcq + WB_RCQ_STATUS, status,
++					 status & WB_RCQ_STATUS_FINISH,
++					 10, 20000);
++		if (ret)
++			drm_warn(conn->dev, "writeback RCQ sync timed out\n");
++		if (!external_timing)
++			sunxi_engine_commit(scrtc->engine, crtc, state);
++		regmap_write(wb->top, DE33_RTWB_MUX,
++			     wb->rtwb_mux | DE33_RTWB_START);
++	} else {
++		writel(gctrl | WB_GCTRL_START, wb->regs + WB_GCTRL);
++	}
++}
++
++static int sun50i_wb_get_modes(struct drm_connector *connector)
++{
++	return drm_add_modes_noedid(connector, WB_MAX_WIDTH, WB_MAX_HEIGHT);
++}
++
++static const struct drm_connector_helper_funcs sun50i_wb_conn_helper_funcs = {
++	.get_modes	= sun50i_wb_get_modes,
++	.atomic_commit	= sun50i_wb_atomic_commit,
++};
++
++static const struct drm_connector_funcs sun50i_wb_conn_funcs = {
++	.fill_modes		= drm_helper_probe_single_connector_modes,
++	.destroy		= drm_connector_cleanup,
++	.reset			= drm_atomic_helper_connector_reset,
++	.atomic_duplicate_state	= drm_atomic_helper_connector_duplicate_state,
++	.atomic_destroy_state	= drm_atomic_helper_connector_destroy_state,
++};
++
++static void sun50i_wb_setup_clones(struct drm_device *drm,
++				   struct drm_encoder *wb_encoder)
++{
++	struct drm_encoder *encoder;
++	u32 wb_mask = drm_encoder_mask(wb_encoder);
++
++	wb_encoder->possible_clones = wb_mask;
++
++	drm_for_each_encoder(encoder, drm) {
++		if (encoder == wb_encoder ||
++		    !(encoder->possible_crtcs & wb_encoder->possible_crtcs))
++			continue;
++
++		encoder->possible_clones |= drm_encoder_mask(encoder) | wb_mask;
++		wb_encoder->possible_clones |= drm_encoder_mask(encoder);
++	}
++}
++
++static int sun50i_wb_bind(struct device *dev, struct device *master,
++			  void *data)
++{
++	struct device_node *ep, *mixer, *port;
++	struct of_endpoint endpoint;
++	struct sun50i_wb *wb = dev_get_drvdata(dev);
++	struct drm_crtc *crtc;
++	struct drm_device *drm = data;
++	u32 possible_crtcs;
++	int ret;
++
++	if (wb->cfg->has_rcq && !wb->shadow) {
++		wb->dma_dev = drm_dev_dma_dev(drm);
++		ret = sun50i_wb_init_rcq(wb);
++		if (ret)
++			return ret;
++	}
++
++	possible_crtcs = 0;
++	memset(wb->crtc_port, U8_MAX, sizeof(wb->crtc_port));
++	port = of_graph_get_port_by_id(wb->dev->of_node, 0);
++	for_each_child_of_node(port, ep) {
++		ret = of_graph_parse_endpoint(ep, &endpoint);
++		if (ret || endpoint.id >= WB_MAX_INPUTS)
++			continue;
++
++		mixer = of_graph_get_remote_port_parent(ep);
++		drm_for_each_crtc(crtc, drm) {
++			struct sun4i_crtc *scrtc = drm_crtc_to_sun4i_crtc(crtc);
++
++			if (scrtc->engine->node == mixer) {
++				wb->crtc_port[drm_crtc_index(crtc)] = endpoint.id;
++				possible_crtcs |= drm_crtc_mask(crtc);
++			}
++		}
++		of_node_put(mixer);
++	}
++	of_node_put(port);
++
++	if (!possible_crtcs) {
++		dev_err(wb->dev, "no CRTC connected to writeback\n");
++		return -ENODEV;
++	}
++
++	drm_connector_helper_add(&wb->wb_conn.base,
++				 &sun50i_wb_conn_helper_funcs);
++
++	ret = drm_writeback_connector_init(drm, &wb->wb_conn,
++					   &sun50i_wb_conn_funcs,
++					   &sun50i_wb_encoder_helper_funcs,
++					   wb->cfg->formats,
++					   wb->cfg->format_count,
++					   possible_crtcs);
++	if (ret)
++		return ret;
++
++	sun50i_wb_setup_clones(drm, &wb->wb_conn.encoder);
++
++	return 0;
++}
++
++static const struct component_ops sun50i_wb_ops = {
++	.bind	= sun50i_wb_bind,
++};
++
++static int sun50i_wb_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct platform_device *top_pdev;
++	struct device_node *np;
++	struct sun50i_wb *wb;
++	int irq, ret;
++
++	wb = devm_kzalloc(dev, sizeof(*wb), GFP_KERNEL);
++	if (!wb)
++		return -ENOMEM;
++
++	wb->dev = dev;
++	wb->cfg = of_device_get_match_data(dev);
++	if (!wb->cfg)
++		return -EINVAL;
++
++	init_completion(&wb->job_done);
++	complete(&wb->job_done);
++
++	wb->regs = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(wb->regs))
++		return PTR_ERR(wb->regs);
++
++	if (wb->cfg->has_rcq) {
++		wb->rcq = devm_platform_ioremap_resource(pdev, 1);
++		if (IS_ERR(wb->rcq))
++			return PTR_ERR(wb->rcq);
++
++		np = of_parse_phandle(dev->of_node, "allwinner,top", 0);
++		if (!np)
++			return -EINVAL;
++		top_pdev = of_find_device_by_node(np);
++		of_node_put(np);
++		if (!top_pdev)
++			return -EPROBE_DEFER;
++		wb->top = dev_get_regmap(&top_pdev->dev, NULL);
++		if (!wb->top) {
++			platform_device_put(top_pdev);
++			return -EPROBE_DEFER;
++		}
++		if (!device_link_add(dev, &top_pdev->dev,
++				     DL_FLAG_AUTOREMOVE_CONSUMER)) {
++			platform_device_put(top_pdev);
++			return -EINVAL;
++		}
++		platform_device_put(top_pdev);
++	}
++
++	wb->bus_clk = devm_clk_get_enabled(dev, "bus");
++	if (IS_ERR(wb->bus_clk))
++		return PTR_ERR(wb->bus_clk);
++
++	wb->mod_clk = devm_clk_get_enabled(dev, "mod");
++	if (IS_ERR(wb->mod_clk))
++		return PTR_ERR(wb->mod_clk);
++
++	wb->reset = devm_reset_control_get(dev, NULL);
++	if (IS_ERR(wb->reset))
++		return PTR_ERR(wb->reset);
++
++	ret = reset_control_deassert(wb->reset);
++	if (ret)
++		return ret;
++
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0) {
++		ret = irq;
++		goto err_reset;
++	}
++
++	ret = devm_request_irq(dev, irq, sun50i_wb_irq, 0,
++			       dev_name(dev), wb);
++	if (ret)
++		goto err_reset;
++
++	dev_set_drvdata(dev, wb);
++
++	ret = component_add(dev, &sun50i_wb_ops);
++	if (ret)
++		goto err_reset;
++
++	return 0;
++
++err_reset:
++	reset_control_assert(wb->reset);
++	return ret;
++}
++
++static void sun50i_wb_remove(struct platform_device *pdev)
++{
++	struct sun50i_wb *wb = platform_get_drvdata(pdev);
++
++	component_del(&pdev->dev, &sun50i_wb_ops);
++	reset_control_assert(wb->reset);
++}
++
++static const struct of_device_id sun50i_wb_of_table[] = {
++	{ .compatible = "allwinner,sun50i-h6-de3-wb", .data = &sun50i_h6_wb_cfg },
++	{ .compatible = "allwinner,sun50i-h616-de33-wb", .data = &sun50i_h616_wb_cfg },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, sun50i_wb_of_table);
++
++struct platform_driver sun50i_wb_platform_driver = {
++	.probe	= sun50i_wb_probe,
++	.remove	= sun50i_wb_remove,
++	.driver	= {
++		.name		= "sun50i-de3-wb",
++		.of_match_table	= sun50i_wb_of_table,
++	},
++};
++module_platform_driver(sun50i_wb_platform_driver);
++
++MODULE_AUTHOR("Jernej Skrabec <jernej.skrabec@gmail.com>");
++MODULE_DESCRIPTION("Allwinner DE3 write-back connector");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/gpu/drm/sun4i/sun8i_csc.c b/drivers/gpu/drm/sun4i/sun8i_csc.c
+index 70fc9b0..098bf34 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_csc.c
++++ b/drivers/gpu/drm/sun4i/sun8i_csc.c
+@@ -10,6 +10,24 @@
+ 
+ #include "sun8i_csc.h"
+ #include "sun8i_mixer.h"
++#include "sun8i_rdma.h"
++
++static const struct reg_region sun8i_csc_regions[] = {
++	{ 0x00, 1 },
++	{ 0x10, 12 },
++	{ }
++};
++
++static const struct reg_region sun8i_de3_csc_regions[] = {
++	{ 0x00, 12 },
++	{ }
++};
++
++static const struct reg_region sun8i_de33_csc_regions[] = {
++	{ 0x00, 1 },
++	{ 0x04, 15 },
++	{ }
++};
+ 
+ enum sun8i_csc_mode {
+ 	SUN8I_CSC_MODE_OFF,
+@@ -23,6 +41,32 @@ static const u32 ccsc_base[][2] = {
+ 	[CCSC_D1_MIXER0_LAYOUT]	= {CCSC00_OFFSET, CCSC01_D1_OFFSET},
+ };
+ 
++int sun8i_csc_init(struct sun8i_layer *layer, struct sun8i_rdma *rdma,
++		   void __iomem *reg_base, u32 reg_offset_base)
++{
++	const struct reg_region *regions;
++	u32 base, size;
++
++	if (layer->cfg->de_type == SUN8I_MIXER_DE3) {
++		base = DE3_BLD_BASE + 0x110 + layer->channel * 0x30;
++		regions = sun8i_de3_csc_regions;
++		size = 0x30;
++	} else if (layer->cfg->de_type == SUN8I_MIXER_DE33) {
++		base = DE33_CCSC_BASE + layer->channel * DE33_CH_SIZE;
++		regions = sun8i_de33_csc_regions;
++		size = 0x44;
++	} else {
++		base = ccsc_base[layer->cfg->ccsc][layer->channel];
++		regions = sun8i_csc_regions;
++		size = 0x40;
++	}
++
++	layer->csc_rdma = sun8i_rdma_add_unit(rdma, reg_base + base,
++					      reg_offset_base + base, size, regions);
++
++	return layer->csc_rdma ? 0 : -ENOMEM;
++}
++
+ /*
+  * Factors are in two's complement format, 10 bits for fractinal part.
+  * First tree values in each line are multiplication factor and last
+@@ -116,7 +160,30 @@ static const u32 yuv2rgb_de3[2][3][12] = {
+ 	},
+ };
+ 
+-static void sun8i_csc_setup(struct regmap *map, u32 base,
++static const u32 identity_de3[12] = {
++	0x00020000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00020000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00020000, 0x00000000,
++};
++
++static void sun8i_de3_ccsc_set_identity(void __iomem *base, int layer)
++{
++	u32 addr = DE3_BLD_BASE +
++		   SUN50I_MIXER_BLEND_CSC_COEFF(layer, 0);
++
++	__iowrite32_copy(base + addr, identity_de3,
++			 ARRAY_SIZE(identity_de3));
++}
++
++void sun8i_de3_ccsc_init(void __iomem *base)
++{
++	int i;
++
++	for (i = 0; i < 4; i++)
++		sun8i_de3_ccsc_set_identity(base, i);
++}
++
++static void sun8i_csc_setup(struct sun8i_rdma_unit *rdma,
+ 			    enum sun8i_csc_mode mode,
+ 			    enum drm_color_encoding encoding,
+ 			    enum drm_color_range range)
+@@ -133,19 +200,19 @@ static void sun8i_csc_setup(struct regmap *map, u32 base,
+ 		break;
+ 	case SUN8I_CSC_MODE_YUV2RGB:
+ 		val = SUN8I_CSC_CTRL_EN;
+-		base_reg = SUN8I_CSC_COEFF(base, 0);
+-		regmap_bulk_write(map, base_reg, table, 12);
++		base_reg = SUN8I_CSC_COEFF(0, 0);
++		sun8i_rdma_memcpy(rdma, base_reg, table, 12);
+ 		break;
+ 	case SUN8I_CSC_MODE_YVU2RGB:
+ 		val = SUN8I_CSC_CTRL_EN;
+ 		for (i = 0; i < 12; i++) {
+ 			if ((i & 3) == 1)
+-				base_reg = SUN8I_CSC_COEFF(base, i + 1);
++				base_reg = SUN8I_CSC_COEFF(0, i + 1);
+ 			else if ((i & 3) == 2)
+-				base_reg = SUN8I_CSC_COEFF(base, i - 1);
++				base_reg = SUN8I_CSC_COEFF(0, i - 1);
+ 			else
+-				base_reg = SUN8I_CSC_COEFF(base, i);
+-			regmap_write(map, base_reg, table[i]);
++				base_reg = SUN8I_CSC_COEFF(0, i);
++			sun8i_rdma_write(rdma, base_reg, table[i]);
+ 		}
+ 		break;
+ 	default:
+@@ -154,55 +221,43 @@ static void sun8i_csc_setup(struct regmap *map, u32 base,
+ 		return;
+ 	}
+ 
+-	regmap_write(map, SUN8I_CSC_CTRL(base), val);
++	sun8i_rdma_write(rdma, SUN8I_CSC_CTRL(0), val);
+ }
+ 
+-static void sun8i_de3_ccsc_setup(struct regmap *map, int layer,
++static void sun8i_de3_ccsc_setup(struct sun8i_rdma_unit *rdma,
+ 				 enum sun8i_csc_mode mode,
+ 				 enum drm_color_encoding encoding,
+ 				 enum drm_color_range range)
+ {
+-	u32 addr, val, mask;
+ 	const u32 *table;
++	u32 addr;
+ 	int i;
+ 
+-	mask = SUN50I_MIXER_BLEND_CSC_CTL_EN(layer);
+ 	table = yuv2rgb_de3[range][encoding];
+ 
+ 	switch (mode) {
+ 	case SUN8I_CSC_MODE_OFF:
+-		val = 0;
++		sun8i_rdma_memcpy(rdma, 0, identity_de3,
++				  ARRAY_SIZE(identity_de3));
+ 		break;
+ 	case SUN8I_CSC_MODE_YUV2RGB:
+-		val = mask;
+-		addr = SUN50I_MIXER_BLEND_CSC_COEFF(DE3_BLD_BASE, layer, 0);
+-		regmap_bulk_write(map, addr, table, 12);
++		sun8i_rdma_memcpy(rdma, 0, table, 12);
+ 		break;
+ 	case SUN8I_CSC_MODE_YVU2RGB:
+-		val = mask;
+ 		for (i = 0; i < 12; i++) {
+ 			if ((i & 3) == 1)
+-				addr = SUN50I_MIXER_BLEND_CSC_COEFF(DE3_BLD_BASE,
+-								    layer,
+-								    i + 1);
++				addr = (i + 1) * sizeof(u32);
+ 			else if ((i & 3) == 2)
+-				addr = SUN50I_MIXER_BLEND_CSC_COEFF(DE3_BLD_BASE,
+-								    layer,
+-								    i - 1);
++				addr = (i - 1) * sizeof(u32);
+ 			else
+-				addr = SUN50I_MIXER_BLEND_CSC_COEFF(DE3_BLD_BASE,
+-								    layer, i);
+-			regmap_write(map, addr, table[i]);
++				addr = i * sizeof(u32);
++			sun8i_rdma_write(rdma, addr, table[i]);
+ 		}
+ 		break;
+ 	default:
+-		val = 0;
+ 		DRM_WARN("Wrong CSC mode specified.\n");
+ 		return;
+ 	}
+-
+-	regmap_update_bits(map, SUN50I_MIXER_BLEND_CSC_CTL(DE3_BLD_BASE),
+-			   mask, val);
+ }
+ 
+ /* extract constant from high word and invert sign if necessary */
+@@ -227,17 +282,16 @@ static void sun8i_de33_convert_table(const u32 *src, u32 *dst)
+ 	dst[14] &= 0xffff;
+ }
+ 
+-static void sun8i_de33_ccsc_setup(struct regmap *map, int layer,
++static void sun8i_de33_ccsc_setup(struct sun8i_rdma_unit *rdma,
+ 				  enum sun8i_csc_mode mode,
+ 				  enum drm_color_encoding encoding,
+ 				  enum drm_color_range range)
+ {
+-	u32 addr, val, base, csc[15];
++	u32 addr, val, csc[15];
+ 	const u32 *table;
+ 	int i;
+ 
+ 	table = yuv2rgb_de3[range][encoding];
+-	base = DE33_CCSC_BASE + layer * DE33_CH_SIZE;
+ 
+ 	switch (mode) {
+ 	case SUN8I_CSC_MODE_OFF:
+@@ -246,20 +300,20 @@ static void sun8i_de33_ccsc_setup(struct regmap *map, int layer,
+ 	case SUN8I_CSC_MODE_YUV2RGB:
+ 		val = SUN8I_CSC_CTRL_EN;
+ 		sun8i_de33_convert_table(table, csc);
+-		regmap_bulk_write(map, SUN50I_CSC_COEFF(base, 0), csc, 15);
++		sun8i_rdma_memcpy(rdma, SUN50I_CSC_COEFF(0, 0), csc, 15);
+ 		break;
+ 	case SUN8I_CSC_MODE_YVU2RGB:
+ 		val = SUN8I_CSC_CTRL_EN;
+ 		sun8i_de33_convert_table(table, csc);
+ 		for (i = 0; i < 15; i++) {
+-			addr = SUN50I_CSC_COEFF(base, i);
++			addr = SUN50I_CSC_COEFF(0, i);
+ 			if (i > 3) {
+ 				if (((i - 3) & 3) == 1)
+-					addr = SUN50I_CSC_COEFF(base, i + 1);
++					addr = SUN50I_CSC_COEFF(0, i + 1);
+ 				else if (((i - 3) & 3) == 2)
+-					addr = SUN50I_CSC_COEFF(base, i - 1);
++					addr = SUN50I_CSC_COEFF(0, i - 1);
+ 			}
+-			regmap_write(map, addr, csc[i]);
++			sun8i_rdma_write(rdma, addr, csc[i]);
+ 		}
+ 		break;
+ 	default:
+@@ -268,7 +322,7 @@ static void sun8i_de33_ccsc_setup(struct regmap *map, int layer,
+ 		return;
+ 	}
+ 
+-	regmap_write(map, SUN8I_CSC_CTRL(base), val);
++	sun8i_rdma_write(rdma, SUN8I_CSC_CTRL(0), val);
+ }
+ 
+ static u32 sun8i_csc_get_mode(struct drm_plane_state *state)
+@@ -297,23 +351,20 @@ void sun8i_csc_config(struct sun8i_layer *layer,
+ 		      struct drm_plane_state *state)
+ {
+ 	u32 mode = sun8i_csc_get_mode(state);
+-	u32 base;
+ 
+ 	if (layer->cfg->de_type == SUN8I_MIXER_DE3) {
+-		sun8i_de3_ccsc_setup(layer->regs, layer->channel,
++		sun8i_de3_ccsc_setup(layer->csc_rdma,
+ 				     mode, state->color_encoding,
+ 				     state->color_range);
+ 		return;
+ 	} else if (layer->cfg->de_type == SUN8I_MIXER_DE33) {
+-		sun8i_de33_ccsc_setup(layer->regs, layer->channel,
++		sun8i_de33_ccsc_setup(layer->csc_rdma,
+ 				      mode, state->color_encoding,
+ 				      state->color_range);
+ 		return;
+ 	}
+ 
+-	base = ccsc_base[layer->cfg->ccsc][layer->channel];
+-
+-	sun8i_csc_setup(layer->regs, base,
++	sun8i_csc_setup(layer->csc_rdma,
+ 			mode, state->color_encoding,
+ 			state->color_range);
+ }
+diff --git a/drivers/gpu/drm/sun4i/sun8i_csc.h b/drivers/gpu/drm/sun4i/sun8i_csc.h
+index d2ba5f8..ffc20f9 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_csc.h
++++ b/drivers/gpu/drm/sun4i/sun8i_csc.h
+@@ -10,6 +10,7 @@
+ 
+ struct drm_plane_state;
+ struct sun8i_layer;
++struct sun8i_rdma;
+ 
+ /* VI channel CSC units offsets */
+ #define CCSC00_OFFSET 0xAA050
+@@ -30,5 +31,8 @@ struct sun8i_layer;
+ 
+ void sun8i_csc_config(struct sun8i_layer *layer,
+ 		      struct drm_plane_state *state);
++void sun8i_de3_ccsc_init(void __iomem *base);
++int sun8i_csc_init(struct sun8i_layer *layer, struct sun8i_rdma *rdma,
++		   void __iomem *reg_base, u32 reg_offset_base);
+ 
+ #endif
+diff --git a/drivers/gpu/drm/sun4i/sun8i_mixer.c b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+index 0659339..2b12049 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_mixer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+@@ -10,6 +10,7 @@
+ #include <linux/component.h>
+ #include <linux/delay.h>
+ #include <linux/dma-mapping.h>
++#include <linux/iopoll.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/of_device.h>
+@@ -25,11 +26,14 @@
+ #include <drm/drm_gem_dma_helper.h>
+ #include <drm/drm_print.h>
+ #include <drm/drm_probe_helper.h>
++#include <drm/drm_vblank.h>
+ 
+ #include "sun4i_drv.h"
+ #include "sun50i_planes.h"
+ #include "sun4i_tcon.h"
++#include "sun8i_csc.h"
+ #include "sun8i_mixer.h"
++#include "sun8i_rdma.h"
+ #include "sun8i_ui_layer.h"
+ #include "sun8i_vi_layer.h"
+ #include "sunxi_engine.h"
+@@ -51,7 +55,38 @@ static const u32 sun8i_rgb2yuv_coef[12] = {
+ 	0x000001c2, 0x00001e87, 0x00001fb7, 0x00020200,
+ };
+ 
++static const struct reg_region sun8i_global_regions[] = {
++	{ SUN8I_MIXER_GLOBAL_CTL, 1 },
++	{ SUN8I_MIXER_GLOBAL_SIZE, 1 },
++	{ }
++};
++
++static const struct reg_region sun8i_blender_regions[] = {
++	{ 0x000, 1 },
++	{ 0x004, 16 },
++	{ 0x080, 16 },
++	{ 0x0c0, 16 },
++	{ 0x100, 1 },
++	{ }
++};
++
++/*
++ * DE2 has no blender CSC control at 0x100 and its blender block wraps
++ * around at 0x100, so writing it would clobber the pipe control register.
++ */
++static const struct reg_region sun8i_de2_blender_regions[] = {
++	{ 0x000, 1 },
++	{ 0x004, 16 },
++	{ 0x080, 16 },
++	{ 0x0c0, 16 },
++	{ }
++};
++
+ static const struct de2_fmt_info de2_formats[] = {
++	{
++		.drm_fmt = DRM_FORMAT_AYUV,
++		.de2_fmt = SUN8I_MIXER_FBFMT_ARGB8888,
++	},
+ 	{
+ 		.drm_fmt = DRM_FORMAT_ARGB8888,
+ 		.de2_fmt = SUN8I_MIXER_FBFMT_ARGB8888,
+@@ -176,6 +211,10 @@ static const struct de2_fmt_info de2_formats[] = {
+ 		.drm_fmt = DRM_FORMAT_ARGB2101010,
+ 		.de2_fmt = SUN8I_MIXER_FBFMT_ARGB2101010,
+ 	},
++	{
++		.drm_fmt = DRM_FORMAT_XRGB2101010,
++		.de2_fmt = SUN8I_MIXER_FBFMT_ARGB2101010,
++	},
+ 	{
+ 		.drm_fmt = DRM_FORMAT_ABGR2101010,
+ 		.de2_fmt = SUN8I_MIXER_FBFMT_ABGR2101010,
+@@ -272,7 +311,6 @@ static void sun8i_mixer_commit(struct sunxi_engine *engine,
+ 			       struct drm_atomic_commit *state)
+ {
+ 	struct sun8i_mixer *mixer = engine_to_sun8i_mixer(engine);
+-	u32 bld_base = sun8i_blender_base(mixer);
+ 	struct drm_plane_state *plane_state;
+ 	struct drm_plane *plane;
+ 	u32 route = 0, pipe_en = 0;
+@@ -358,21 +396,29 @@ static void sun8i_mixer_commit(struct sunxi_engine *engine,
+ 		route |= layer->index << SUN8I_MIXER_BLEND_ROUTE_PIPE_SHIFT(zpos);
+ 		pipe_en |= SUN8I_MIXER_BLEND_PIPE_CTL_EN(zpos);
+ 
+-		regmap_write(engine->regs,
+-			     SUN8I_MIXER_BLEND_ATTR_COORD(bld_base, zpos),
+-			     SUN8I_MIXER_COORD(x, y));
+-		regmap_write(engine->regs,
+-			     SUN8I_MIXER_BLEND_ATTR_INSIZE(bld_base, zpos),
+-			     SUN8I_MIXER_SIZE(w, h));
++		sun8i_rdma_write(mixer->blender_rdma,
++				 SUN8I_MIXER_BLEND_ATTR_COORD(zpos),
++				 SUN8I_MIXER_COORD(x, y));
++		sun8i_rdma_write(mixer->blender_rdma,
++				 SUN8I_MIXER_BLEND_ATTR_INSIZE(zpos),
++				 SUN8I_MIXER_SIZE(w, h));
+ 	}
+ 
+-	regmap_write(engine->regs, SUN8I_MIXER_BLEND_ROUTE(bld_base), route);
+-	regmap_write(engine->regs, SUN8I_MIXER_BLEND_PIPE_CTL(bld_base),
+-		     pipe_en | SUN8I_MIXER_BLEND_PIPE_CTL_FC_EN(0));
++	sun8i_rdma_write(mixer->blender_rdma,
++			 SUN8I_MIXER_BLEND_ROUTE, route);
++	sun8i_rdma_write(mixer->blender_rdma,
++			 SUN8I_MIXER_BLEND_PIPE_CTL,
++			 pipe_en | SUN8I_MIXER_BLEND_PIPE_CTL_FC_EN(0));
++
++	if (mixer->cfg->de_type == SUN8I_MIXER_DE33)
++		writel(mixer->global_size,
++		       mixer->top + SUN50I_MIXER_GLOBAL_SIZE);
++
++	WARN_ON(sun8i_rdma_apply(mixer->rdma));
+ 
+ 	if (mixer->cfg->de_type != SUN8I_MIXER_DE33)
+-		regmap_write(engine->regs, SUN8I_MIXER_GLOBAL_DBUFF,
+-			     SUN8I_MIXER_GLOBAL_DBUFF_ENABLE);
++		writel(SUN8I_MIXER_GLOBAL_DBUFF_ENABLE,
++		       mixer->base + SUN8I_MIXER_GLOBAL_DBUFF);
+ }
+ 
+ static struct drm_plane **sun8i_layers_init(struct drm_device *drm,
+@@ -396,9 +442,9 @@ static struct drm_plane **sun8i_layers_init(struct drm_device *drm,
+ 		else
+ 			type = DRM_PLANE_TYPE_OVERLAY;
+ 
+-		layer = sun8i_vi_layer_init_one(drm, type, mixer->engine.regs,
+-						i, i, plane_cnt,
+-						&mixer->cfg->lay_cfg);
++		layer = sun8i_vi_layer_init_one(drm, type, i, i, plane_cnt,
++						&mixer->cfg->lay_cfg,
++						mixer->rdma, mixer->base);
+ 		if (IS_ERR(layer)) {
+ 			dev_err(drm->dev,
+ 				"Couldn't initialize overlay plane\n");
+@@ -417,9 +463,10 @@ static struct drm_plane **sun8i_layers_init(struct drm_device *drm,
+ 		else if (i == (mixer->cfg->ui_num - 1))
+ 			type = DRM_PLANE_TYPE_CURSOR;
+ 
+-		layer = sun8i_ui_layer_init_one(drm, type, mixer->engine.regs,
+-						index, index, plane_cnt,
+-						&mixer->cfg->lay_cfg);
++		layer = sun8i_ui_layer_init_one(drm, type, index, index,
++						plane_cnt,
++						&mixer->cfg->lay_cfg,
++						mixer->rdma, mixer->base);
+ 		if (IS_ERR(layer)) {
+ 			dev_err(drm->dev, "Couldn't initialize %s plane\n",
+ 				i ? "overlay" : "primary");
+@@ -436,15 +483,31 @@ static struct drm_plane **sun50i_layers_init(struct drm_device *drm,
+ 					     struct sunxi_engine *engine)
+ {
+ 	struct sun8i_mixer *mixer = engine_to_sun8i_mixer(engine);
++	struct drm_plane **planes;
++	int i, ret;
++
++	planes = sun50i_planes_setup(mixer->planes_dev, drm,
++				     engine->id, mixer->rdma);
++	if (IS_ERR(planes))
++		return planes;
++
++	for (i = 0; planes[i]; i++)
++		sun8i_rdma_write(mixer->blender_rdma,
++				 SUN8I_MIXER_BLEND_MODE(i),
++				 SUN8I_MIXER_BLEND_MODE_DEF);
+ 
+-	return sun50i_planes_setup(mixer->planes_dev, drm, engine->id);
++	ret = sun8i_rdma_prepare(mixer->rdma);
++	if (ret)
++		return ERR_PTR(ret);
++
++	return planes;
+ }
+ 
+ static void sun8i_mixer_mode_set(struct sunxi_engine *engine,
+ 				 const struct drm_display_mode *mode)
+ {
+ 	struct sun8i_mixer *mixer = engine_to_sun8i_mixer(engine);
+-	u32 bld_base, size, val;
++	u32 size, val;
+ 	bool interlaced;
+ 
+ 	/* v35x DE: top control via MMIO, datapath sizes staged into the RCQ */
+@@ -453,7 +516,6 @@ static void sun8i_mixer_mode_set(struct sunxi_engine *engine,
+ 		return;
+ 	}
+ 
+-	bld_base = sun8i_blender_base(mixer);
+ 	interlaced = !!(mode->flags & DRM_MODE_FLAG_INTERLACE);
+ 	size = SUN8I_MIXER_SIZE(mode->hdisplay, mode->vdisplay);
+ 
+@@ -461,19 +523,21 @@ static void sun8i_mixer_mode_set(struct sunxi_engine *engine,
+ 			 mode->hdisplay, mode->vdisplay);
+ 
+ 	if (mixer->cfg->de_type == SUN8I_MIXER_DE33)
+-		regmap_write(mixer->top_regs, SUN50I_MIXER_GLOBAL_SIZE, size);
++		mixer->global_size = size;
+ 	else
+-		regmap_write(mixer->engine.regs, SUN8I_MIXER_GLOBAL_SIZE, size);
++		sun8i_rdma_write(mixer->global_rdma, SUN8I_MIXER_GLOBAL_SIZE,
++				 size);
+ 
+-	regmap_write(engine->regs, SUN8I_MIXER_BLEND_OUTSIZE(bld_base), size);
++	sun8i_rdma_write(mixer->blender_rdma,
++			 SUN8I_MIXER_BLEND_OUTSIZE, size);
+ 
+ 	if (interlaced)
+ 		val = SUN8I_MIXER_BLEND_OUTCTL_INTERLACED;
+ 	else
+ 		val = 0;
+ 
+-	regmap_update_bits(engine->regs, SUN8I_MIXER_BLEND_OUTCTL(bld_base),
+-			   SUN8I_MIXER_BLEND_OUTCTL_INTERLACED, val);
++	sun8i_rdma_write(mixer->blender_rdma,
++			 SUN8I_MIXER_BLEND_OUTCTL, val);
+ 
+ 	DRM_DEBUG_DRIVER("Switching display mixer interlaced mode %s\n",
+ 			 interlaced ? "on" : "off");
+@@ -491,18 +555,22 @@ static void sun8i_mixer_vblank_quirk(struct sunxi_engine *engine,
+ 
+ static void sun8i_mixer_apply_color_correction(struct sunxi_engine *engine)
+ {
++	struct sun8i_mixer *mixer = engine_to_sun8i_mixer(engine);
++
+ 	DRM_DEBUG_DRIVER("Applying RGB to YUV color correction\n");
+ 
+-	regmap_bulk_write(engine->regs, SUN8I_MIXER_DCSC_COEF_REG(0),
+-			  sun8i_rgb2yuv_coef, 12);
+-	regmap_write(engine->regs, SUN8I_MIXER_DCSC_EN, 1);
++	__iowrite32_copy(mixer->base + SUN8I_MIXER_DCSC_COEF_REG(0),
++			 sun8i_rgb2yuv_coef, ARRAY_SIZE(sun8i_rgb2yuv_coef));
++	writel(1, mixer->base + SUN8I_MIXER_DCSC_EN);
+ }
+ 
+ static void sun8i_mixer_disable_color_correction(struct sunxi_engine *engine)
+ {
++	struct sun8i_mixer *mixer = engine_to_sun8i_mixer(engine);
++
+ 	DRM_DEBUG_DRIVER("Disabling color correction\n");
+ 
+-	regmap_write(engine->regs, SUN8I_MIXER_DCSC_EN, 0);
++	writel(0, mixer->base + SUN8I_MIXER_DCSC_EN);
+ }
+ 
+ static const struct sunxi_engine_ops sun8i_engine_ops = {
+@@ -514,26 +582,48 @@ static const struct sunxi_engine_ops sun8i_engine_ops = {
+ 	.vblank_quirk		= sun8i_mixer_vblank_quirk,
+ };
+ 
++static void sun8i_mixer_sync(struct sunxi_engine *engine)
++{
++	struct sun8i_mixer *mixer = engine_to_sun8i_mixer(engine);
++
++	sun8i_rdma_sync(mixer->rdma);
++}
++
++static void sun8i_mixer_wait_for_scanout(struct sunxi_engine *engine,
++					 struct drm_crtc *crtc)
++{
++	struct sun8i_mixer *mixer = engine_to_sun8i_mixer(engine);
++	u32 val;
++	int ret;
++
++	ret = readl_poll_timeout(mixer->base + SUN8I_MIXER_GLOBAL_DBUFF,
++				 val,
++				 !(val & SUN8I_MIXER_GLOBAL_DBUFF_ENABLE),
++				 10, 50000);
++	if (ret)
++		pr_warn("sun8i-mixer %pOF: double buffer sync timed out\n",
++			mixer->engine.node);
++
++	/*
++	 * DE3 clears DBUFF when the new registers are latched, but DMA
++	 * requests for the old frame can remain in flight until the next
++	 * vblank.
++	 */
++	drm_crtc_wait_one_vblank(crtc);
++}
++
+ static const struct sunxi_engine_ops sun50i_engine_ops = {
++	.sync		= sun8i_mixer_sync,
+ 	.commit		= sun8i_mixer_commit,
+ 	.layers_init	= sun50i_layers_init,
+ 	.mode_set	= sun8i_mixer_mode_set,
+ };
+ 
+-static const struct regmap_config sun8i_mixer_regmap_config = {
+-	.name		= "display",
+-	.reg_bits	= 32,
+-	.val_bits	= 32,
+-	.reg_stride	= 4,
+-	.max_register	= 0xffffc, /* guessed */
+-};
+-
+-static const struct regmap_config sun8i_top_regmap_config = {
+-	.name		= "top",
+-	.reg_bits	= 32,
+-	.val_bits	= 32,
+-	.reg_stride	= 4,
+-	.max_register	= 0x3c,
++static const struct sunxi_engine_ops sun50i_de3_engine_ops = {
++	.wait_for_scanout = sun8i_mixer_wait_for_scanout,
++	.commit		  = sun8i_mixer_commit,
++	.layers_init	  = sun8i_layers_init,
++	.mode_set	  = sun8i_mixer_mode_set,
+ };
+ 
+ /*
+@@ -569,10 +659,10 @@ static int sun8i_mixer_of_get_id(struct device_node *node)
+ 	return of_ep.id;
+ }
+ 
+-static void sun8i_mixer_init(struct sun8i_mixer *mixer)
++static int sun8i_mixer_init(struct sun8i_mixer *mixer)
+ {
+ 	unsigned int base = sun8i_blender_base(mixer);
+-	struct regmap *top_regs;
++	u32 reg_offset = 0;
+ 	int plane_cnt, i;
+ 
+ 	/*
+@@ -583,42 +673,74 @@ static void sun8i_mixer_init(struct sun8i_mixer *mixer)
+ 	 */
+ 	if (mixer->cfg->uses_rcq) {
+ 		mixer->de_bg_color = 0xff00ff00;
+-		return;
++		return 0;
+ 	}
+ 
+ 	if (mixer->cfg->de_type == SUN8I_MIXER_DE33)
+-		top_regs = mixer->top_regs;
+-	else
+-		top_regs = mixer->engine.regs;
+-
+-	/* Enable the mixer */
+-	regmap_write(top_regs, SUN8I_MIXER_GLOBAL_CTL,
+-		     SUN8I_MIXER_GLOBAL_CTL_RT_EN);
++		reg_offset = 0x280000 + mixer->engine.id * 0x20000;
++
++	mixer->blender_rdma = sun8i_rdma_add_unit(mixer->rdma,
++						  mixer->base + base,
++						  reg_offset + base, 0x104,
++						  mixer->cfg->de_type == SUN8I_MIXER_DE2 ?
++						  sun8i_de2_blender_regions :
++						  sun8i_blender_regions);
++	if (!mixer->blender_rdma)
++		return -ENOMEM;
+ 
+-	if (mixer->cfg->de_type == SUN8I_MIXER_DE33)
+-		regmap_write(top_regs, SUN50I_MIXER_GLOBAL_CLK, 1);
++	if (mixer->cfg->de_type == SUN8I_MIXER_DE33) {
++		writel(SUN8I_MIXER_GLOBAL_CTL_RT_EN,
++		       mixer->top + SUN8I_MIXER_GLOBAL_CTL);
++		writel(1, mixer->top + SUN50I_MIXER_GLOBAL_CLK);
++	} else {
++		mixer->global_rdma = sun8i_rdma_add_unit(mixer->rdma,
++							 mixer->base, 0, 0x10,
++							 sun8i_global_regions);
++		if (!mixer->global_rdma)
++			return -ENOMEM;
++		sun8i_rdma_write(mixer->global_rdma, SUN8I_MIXER_GLOBAL_CTL,
++				 SUN8I_MIXER_GLOBAL_CTL_RT_EN);
++	}
+ 
+ 	/* Set background color to black */
+-	regmap_write(mixer->engine.regs, SUN8I_MIXER_BLEND_BKCOLOR(base),
+-		     SUN8I_MIXER_BLEND_COLOR_BLACK);
++	sun8i_rdma_write(mixer->blender_rdma,
++			 SUN8I_MIXER_BLEND_BKCOLOR,
++			 SUN8I_MIXER_BLEND_COLOR_BLACK);
+ 
+ 	/*
+ 	 * Set fill color of bottom plane to black. Generally not needed
+ 	 * except when VI plane is at bottom (zpos = 0) and enabled.
+ 	 */
+-	regmap_write(mixer->engine.regs, SUN8I_MIXER_BLEND_PIPE_CTL(base),
+-		     SUN8I_MIXER_BLEND_PIPE_CTL_FC_EN(0));
+-	regmap_write(mixer->engine.regs, SUN8I_MIXER_BLEND_ATTR_FCOLOR(base, 0),
+-		     SUN8I_MIXER_BLEND_COLOR_BLACK);
++	sun8i_rdma_write(mixer->blender_rdma,
++			 SUN8I_MIXER_BLEND_PIPE_CTL,
++			 SUN8I_MIXER_BLEND_PIPE_CTL_FC_EN(0));
++	sun8i_rdma_write(mixer->blender_rdma,
++			 SUN8I_MIXER_BLEND_ATTR_FCOLOR(0),
++			 SUN8I_MIXER_BLEND_COLOR_BLACK);
+ 
+ 	plane_cnt = mixer->cfg->vi_num + mixer->cfg->ui_num;
+ 	for (i = 0; i < plane_cnt; i++)
+-		regmap_write(mixer->engine.regs,
+-			     SUN8I_MIXER_BLEND_MODE(base, i),
+-			     SUN8I_MIXER_BLEND_MODE_DEF);
++		sun8i_rdma_write(mixer->blender_rdma,
++				 SUN8I_MIXER_BLEND_MODE(i),
++				 SUN8I_MIXER_BLEND_MODE_DEF);
+ 
+-	regmap_update_bits(mixer->engine.regs, SUN8I_MIXER_BLEND_PIPE_CTL(base),
+-			   SUN8I_MIXER_BLEND_PIPE_CTL_EN_MSK, 0);
++	/*
++	 * Enable all CSC units by default, same as in vendor driver. It
++	 * would be tricky to do it without read-modify-write mechanism,
++	 * which is not safe on DE2 and newer. Having it enabled all the
++	 * time doesn't have negative effects.
++	 */
++	if (mixer->cfg->de_type == SUN8I_MIXER_DE3) {
++		sun8i_de3_ccsc_init(mixer->base);
++		sun8i_rdma_write(mixer->blender_rdma,
++				 SUN50I_MIXER_BLEND_CSC_CTL,
++				 SUN50I_MIXER_BLEND_CSC_CTL_EN(0) |
++				 SUN50I_MIXER_BLEND_CSC_CTL_EN(1) |
++				 SUN50I_MIXER_BLEND_CSC_CTL_EN(2) |
++				 SUN50I_MIXER_BLEND_CSC_CTL_EN(3));
++	}
++
++	return 0;
+ }
+ 
+ static int sun8i_mixer_bind(struct device *dev, struct device *master,
+@@ -628,7 +750,6 @@ static int sun8i_mixer_bind(struct device *dev, struct device *master,
+ 	struct drm_device *drm = data;
+ 	struct sun4i_drv *drv = drm->dev_private;
+ 	struct sun8i_mixer *mixer;
+-	void __iomem *regs;
+ 	int i, ret;
+ 
+ 	/*
+@@ -638,7 +759,7 @@ static int sun8i_mixer_bind(struct device *dev, struct device *master,
+ 	 * Restrict the DMA mask so that the mixer won't be
+ 	 * allocated some memory that is too high.
+ 	 */
+-	ret = dma_set_mask(dev, DMA_BIT_MASK(32));
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
+ 	if (ret) {
+ 		dev_err(dev, "Cannot do 32-bit DMA.\n");
+ 		return ret;
+@@ -691,35 +812,38 @@ static int sun8i_mixer_bind(struct device *dev, struct device *master,
+ 
+ 	if (mixer->cfg->de_type == SUN8I_MIXER_DE33 && !mixer->cfg->uses_rcq)
+ 		mixer->engine.ops = &sun50i_engine_ops;
++	else if (mixer->cfg->de_type == SUN8I_MIXER_DE3)
++		mixer->engine.ops = &sun50i_de3_engine_ops;
+ 	else
+ 		mixer->engine.ops = &sun8i_engine_ops;
+ 
+-	regs = devm_platform_ioremap_resource(pdev, 0);
+-	if (IS_ERR(regs))
+-		return PTR_ERR(regs);
++	mixer->base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(mixer->base))
++		return PTR_ERR(mixer->base);
+ 
+-	mixer->engine.regs = devm_regmap_init_mmio(dev, regs,
+-						   &sun8i_mixer_regmap_config);
+-	if (IS_ERR(mixer->engine.regs)) {
+-		dev_err(dev, "Couldn't create the mixer regmap\n");
+-		return PTR_ERR(mixer->engine.regs);
++	if (mixer->cfg->de_type == SUN8I_MIXER_DE33) {
++		mixer->top = devm_platform_ioremap_resource_byname(pdev, "top");
++		if (IS_ERR(mixer->top))
++			return PTR_ERR(mixer->top);
+ 	}
+ 
+-	if (mixer->cfg->de_type == SUN8I_MIXER_DE33) {
+-		regs = devm_platform_ioremap_resource_byname(pdev, "top");
+-		if (IS_ERR(regs))
+-			return PTR_ERR(regs);
+-
+-		mixer->top_regs = devm_regmap_init_mmio(dev, regs,
+-							&sun8i_top_regmap_config);
+-		if (IS_ERR(mixer->top_regs)) {
+-			dev_err(dev, "Couldn't create the top regmap\n");
++	if (mixer->cfg->uses_rcq) {
++		static const struct regmap_config top_config = {
++			.reg_bits = 32,
++			.val_bits = 32,
++			.reg_stride = 4,
++			.max_register = 0x3c,
++		};
++
++		mixer->top_regs = devm_regmap_init_mmio(dev, mixer->top,
++						       &top_config);
++		if (IS_ERR(mixer->top_regs))
+ 			return PTR_ERR(mixer->top_regs);
+-		}
+ 	}
+ 
+ 	if (mixer->cfg->uses_rcq) {
+ 		struct resource *res;
++		void __iomem *regs;
+ 
+ 		/*
+ 		 * The DE top mux/control block overlaps the de33-clk node, so
+@@ -783,6 +907,7 @@ static int sun8i_mixer_bind(struct device *dev, struct device *master,
+ 
+ 	if (mixer->cfg->de_type == SUN8I_MIXER_DE33 && !mixer->cfg->uses_rcq) {
+ 		struct platform_device *pdev;
++		struct device_link *link;
+ 		struct device_node *np;
+ 		void *data;
+ 
+@@ -807,6 +932,31 @@ static int sun8i_mixer_bind(struct device *dev, struct device *master,
+ 		}
+ 
+ 		mixer->planes_dev = &pdev->dev;
++		link = device_link_add(dev, &pdev->dev,
++				       DL_FLAG_AUTOREMOVE_CONSUMER);
++		if (!link) {
++			ret = -EINVAL;
++			goto err_put_device;
++		}
++
++		/*
++		 * All DE33 memory clients share one IOMMU master. Use the
++		 * planes device for framebuffer and RCQ allocations so they
++		 * are mapped in the same domain.
++		 */
++		drm_dev_set_dma_dev(drm, mixer->planes_dev);
++	}
++
++	mixer->rdma = sun8i_rdma_init(mixer->planes_dev ?: dev,
++				      mixer->cfg->de_type == SUN8I_MIXER_DE33 &&
++				      !mixer->cfg->uses_rcq ? mixer->top + 0x10 : NULL,
++				      mixer->cfg->de_type == SUN8I_MIXER_DE33 &&
++				      !mixer->cfg->uses_rcq);
++	if (!mixer->rdma) {
++		ret = -ENOMEM;
++		if (mixer->cfg->de_type == SUN8I_MIXER_DE33)
++			goto err_put_device;
++		goto err_disable_mod_clk;
+ 	}
+ 
+ 	list_add_tail(&mixer->engine.list, &drv->engine_list);
+@@ -815,44 +965,56 @@ static int sun8i_mixer_bind(struct device *dev, struct device *master,
+ 	/* Reset registers and disable unused sub-engines */
+ 	if (mixer->cfg->de_type == SUN8I_MIXER_DE3) {
+ 		for (i = 0; i < DE3_MIXER_UNIT_SIZE; i += 4)
+-			regmap_write(mixer->engine.regs, i, 0);
+-
+-		regmap_write(mixer->engine.regs, SUN50I_MIXER_FCE_EN, 0);
+-		regmap_write(mixer->engine.regs, SUN50I_MIXER_PEAK_EN, 0);
+-		regmap_write(mixer->engine.regs, SUN50I_MIXER_LCTI_EN, 0);
+-		regmap_write(mixer->engine.regs, SUN50I_MIXER_BLS_EN, 0);
+-		regmap_write(mixer->engine.regs, SUN50I_MIXER_FCC_EN, 0);
+-		regmap_write(mixer->engine.regs, SUN50I_MIXER_DNS_EN, 0);
+-		regmap_write(mixer->engine.regs, SUN50I_MIXER_DRC_EN, 0);
+-		regmap_write(mixer->engine.regs, SUN50I_MIXER_FMT_EN, 0);
+-		regmap_write(mixer->engine.regs, SUN50I_MIXER_CDC0_EN, 0);
+-		regmap_write(mixer->engine.regs, SUN50I_MIXER_CDC1_EN, 0);
++			writel(0, mixer->base + i);
++
++		writel(0, mixer->base + SUN50I_MIXER_FCE_EN);
++		writel(0, mixer->base + SUN50I_MIXER_PEAK_EN);
++		writel(0, mixer->base + SUN50I_MIXER_LCTI_EN);
++		writel(0, mixer->base + SUN50I_MIXER_BLS_EN);
++		writel(0, mixer->base + SUN50I_MIXER_FCC_EN);
++		writel(0, mixer->base + SUN50I_MIXER_DNS_EN);
++		writel(0, mixer->base + SUN50I_MIXER_DRC_EN);
++		writel(0, mixer->base + SUN50I_MIXER_FMT_EN);
++		writel(0, mixer->base + SUN50I_MIXER_CDC0_EN);
++		writel(0, mixer->base + SUN50I_MIXER_CDC1_EN);
+ 	} else if (mixer->cfg->de_type == SUN8I_MIXER_DE2) {
+ 		for (i = 0; i < DE2_MIXER_UNIT_SIZE; i += 4)
+-			regmap_write(mixer->engine.regs, i, 0);
+-
+-		regmap_write(mixer->engine.regs, SUN8I_MIXER_FCE_EN, 0);
+-		regmap_write(mixer->engine.regs, SUN8I_MIXER_BWS_EN, 0);
+-		regmap_write(mixer->engine.regs, SUN8I_MIXER_LTI_EN, 0);
+-		regmap_write(mixer->engine.regs, SUN8I_MIXER_PEAK_EN, 0);
+-		regmap_write(mixer->engine.regs, SUN8I_MIXER_ASE_EN, 0);
+-		regmap_write(mixer->engine.regs, SUN8I_MIXER_FCC_EN, 0);
+-		regmap_write(mixer->engine.regs, SUN8I_MIXER_DCSC_EN, 0);
++			writel(0, mixer->base + i);
++
++		writel(0, mixer->base + SUN8I_MIXER_FCE_EN);
++		writel(0, mixer->base + SUN8I_MIXER_BWS_EN);
++		writel(0, mixer->base + SUN8I_MIXER_LTI_EN);
++		writel(0, mixer->base + SUN8I_MIXER_PEAK_EN);
++		writel(0, mixer->base + SUN8I_MIXER_ASE_EN);
++		writel(0, mixer->base + SUN8I_MIXER_FCC);
++		writel(0, mixer->base + SUN8I_MIXER_DCSC_EN);
+ 	}
+ 
+-	sun8i_mixer_init(mixer);
+ 	} /* hw_preconfigured */
+ 
++	ret = sun8i_mixer_init(mixer);
++	if (ret) {
++		list_del(&mixer->engine.list);
++		sun8i_rdma_deinit(mixer->rdma);
++		mixer->rdma = NULL;
++		goto err_put_device;
++	}
++
+ 	if (mixer->cfg->uses_rcq) {
+ 		ret = sun55i_de_init(mixer);
+ 		if (ret) {
+-			dev_err(dev, "Couldn't set up the v35x DE RCQ engine\n");
+-			goto err_disable_mod_clk;
++			list_del(&mixer->engine.list);
++			sun8i_rdma_deinit(mixer->rdma);
++			mixer->rdma = NULL;
++			goto err_put_device;
+ 		}
+ 	}
+ 
+ 	return 0;
+ 
++err_put_device:
++	if (mixer->planes_dev)
++		put_device(mixer->planes_dev);
+ err_disable_mod_clk:
+ 	clk_disable_unprepare(mixer->mod_clk);
+ err_disable_bus_clk:
+@@ -869,7 +1031,9 @@ static void sun8i_mixer_unbind(struct device *dev, struct device *master,
+ 
+ 	list_del(&mixer->engine.list);
+ 
+-	if (mixer->cfg->de_type == SUN8I_MIXER_DE33 && !mixer->cfg->uses_rcq)
++	sun8i_rdma_deinit(mixer->rdma);
++
++	if (mixer->planes_dev)
+ 		put_device(mixer->planes_dev);
+ 
+ 	clk_disable_unprepare(mixer->mod_clk);
+@@ -906,8 +1070,14 @@ static const struct sun8i_mixer_cfg sun8i_a83t_mixer0_cfg = {
+ 		.ccsc		= CCSC_MIXER0_LAYOUT,
+ 		.de_type	= SUN8I_MIXER_DE2,
+ 		.vi_scaler_num	= 1,
+-		.scaler_mask	= 0xf,
+-		.scanline_yuv	= 2048,
++		.scaler_type	= {
++			SUN8I_SCALER_VI_10,
++			SUN8I_SCALER_UI,
++			SUN8I_SCALER_UI,
++			SUN8I_SCALER_UI,
++		},
++		.scanline_yuv	= {2048},
++		.scanline_rgb	= {2048, 2048, 2048, 2048},
+ 		.de2_fcc_alpha	= 1,
+ 	},
+ 	.de_type	= SUN8I_MIXER_DE2,
+@@ -920,8 +1090,12 @@ static const struct sun8i_mixer_cfg sun8i_a83t_mixer1_cfg = {
+ 		.ccsc		= CCSC_MIXER1_LAYOUT,
+ 		.de_type	= SUN8I_MIXER_DE2,
+ 		.vi_scaler_num	= 1,
+-		.scaler_mask	= 0x3,
+-		.scanline_yuv	= 2048,
++		.scaler_type	= {
++			SUN8I_SCALER_VI_10,
++			SUN8I_SCALER_UI,
++		},
++		.scanline_yuv	= {2048},
++		.scanline_rgb	= {2048, 2048},
+ 		.de2_fcc_alpha	= 1,
+ 	},
+ 	.de_type	= SUN8I_MIXER_DE2,
+@@ -934,8 +1108,14 @@ static const struct sun8i_mixer_cfg sun8i_h3_mixer0_cfg = {
+ 		.ccsc		= CCSC_MIXER0_LAYOUT,
+ 		.de_type	= SUN8I_MIXER_DE2,
+ 		.vi_scaler_num	= 1,
+-		.scaler_mask	= 0xf,
+-		.scanline_yuv	= 2048,
++		.scaler_type	= {
++			SUN8I_SCALER_VI_10,
++			SUN8I_SCALER_UI,
++			SUN8I_SCALER_UI,
++			SUN8I_SCALER_UI,
++		},
++		.scanline_yuv	= {2048},
++		.scanline_rgb	= {2048, 2048, 2048, 2048},
+ 		.de2_fcc_alpha	= 1,
+ 	},
+ 	.de_type	= SUN8I_MIXER_DE2,
+@@ -953,8 +1133,9 @@ static const struct sun8i_mixer_cfg sun8i_h3_mixer1_cfg = {
+ 		.ccsc		= CCSC_MIXER1_LAYOUT,
+ 		.de_type	= SUN8I_MIXER_DE2,
+ 		.vi_scaler_num	= 1,
+-		.scaler_mask	= 0x3,
+-		.scanline_yuv	= 2048,
++		.scaler_type	= {SUN8I_SCALER_VI_10, SUN8I_SCALER_UI},
++		.scanline_yuv	= {2048},
++		.scanline_rgb	= {2048, 2048},
+ 		.de2_fcc_alpha	= 1,
+ 	},
+ 	.de_type	= SUN8I_MIXER_DE2,
+@@ -968,8 +1149,14 @@ static const struct sun8i_mixer_cfg sun8i_r40_mixer0_cfg = {
+ 		.ccsc		= CCSC_MIXER0_LAYOUT,
+ 		.de_type	= SUN8I_MIXER_DE2,
+ 		.vi_scaler_num	= 1,
+-		.scaler_mask	= 0xf,
+-		.scanline_yuv	= 2048,
++		.scaler_type	= {
++			SUN8I_SCALER_VI_10,
++			SUN8I_SCALER_UI,
++			SUN8I_SCALER_UI,
++			SUN8I_SCALER_UI,
++		},
++		.scanline_yuv	= {2048},
++		.scanline_rgb	= {2048, 2048, 2048, 2048},
+ 		.de2_fcc_alpha	= 1,
+ 	},
+ 	.de_type	= SUN8I_MIXER_DE2,
+@@ -983,8 +1170,12 @@ static const struct sun8i_mixer_cfg sun8i_r40_mixer1_cfg = {
+ 		.ccsc		= CCSC_MIXER1_LAYOUT,
+ 		.de_type	= SUN8I_MIXER_DE2,
+ 		.vi_scaler_num	= 1,
+-		.scaler_mask	= 0x3,
+-		.scanline_yuv	= 2048,
++		.scaler_type	= {
++			SUN8I_SCALER_VI_10,
++			SUN8I_SCALER_UI,
++		},
++		.scanline_yuv	= {2048},
++		.scanline_rgb	= {2048, 2048},
+ 		.de2_fcc_alpha	= 1,
+ 	},
+ 	.de_type	= SUN8I_MIXER_DE2,
+@@ -998,8 +1189,13 @@ static const struct sun8i_mixer_cfg sun8i_v3s_mixer_cfg = {
+ 		.ccsc		= CCSC_MIXER0_LAYOUT,
+ 		.de_type	= SUN8I_MIXER_DE2,
+ 		.vi_scaler_num	= 2,
+-		.scaler_mask	= 0x3,
+-		.scanline_yuv	= 1024,
++		.scaler_type	= {
++			SUN8I_SCALER_VI_10,
++			SUN8I_SCALER_VI_10,
++			SUN8I_SCALER_NONE,
++		},
++		.scanline_yuv	= {1024, 1024},
++		.scanline_rgb	= {1024, 1024},
+ 	},
+ 	.de_type	= SUN8I_MIXER_DE2,
+ 	.mod_rate	= 150000000,
+@@ -1012,8 +1208,12 @@ static const struct sun8i_mixer_cfg sun20i_d1_mixer0_cfg = {
+ 		.ccsc		= CCSC_D1_MIXER0_LAYOUT,
+ 		.de_type	= SUN8I_MIXER_DE2,
+ 		.vi_scaler_num	= 1,
+-		.scaler_mask	= 0x3,
+-		.scanline_yuv	= 2048,
++		.scaler_type	= {
++			SUN8I_SCALER_VI_10,
++			SUN8I_SCALER_UI,
++		},
++		.scanline_yuv	= {2048},
++		.scanline_rgb	= {2048, 2048},
+ 		.de2_fcc_alpha	= 1,
+ 	},
+ 	.de_type	= SUN8I_MIXER_DE2,
+@@ -1027,8 +1227,11 @@ static const struct sun8i_mixer_cfg sun20i_d1_mixer1_cfg = {
+ 		.ccsc		= CCSC_MIXER1_LAYOUT,
+ 		.de_type	= SUN8I_MIXER_DE2,
+ 		.vi_scaler_num	= 1,
+-		.scaler_mask	= 0x1,
+-		.scanline_yuv	= 1024,
++		.scaler_type	= {
++			SUN8I_SCALER_VI_10,
++		},
++		.scanline_yuv	= {1024},
++		.scanline_rgb	= {1024},
+ 		.de2_fcc_alpha	= 1,
+ 	},
+ 	.de_type	= SUN8I_MIXER_DE2,
+@@ -1042,8 +1245,14 @@ static const struct sun8i_mixer_cfg sun50i_a64_mixer0_cfg = {
+ 		.ccsc		= CCSC_MIXER0_LAYOUT,
+ 		.de_type	= SUN8I_MIXER_DE2,
+ 		.vi_scaler_num	= 1,
+-		.scaler_mask	= 0xf,
+-		.scanline_yuv	= 4096,
++		.scaler_type	= {
++			SUN8I_SCALER_VI_10,
++			SUN8I_SCALER_UI,
++			SUN8I_SCALER_UI,
++			SUN8I_SCALER_UI,
++		},
++		.scanline_yuv	= {4096},
++		.scanline_rgb	= {2048, 2048, 2048, 2048},
+ 		.de2_fcc_alpha	= 1,
+ 	},
+ 	.de_type	= SUN8I_MIXER_DE2,
+@@ -1057,8 +1266,12 @@ static const struct sun8i_mixer_cfg sun50i_a64_mixer1_cfg = {
+ 		.ccsc		= CCSC_MIXER1_LAYOUT,
+ 		.de_type	= SUN8I_MIXER_DE2,
+ 		.vi_scaler_num	= 1,
+-		.scaler_mask	= 0x3,
+-		.scanline_yuv	= 2048,
++		.scaler_type	= {
++			SUN8I_SCALER_VI_10,
++			SUN8I_SCALER_UI,
++		},
++		.scanline_yuv	= {2048},
++		.scanline_rgb	= {2048, 2048},
+ 		.de2_fcc_alpha	= 1,
+ 	},
+ 	.de_type	= SUN8I_MIXER_DE2,
+@@ -1070,9 +1283,17 @@ static const struct sun8i_mixer_cfg sun50i_a64_mixer1_cfg = {
+ static const struct sun8i_mixer_cfg sun50i_h6_mixer0_cfg = {
+ 	.lay_cfg = {
+ 		.de_type	= SUN8I_MIXER_DE3,
++		.afbc_mask	= BIT(0),
+ 		.vi_scaler_num	= 1,
+-		.scaler_mask	= 0xf,
+-		.scanline_yuv	= 4096,
++		.scaler_type	= {
++			SUN8I_SCALER_VI_ED,
++			SUN8I_SCALER_UI,
++			SUN8I_SCALER_UI,
++			SUN8I_SCALER_UI,
++		},
++		.scanline_yuv	= {4096},
++		.scanline_rgb	= {2048, 2048, 2048, 2048},
++		.scanline_ed	= {2048},
+ 	},
+ 	.de_type	= SUN8I_MIXER_DE3,
+ 	.mod_rate	= 600000000,
+@@ -1092,8 +1313,12 @@ static const struct sun8i_mixer_cfg sun50i_h616_mixer0_cfg = {
+ static const struct sun8i_mixer_cfg sun55i_a523_mixer0_cfg = {
+ 	.lay_cfg = {
+ 		.de_type	= SUN8I_MIXER_DE33,
+-		.scaler_mask	= 0xf,
+-		.scanline_yuv	= 4096,
++		.scaler_type	= {
++			SUN8I_SCALER_VI_10, SUN8I_SCALER_UI,
++			SUN8I_SCALER_UI, SUN8I_SCALER_UI,
++		},
++		.scanline_yuv	= {4096},
++		.scanline_rgb	= {2048, 2048, 2048, 2048},
+ 	},
+ 	.de_type	= SUN8I_MIXER_DE33,
+ 	.mod_rate	= 600000000,
+@@ -1171,7 +1396,29 @@ static struct platform_driver sun8i_mixer_platform_driver = {
+ 		.of_match_table	= sun8i_mixer_of_table,
+ 	},
+ };
+-module_platform_driver(sun8i_mixer_platform_driver);
++static int __init sun8i_mixer_module_init(void)
++{
++	int ret;
++
++	ret = platform_driver_register(&sun50i_planes_platform_driver);
++	if (ret)
++		return ret;
++
++	ret = platform_driver_register(&sun8i_mixer_platform_driver);
++	if (ret)
++		platform_driver_unregister(&sun50i_planes_platform_driver);
++
++	return ret;
++}
++
++static void __exit sun8i_mixer_module_exit(void)
++{
++	platform_driver_unregister(&sun8i_mixer_platform_driver);
++	platform_driver_unregister(&sun50i_planes_platform_driver);
++}
++
++module_init(sun8i_mixer_module_init);
++module_exit(sun8i_mixer_module_exit);
+ 
+ MODULE_AUTHOR("Icenowy Zheng <icenowy@aosc.io>");
+ MODULE_DESCRIPTION("Allwinner DE2 Mixer driver");
+diff --git a/drivers/gpu/drm/sun4i/sun8i_mixer.h b/drivers/gpu/drm/sun4i/sun8i_mixer.h
+index 4d599cd..6a77a32 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_mixer.h
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.h
+@@ -65,23 +65,24 @@
+ #define DE33_CH_BASE				0x1000
+ #define DE33_CH_SIZE				0x20000
+ 
+-#define SUN8I_MIXER_BLEND_PIPE_CTL(base)	((base) + 0)
+-#define SUN8I_MIXER_BLEND_ATTR_FCOLOR(base, x)	((base) + 0x4 + 0x10 * (x))
+-#define SUN8I_MIXER_BLEND_ATTR_INSIZE(base, x)	((base) + 0x8 + 0x10 * (x))
+-#define SUN8I_MIXER_BLEND_ATTR_COORD(base, x)	((base) + 0xc + 0x10 * (x))
+-#define SUN8I_MIXER_BLEND_ROUTE(base)		((base) + 0x80)
+-#define SUN8I_MIXER_BLEND_PREMULTIPLY(base)	((base) + 0x84)
+-#define SUN8I_MIXER_BLEND_BKCOLOR(base)		((base) + 0x88)
+-#define SUN8I_MIXER_BLEND_OUTSIZE(base)		((base) + 0x8c)
+-#define SUN8I_MIXER_BLEND_MODE(base, x)		((base) + 0x90 + 0x04 * (x))
+-#define SUN8I_MIXER_BLEND_CK_CTL(base)		((base) + 0xb0)
+-#define SUN8I_MIXER_BLEND_CK_CFG(base)		((base) + 0xb4)
+-#define SUN8I_MIXER_BLEND_CK_MAX(base, x)	((base) + 0xc0 + 0x04 * (x))
+-#define SUN8I_MIXER_BLEND_CK_MIN(base, x)	((base) + 0xe0 + 0x04 * (x))
+-#define SUN8I_MIXER_BLEND_OUTCTL(base)		((base) + 0xfc)
+-#define SUN50I_MIXER_BLEND_CSC_CTL(base)	((base) + 0x100)
+-#define SUN50I_MIXER_BLEND_CSC_COEFF(base, layer, x) \
+-	((base) + 0x110 + (layer) * 0x30 +  (x) * 4)
++#define SUN8I_MIXER_FCC				0xaa000
++
++#define SUN8I_MIXER_BLEND_PIPE_CTL		0x0
++#define SUN8I_MIXER_BLEND_ATTR_FCOLOR(x)	(0x4 + 0x10 * (x))
++#define SUN8I_MIXER_BLEND_ATTR_INSIZE(x)	(0x8 + 0x10 * (x))
++#define SUN8I_MIXER_BLEND_ATTR_COORD(x)		(0xc + 0x10 * (x))
++#define SUN8I_MIXER_BLEND_ROUTE			0x80
++#define SUN8I_MIXER_BLEND_PREMULTIPLY		0x84
++#define SUN8I_MIXER_BLEND_BKCOLOR		0x88
++#define SUN8I_MIXER_BLEND_OUTSIZE		0x8c
++#define SUN8I_MIXER_BLEND_MODE(x)		(0x90 + 0x04 * (x))
++#define SUN8I_MIXER_BLEND_CK_CTL		0xb0
++#define SUN8I_MIXER_BLEND_CK_CFG		0xb4
++#define SUN8I_MIXER_BLEND_CK_MAX(x)		(0xc0 + 0x04 * (x))
++#define SUN8I_MIXER_BLEND_CK_MIN(x)		(0xe0 + 0x04 * (x))
++#define SUN8I_MIXER_BLEND_OUTCTL		0xfc
++#define SUN50I_MIXER_BLEND_CSC_CTL		0x100
++#define SUN50I_MIXER_BLEND_CSC_COEFF(layer, x)	(0x110 + (layer) * 0x30 + (x) * 4)
+ 
+ #define SUN8I_MIXER_BLEND_PIPE_CTL_EN_MSK	GENMASK(12, 8)
+ #define SUN8I_MIXER_BLEND_PIPE_CTL_EN(pipe)	BIT(8 + pipe)
+@@ -165,6 +166,7 @@
+ #define SUN8I_MIXER_PEAK_EN			0xa6000
+ #define SUN8I_MIXER_ASE_EN			0xa8000
+ #define SUN8I_MIXER_FCC_EN			0xaa000
++#define SUN8I_MIXER_DCSC_EN			0xb0000
+ 
+ #define SUN50I_MIXER_FCE_EN			0x70000
+ #define SUN50I_MIXER_PEAK_EN			0x70800
+@@ -177,6 +179,8 @@
+ #define SUN50I_MIXER_CDC0_EN			0xd0000
+ #define SUN50I_MIXER_CDC1_EN			0xd8000
+ 
++#define MAX_CHANNELS	9
++
+ enum {
+ 	/* First mixer or second mixer with VEP support. */
+ 	CCSC_MIXER0_LAYOUT,
+@@ -192,25 +196,39 @@ enum sun8i_mixer_type {
+ 	SUN8I_MIXER_DE33,
+ };
+ 
++enum sun8i_scaler_type {
++	SUN8I_SCALER_NONE,
++	SUN8I_SCALER_UI,
++	SUN8I_SCALER_VI_8,
++	SUN8I_SCALER_VI_10,
++	SUN8I_SCALER_VI_ED,
++};
++
++struct sun8i_rdma;
++
+ /**
+  * struct sun8i_layer_cfg - layer configuration
+  * @vi_scaler_num: Number of VI scalers. Used on DE2 and DE3.
+- * @scaler_mask: bitmask which tells which channel supports scaling
+- *	First, scaler supports for VI channels is defined and after that, scaler
+- *	support for UI channels. For example, if mixer has 2 VI channels without
+- *	scaler and 2 UI channels with scaler, bitmask would be 0xC.
++ * @scaler_type: Type of supported scaler for each channel.
+  * @ccsc: select set of CCSC base addresses from the enumeration above.
+  * @de_type: sun8i_mixer_type enum representing the display engine generation.
+- * @scaline_yuv: size of a scanline for VI scaler for YUV formats.
++ * @afbc_mask: bitmask of physical channels with an AFBC decompressor.
++ * @scanline_yuv: array of sizes of a scanline for VI scaler for YUV formats.
++ * @scanline_rgb: array of sizes of a scanline for VI scaler for RGB formats.
++ * @scanline_ed: array of sizes of a scanline for VI scaler in edge detection
++ *	mode.
+  * @de2_fcc_alpha: use FCC for missing DE2 VI alpha capability
+  *	Most DE2 cores has FCC. If number of VI planes is one, enable this.
+  */
+ struct sun8i_layer_cfg {
+ 	unsigned int	vi_scaler_num;
+-	int		scaler_mask;
++	unsigned int	scaler_type[MAX_CHANNELS];
+ 	int		ccsc;
+ 	unsigned int	de_type;
+-	unsigned int	scanline_yuv;
++	unsigned int	afbc_mask;
++	unsigned int	scanline_yuv[MAX_CHANNELS];
++	unsigned int	scanline_rgb[MAX_CHANNELS];
++	unsigned int	scanline_ed[MAX_CHANNELS];
+ 	unsigned int	de2_fcc_alpha : 1;
+ };
+ 
+@@ -245,8 +263,8 @@ struct sun8i_mixer {
+ 	struct clk			*bus_clk;
+ 	struct clk			*mod_clk;
+ 
+-	struct regmap			*top_regs;
+ 	struct device			*planes_dev;
++	struct regmap			*top_regs;
+ 	struct sun4i_drv		*drv;
+ 	bool				hw_preconfigured;
+ 
+@@ -255,6 +273,13 @@ struct sun8i_mixer {
+ 	struct regmap			*detop_regs;	/* DE top mux/control 0x8000 */
+ 	struct sun55i_de		*de;		/* RCQ engine state */
+ 	u32				de_bg_color;	/* background (AARRGGBB) */
++
++	struct sun8i_rdma		*rdma;
++	struct sun8i_rdma_unit		*global_rdma;
++	struct sun8i_rdma_unit		*blender_rdma;
++	u32				global_size;
++	void __iomem			*base;
++	void __iomem			*top;
+ };
+ 
+ enum {
+@@ -268,8 +293,12 @@ struct sun8i_layer {
+ 	int				index;
+ 	int				channel;
+ 	int				overlay;
+-	struct regmap			*regs;
+ 	const struct sun8i_layer_cfg	*cfg;
++	struct sun8i_rdma_unit		*layer_rdma;
++	struct sun8i_rdma_unit		*afbc_rdma;
++	struct sun8i_rdma_unit		*fcc_rdma;
++	struct sun8i_rdma_unit		*scaler_rdma;
++	struct sun8i_rdma_unit		*csc_rdma;
+ };
+ 
+ static inline struct sun8i_layer *
+diff --git a/drivers/gpu/drm/sun4i/sun8i_rdma.c b/drivers/gpu/drm/sun4i/sun8i_rdma.c
+new file mode 100644
+index 0000000..e390e7c
+--- /dev/null
++++ b/drivers/gpu/drm/sun4i/sun8i_rdma.c
+@@ -0,0 +1,328 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Copyright (C) Jernej Skrabec <jernej.skrabec@gmail.com>
++ */
++
++#include <linux/dma-mapping.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/list.h>
++#include <linux/slab.h>
++
++#include "sun8i_rdma.h"
++
++#define SUN8I_RCQ_STATUS_OFFSET	0x0c
++#define SUN8I_RCQ_STATUS_FINISH	BIT(2)
++#define SUN8I_RCQ_STATUS_ACCEPT	BIT(3)
++#define SUN8I_RCQ_STATUS_W1C	(BIT(0) | GENMASK(3, 2))
++
++/* Two frame periods at the lowest supported refresh rate. */
++#define SUN8I_RCQ_FINISH_TIMEOUT_US	40000
++
++struct sun8i_rcq_head {
++	u32 low_addr;
++	u32 len_hi;
++	u32 dirty;
++	u32 reg_offset;
++};
++
++struct sun8i_rdma_unit {
++	struct list_head node;
++	void __iomem *base;
++	void *mem;
++	void *rcq_mem;
++	dma_addr_t rcq_dma;
++	size_t rcq_size;
++	u32 reg_offset;
++	u32 size;
++	const struct reg_region *regions;
++	unsigned int first_head;
++	bool dirty;
++};
++
++struct sun8i_rdma {
++	struct device *dev;
++	struct list_head list;
++	void __iomem *rcq;
++	struct sun8i_rcq_head *heads;
++	dma_addr_t heads_dma;
++	unsigned int head_count;
++	unsigned int head_alloc;
++	bool rcq_enabled;
++	bool rcq_ready;
++	bool rcq_armed;
++};
++
++struct sun8i_rdma *sun8i_rdma_init(struct device *dev,
++				   void __iomem *rcq, bool rcq_enabled)
++{
++	struct sun8i_rdma *rdma;
++
++	rdma = kzalloc_obj(*rdma, GFP_KERNEL);
++	if (!rdma)
++		return NULL;
++
++	rdma->dev = dev;
++	rdma->rcq = rcq;
++	rdma->rcq_enabled = rcq_enabled;
++	INIT_LIST_HEAD(&rdma->list);
++
++	return rdma;
++}
++
++void sun8i_rdma_deinit(struct sun8i_rdma *rdma)
++{
++	struct sun8i_rdma_unit *unit, *tmp;
++
++	if (!rdma)
++		return;
++
++	if (rdma->heads)
++		dma_free_coherent(rdma->dev,
++				  rdma->head_alloc * sizeof(*rdma->heads),
++				  rdma->heads, rdma->heads_dma);
++
++	list_for_each_entry_safe(unit, tmp, &rdma->list, node) {
++		list_del(&unit->node);
++		if (rdma->rcq_enabled)
++			dma_free_coherent(rdma->dev, unit->rcq_size,
++					  unit->rcq_mem, unit->rcq_dma);
++		kfree(unit->mem);
++		kfree(unit);
++	}
++
++	kfree(rdma);
++}
++
++int sun8i_rdma_prepare(struct sun8i_rdma *rdma)
++{
++	struct sun8i_rdma_unit *unit;
++	unsigned int count = 0;
++
++	if (!rdma->rcq_enabled || rdma->rcq_ready)
++		return 0;
++
++	list_for_each_entry(unit, &rdma->list, node) {
++		const struct reg_region *region = unit->regions;
++
++		while (region->count) {
++			count++;
++			region++;
++		}
++	}
++
++	/* The hardware fetches RCQ heads in pairs. */
++	rdma->head_alloc = ALIGN(count, 2);
++	rdma->heads = dma_alloc_coherent(rdma->dev,
++					 rdma->head_alloc * sizeof(*rdma->heads),
++					 &rdma->heads_dma, GFP_KERNEL);
++	if (!rdma->heads)
++		return -ENOMEM;
++	memset(rdma->heads, 0, rdma->head_alloc * sizeof(*rdma->heads));
++
++	count = 0;
++	list_for_each_entry(unit, &rdma->list, node) {
++		const struct reg_region *region = unit->regions;
++		size_t offset = 0;
++
++		unit->first_head = count;
++		while (region->count) {
++			struct sun8i_rcq_head *head = &rdma->heads[count++];
++			dma_addr_t addr = unit->rcq_dma + offset;
++
++			head->low_addr = lower_32_bits(addr);
++			head->len_hi = region->count * sizeof(u32) |
++				       (upper_32_bits(addr) << 24);
++			head->reg_offset = unit->reg_offset + region->offset;
++			offset += ALIGN(region->count * sizeof(u32), 32);
++			region++;
++		}
++	}
++	rdma->head_count = count;
++
++	writel(lower_32_bits(rdma->heads_dma), rdma->rcq + 0x4);
++	writel(upper_32_bits(rdma->heads_dma), rdma->rcq + 0x8);
++	writel(rdma->head_alloc * sizeof(*rdma->heads), rdma->rcq + 0xc);
++	rdma->rcq_ready = true;
++
++	return 0;
++}
++
++/* Wait until a previously triggered queue fetch was consumed. */
++void sun8i_rdma_sync(struct sun8i_rdma *rdma)
++{
++	u32 status;
++	int ret;
++
++	if (!rdma->rcq_enabled || !rdma->rcq_armed)
++		return;
++
++	ret = readl_poll_timeout(rdma->rcq - SUN8I_RCQ_STATUS_OFFSET, status,
++				 status & SUN8I_RCQ_STATUS_FINISH,
++				 10, SUN8I_RCQ_FINISH_TIMEOUT_US);
++	if (ret)
++		dev_warn(rdma->dev, "RCQ sync timed out\n");
++	rdma->rcq_armed = false;
++}
++
++int sun8i_rdma_apply(struct sun8i_rdma *rdma)
++{
++	struct sun8i_rdma_unit *unit;
++	bool dirty = false;
++	unsigned int i;
++
++	if (rdma->rcq_enabled) {
++		if (WARN_ON(!rdma->rcq_ready))
++			return -EINVAL;
++
++		/*
++		 * The queue may be fetched only once per update. Triggering
++		 * a new update before the previous one was consumed can
++		 * lose it entirely, leaving the hardware scanning out stale
++		 * buffer addresses. Wait for the previous fetch and fall
++		 * back to CPU writes if it never happened, like the vendor
++		 * driver does.
++		 */
++		if (rdma->rcq_armed) {
++			u32 status;
++			int ret;
++
++			ret = readl_poll_timeout(rdma->rcq - SUN8I_RCQ_STATUS_OFFSET,
++						 status,
++						 status & SUN8I_RCQ_STATUS_FINISH,
++						 10, SUN8I_RCQ_FINISH_TIMEOUT_US);
++			rdma->rcq_armed = false;
++			if (ret) {
++				dev_warn(rdma->dev,
++					 "RCQ not consumed, syncing registers with CPU\n");
++				writel(0, rdma->rcq);
++				writel(SUN8I_RCQ_STATUS_W1C,
++				       rdma->rcq - SUN8I_RCQ_STATUS_OFFSET);
++				list_for_each_entry(unit, &rdma->list, node) {
++					const struct reg_region *region;
++
++					for (region = unit->regions; region->count; region++)
++						__iowrite32_copy(unit->base + region->offset,
++								 unit->mem + region->offset,
++								 region->count);
++					unit->dirty = false;
++				}
++				return 0;
++			}
++		}
++
++		/*
++		 * Gate queue fetches while the head list and staging
++		 * memory are inconsistent, and retire the dirty flags of
++		 * the consumed update so a spurious refetch applies
++		 * nothing.
++		 */
++		writel(0, rdma->rcq);
++		writel(SUN8I_RCQ_STATUS_W1C,
++		       rdma->rcq - SUN8I_RCQ_STATUS_OFFSET);
++		for (i = 0; i < rdma->head_count; i++)
++			rdma->heads[i].dirty = 0;
++
++		list_for_each_entry(unit, &rdma->list, node) {
++			const struct reg_region *region;
++			unsigned int head;
++			size_t offset = 0;
++
++			if (!unit->dirty)
++				continue;
++
++			head = unit->first_head;
++			for (region = unit->regions; region->count; region++) {
++				memcpy(unit->rcq_mem + offset,
++				       unit->mem + region->offset,
++				       region->count * sizeof(u32));
++				rdma->heads[head++].dirty = 1;
++				offset += ALIGN(region->count * sizeof(u32), 32);
++			}
++			unit->dirty = false;
++			dirty = true;
++		}
++
++		if (dirty) {
++			dma_wmb();
++			writel(1, rdma->rcq);
++			rdma->rcq_armed = true;
++		}
++
++		return 0;
++	}
++
++	list_for_each_entry(unit, &rdma->list, node) {
++		const struct reg_region *region;
++
++		if (!unit->dirty)
++			continue;
++
++		for (region = unit->regions; region->count; region++)
++			__iowrite32_copy(unit->base + region->offset,
++					 unit->mem + region->offset,
++					 region->count);
++		unit->dirty = false;
++	}
++
++	return 0;
++}
++
++struct sun8i_rdma_unit *
++sun8i_rdma_add_unit(struct sun8i_rdma *rdma, void __iomem *base,
++		    u32 reg_offset, unsigned int size,
++		    const struct reg_region *regions)
++{
++	struct sun8i_rdma_unit *unit;
++	const struct reg_region *region;
++
++	unit = kzalloc_obj(*unit, GFP_KERNEL);
++	if (!unit)
++		return NULL;
++
++	unit->mem = kzalloc(size, GFP_KERNEL);
++	if (!unit->mem) {
++		kfree(unit);
++		return NULL;
++	}
++
++	if (rdma->rcq_enabled) {
++		/* Every RCQ source block must start at a 32-byte boundary. */
++		for (region = regions; region->count; region++)
++			unit->rcq_size += ALIGN(region->count * sizeof(u32), 32);
++
++		unit->rcq_mem = dma_alloc_coherent(rdma->dev, unit->rcq_size,
++						   &unit->rcq_dma, GFP_KERNEL);
++		if (!unit->rcq_mem) {
++			kfree(unit->mem);
++			kfree(unit);
++			return NULL;
++		}
++	}
++
++	unit->base = base;
++	unit->reg_offset = reg_offset;
++	unit->size = size;
++	unit->regions = regions;
++	list_add_tail(&unit->node, &rdma->list);
++
++	return unit;
++}
++
++void sun8i_rdma_write(struct sun8i_rdma_unit *unit,
++		      unsigned int reg, u32 value)
++{
++	u32 *ptr = unit->mem + reg;
++
++	WARN_ON(reg + sizeof(*ptr) > unit->size);
++	*ptr = value;
++	unit->dirty = true;
++}
++
++void sun8i_rdma_memcpy(struct sun8i_rdma_unit *unit, unsigned int reg,
++		       const u32 *values, unsigned int count)
++{
++	WARN_ON(reg + count * sizeof(*values) > unit->size);
++	memcpy(unit->mem + reg, values, count * sizeof(*values));
++	unit->dirty = true;
++}
+diff --git a/drivers/gpu/drm/sun4i/sun8i_rdma.h b/drivers/gpu/drm/sun4i/sun8i_rdma.h
+new file mode 100644
+index 0000000..ea2bac8
+--- /dev/null
++++ b/drivers/gpu/drm/sun4i/sun8i_rdma.h
+@@ -0,0 +1,34 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/* Copyright (C) Jernej Skrabec <jernej.skrabec@gmail.com> */
++
++#ifndef _SUN8I_RDMA_H_
++#define _SUN8I_RDMA_H_
++
++#include <linux/types.h>
++
++struct device;
++struct sun8i_rdma;
++struct sun8i_rdma_unit;
++
++struct reg_region {
++	unsigned int offset;
++	unsigned int count;
++};
++
++struct sun8i_rdma *sun8i_rdma_init(struct device *dev,
++				   void __iomem *rcq, bool rcq_enabled);
++void sun8i_rdma_deinit(struct sun8i_rdma *rdma);
++int sun8i_rdma_apply(struct sun8i_rdma *rdma);
++void sun8i_rdma_sync(struct sun8i_rdma *rdma);
++int sun8i_rdma_prepare(struct sun8i_rdma *rdma);
++
++struct sun8i_rdma_unit *
++sun8i_rdma_add_unit(struct sun8i_rdma *rdma, void __iomem *base,
++		    u32 reg_offset, unsigned int size,
++		    const struct reg_region *regions);
++void sun8i_rdma_write(struct sun8i_rdma_unit *unit,
++		      unsigned int reg, u32 value);
++void sun8i_rdma_memcpy(struct sun8i_rdma_unit *unit, unsigned int reg,
++		       const u32 *values, unsigned int count);
++
++#endif /* _SUN8I_RDMA_H_ */
+diff --git a/drivers/gpu/drm/sun4i/sun8i_ui_layer.c b/drivers/gpu/drm/sun4i/sun8i_ui_layer.c
+index 00756ab..5491e9e 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_ui_layer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_ui_layer.c
+@@ -22,16 +22,15 @@
+ #include <drm/drm_probe_helper.h>
+ 
+ #include "sun8i_mixer.h"
++#include "sun8i_rdma.h"
+ #include "sun8i_ui_layer.h"
+ #include "sun8i_ui_scaler.h"
+ #include "sun8i_vi_scaler.h"
+ 
+ static void sun8i_ui_layer_disable(struct sun8i_layer *layer)
+ {
+-	u32 ch_base = sun8i_channel_base(layer);
+-
+-	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_UI_LAYER_ATTR(ch_base, layer->overlay), 0);
++	sun8i_rdma_write(layer->layer_rdma,
++			 SUN8I_MIXER_CHAN_UI_LAYER_ATTR(layer->overlay), 0);
+ }
+ 
+ static void sun8i_ui_layer_update_attributes(struct sun8i_layer *layer,
+@@ -39,21 +38,23 @@ static void sun8i_ui_layer_update_attributes(struct sun8i_layer *layer,
+ {
+ 	struct drm_plane_state *state = plane->state;
+ 	const struct drm_format_info *fmt;
+-	u32 val, ch_base, hw_fmt;
++	u32 val, hw_fmt;
+ 
+-	ch_base = sun8i_channel_base(layer);
+ 	fmt = state->fb->format;
+ 	sun8i_mixer_drm_format_to_hw(fmt->format, &hw_fmt);
+ 
+ 	val = SUN8I_MIXER_CHAN_UI_LAYER_ATTR_ALPHA(state->alpha >> 8);
+-	val |= (state->alpha == DRM_BLEND_ALPHA_OPAQUE) ?
+-		SUN8I_MIXER_CHAN_UI_LAYER_ATTR_ALPHA_MODE_PIXEL :
+-		SUN8I_MIXER_CHAN_UI_LAYER_ATTR_ALPHA_MODE_COMBINED;
++	if (!fmt->has_alpha)
++		val |= SUN8I_MIXER_CHAN_UI_LAYER_ATTR_ALPHA_MODE_LAYER;
++	else if (state->alpha == DRM_BLEND_ALPHA_OPAQUE)
++		val |= SUN8I_MIXER_CHAN_UI_LAYER_ATTR_ALPHA_MODE_PIXEL;
++	else
++		val |= SUN8I_MIXER_CHAN_UI_LAYER_ATTR_ALPHA_MODE_COMBINED;
+ 	val |= hw_fmt << SUN8I_MIXER_CHAN_UI_LAYER_ATTR_FBFMT_OFFSET;
+ 	val |= SUN8I_MIXER_CHAN_UI_LAYER_ATTR_EN;
+ 
+-	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_UI_LAYER_ATTR(ch_base, layer->overlay), val);
++	sun8i_rdma_write(layer->layer_rdma,
++			 SUN8I_MIXER_CHAN_UI_LAYER_ATTR(layer->overlay), val);
+ }
+ 
+ static void sun8i_ui_layer_update_coord(struct sun8i_layer *layer,
+@@ -63,13 +64,10 @@ static void sun8i_ui_layer_update_coord(struct sun8i_layer *layer,
+ 	u32 src_w, src_h, dst_w, dst_h;
+ 	u32 outsize, insize;
+ 	u32 hphase, vphase;
+-	u32 ch_base;
+ 
+ 	DRM_DEBUG_DRIVER("Updating UI channel %d overlay %d\n",
+ 			 layer->channel, layer->overlay);
+ 
+-	ch_base = sun8i_channel_base(layer);
+-
+ 	src_w = drm_rect_width(&state->src) >> 16;
+ 	src_h = drm_rect_height(&state->src) >> 16;
+ 	dst_w = drm_rect_width(&state->dst);
+@@ -85,12 +83,10 @@ static void sun8i_ui_layer_update_coord(struct sun8i_layer *layer,
+ 	DRM_DEBUG_DRIVER("Layer source offset X: %d Y: %d\n",
+ 			 state->src.x1 >> 16, state->src.y1 >> 16);
+ 	DRM_DEBUG_DRIVER("Layer source size W: %d H: %d\n", src_w, src_h);
+-	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_UI_LAYER_SIZE(ch_base, layer->overlay),
+-		     insize);
+-	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_UI_OVL_SIZE(ch_base),
+-		     insize);
++	sun8i_rdma_write(layer->layer_rdma,
++			 SUN8I_MIXER_CHAN_UI_LAYER_SIZE(layer->overlay), insize);
++	sun8i_rdma_write(layer->layer_rdma,
++			 SUN8I_MIXER_CHAN_UI_OVL_SIZE, insize);
+ 
+ 	if (insize != outsize || hphase || vphase) {
+ 		u32 hscale, vscale;
+@@ -103,7 +99,7 @@ static void sun8i_ui_layer_update_coord(struct sun8i_layer *layer,
+ 		if (layer->cfg->de_type == SUN8I_MIXER_DE33) {
+ 			sun8i_vi_scaler_setup(layer, src_w, src_h, dst_w, dst_h,
+ 					      hscale, vscale, hphase, vphase,
+-					      state->fb->format);
++					      state->fb->format, false);
+ 			sun8i_vi_scaler_enable(layer, true);
+ 		} else {
+ 			sun8i_ui_scaler_setup(layer, src_w, src_h, dst_w, dst_h,
+@@ -125,24 +121,21 @@ static void sun8i_ui_layer_update_buffer(struct sun8i_layer *layer,
+ 	struct drm_plane_state *state = plane->state;
+ 	struct drm_framebuffer *fb = state->fb;
+ 	dma_addr_t dma_addr;
+-	u32 ch_base;
+-
+-	ch_base = sun8i_channel_base(layer);
+ 
+ 	/* Get the start of the displayed memory */
+ 	dma_addr = drm_fb_dma_get_gem_addr(fb, state, 0);
+ 
+ 	/* Set the line width */
+ 	DRM_DEBUG_DRIVER("Layer line width: %d bytes\n", fb->pitches[0]);
+-	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_UI_LAYER_PITCH(ch_base, layer->overlay),
+-		     fb->pitches[0]);
++	sun8i_rdma_write(layer->layer_rdma,
++			 SUN8I_MIXER_CHAN_UI_LAYER_PITCH(layer->overlay),
++			 fb->pitches[0]);
+ 
+ 	DRM_DEBUG_DRIVER("Setting buffer address to %pad\n", &dma_addr);
+ 
+-	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_UI_LAYER_TOP_LADDR(ch_base, layer->overlay),
+-		     lower_32_bits(dma_addr));
++	sun8i_rdma_write(layer->layer_rdma,
++			 SUN8I_MIXER_CHAN_UI_LAYER_TOP_LADDR(layer->overlay),
++			 lower_32_bits(dma_addr));
+ }
+ 
+ static int sun8i_ui_layer_atomic_check(struct drm_plane *plane,
+@@ -174,7 +167,7 @@ static int sun8i_ui_layer_atomic_check(struct drm_plane *plane,
+ 	min_scale = DRM_PLANE_NO_SCALING;
+ 	max_scale = DRM_PLANE_NO_SCALING;
+ 
+-	if (layer->cfg->scaler_mask & BIT(layer->channel)) {
++	if (layer->cfg->scaler_type[layer->channel] != SUN8I_SCALER_NONE) {
+ 		min_scale = SUN8I_UI_SCALER_SCALE_MIN;
+ 		max_scale = SUN8I_UI_SCALER_SCALE_MAX;
+ 	}
+@@ -186,6 +179,14 @@ static int sun8i_ui_layer_atomic_check(struct drm_plane *plane,
+ }
+ 
+ 
++static void sun8i_ui_layer_atomic_disable(struct drm_plane *plane,
++					  struct drm_atomic_commit *state)
++{
++	struct sun8i_layer *layer = plane_to_sun8i_layer(plane);
++
++	sun8i_ui_layer_disable(layer);
++}
++
+ static void sun8i_ui_layer_atomic_update(struct drm_plane *plane,
+ 					 struct drm_atomic_commit *state)
+ {
+@@ -206,6 +207,7 @@ static void sun8i_ui_layer_atomic_update(struct drm_plane *plane,
+ static const struct drm_plane_helper_funcs sun8i_ui_layer_helper_funcs = {
+ 	.atomic_check	= sun8i_ui_layer_atomic_check,
+ 	.atomic_update	= sun8i_ui_layer_atomic_update,
++	.atomic_disable	= sun8i_ui_layer_atomic_disable,
+ };
+ 
+ static const struct drm_plane_funcs sun8i_ui_layer_funcs = {
+@@ -245,14 +247,22 @@ static const uint64_t sun8i_layer_modifiers[] = {
+ 	DRM_FORMAT_MOD_INVALID
+ };
+ 
++static const struct reg_region ui_regions[] = {
++	{SUN8I_MIXER_CHAN_UI_LAYER_ATTR(0), 8},
++	{SUN8I_MIXER_CHAN_UI_OVL_SIZE, 1},
++	{ }
++};
++
+ struct sun8i_layer *sun8i_ui_layer_init_one(struct drm_device *drm,
+ 					    enum drm_plane_type type,
+-					    struct regmap *regs,
+ 					    int index, int phy_index,
+ 					    int plane_cnt,
+-					    const struct sun8i_layer_cfg *cfg)
++					    const struct sun8i_layer_cfg *cfg,
++					    struct sun8i_rdma *rdma,
++					    void __iomem *reg_base)
+ {
+ 	struct sun8i_layer *layer;
++	u32 ch_base;
+ 	int ret;
+ 
+ 	layer = devm_kzalloc(drm->dev, sizeof(*layer), GFP_KERNEL);
+@@ -263,9 +273,25 @@ struct sun8i_layer *sun8i_ui_layer_init_one(struct drm_device *drm,
+ 	layer->index = index;
+ 	layer->channel = phy_index;
+ 	layer->overlay = 0;
+-	layer->regs = regs;
+ 	layer->cfg = cfg;
+ 
++	ch_base = sun8i_channel_base(layer);
++	layer->layer_rdma = sun8i_rdma_add_unit(rdma, reg_base + ch_base,
++						(layer->cfg->de_type == SUN8I_MIXER_DE33 ?
++						 0x100000 : 0) + ch_base,
++						0x100, ui_regions);
++	if (!layer->layer_rdma)
++		return ERR_PTR(-ENOMEM);
++
++	if (layer->cfg->scaler_type[phy_index] != SUN8I_SCALER_NONE) {
++		if (layer->cfg->de_type == SUN8I_MIXER_DE33)
++			ret = sun8i_vi_scaler_init(layer, rdma, reg_base, 0x100000);
++		else
++			ret = sun8i_ui_scaler_init(layer, rdma, reg_base, 0);
++		if (ret)
++			return ERR_PTR(ret);
++	}
++
+ 	/* possible crtcs are set later */
+ 	ret = drm_universal_plane_init(drm, &layer->plane, 0,
+ 				       &sun8i_ui_layer_funcs,
+diff --git a/drivers/gpu/drm/sun4i/sun8i_ui_layer.h b/drivers/gpu/drm/sun4i/sun8i_ui_layer.h
+index 1581ffc..69a430c 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_ui_layer.h
++++ b/drivers/gpu/drm/sun4i/sun8i_ui_layer.h
+@@ -14,26 +14,23 @@
+ 
+ #include <drm/drm_plane.h>
+ 
+-#define SUN8I_MIXER_CHAN_UI_LAYER_ATTR(base, layer) \
+-			((base) + 0x20 * (layer) + 0x0)
+-#define SUN8I_MIXER_CHAN_UI_LAYER_SIZE(base, layer) \
+-			((base) + 0x20 * (layer) + 0x4)
+-#define SUN8I_MIXER_CHAN_UI_LAYER_COORD(base, layer) \
+-			((base) + 0x20 * (layer) + 0x8)
+-#define SUN8I_MIXER_CHAN_UI_LAYER_PITCH(base, layer) \
+-			((base) + 0x20 * (layer) + 0xc)
+-#define SUN8I_MIXER_CHAN_UI_LAYER_TOP_LADDR(base, layer) \
+-			((base) + 0x20 * (layer) + 0x10)
+-#define SUN8I_MIXER_CHAN_UI_LAYER_BOT_LADDR(base, layer) \
+-			((base) + 0x20 * (layer) + 0x14)
+-#define SUN8I_MIXER_CHAN_UI_LAYER_FCOLOR(base, layer) \
+-			((base) + 0x20 * (layer) + 0x18)
+-#define SUN8I_MIXER_CHAN_UI_TOP_HADDR(base) \
+-			((base) + 0x80)
+-#define SUN8I_MIXER_CHAN_UI_BOT_HADDR(base) \
+-			((base) + 0x84)
+-#define SUN8I_MIXER_CHAN_UI_OVL_SIZE(base) \
+-			((base) + 0x88)
++#define SUN8I_MIXER_CHAN_UI_LAYER_ATTR(layer) \
++			(0x20 * (layer) + 0x0)
++#define SUN8I_MIXER_CHAN_UI_LAYER_SIZE(layer) \
++			(0x20 * (layer) + 0x4)
++#define SUN8I_MIXER_CHAN_UI_LAYER_COORD(layer) \
++			(0x20 * (layer) + 0x8)
++#define SUN8I_MIXER_CHAN_UI_LAYER_PITCH(layer) \
++			(0x20 * (layer) + 0xc)
++#define SUN8I_MIXER_CHAN_UI_LAYER_TOP_LADDR(layer) \
++			(0x20 * (layer) + 0x10)
++#define SUN8I_MIXER_CHAN_UI_LAYER_BOT_LADDR(layer) \
++			(0x20 * (layer) + 0x14)
++#define SUN8I_MIXER_CHAN_UI_LAYER_FCOLOR(layer) \
++			(0x20 * (layer) + 0x18)
++#define SUN8I_MIXER_CHAN_UI_TOP_HADDR	0x80
++#define SUN8I_MIXER_CHAN_UI_BOT_HADDR	0x84
++#define SUN8I_MIXER_CHAN_UI_OVL_SIZE	0x88
+ 
+ #define SUN8I_MIXER_CHAN_UI_LAYER_ATTR_EN		BIT(0)
+ #define SUN8I_MIXER_CHAN_UI_LAYER_ATTR_ALPHA_MODE_MASK	GENMASK(2, 1)
+@@ -51,8 +48,9 @@ struct sun8i_layer;
+ 
+ struct sun8i_layer *sun8i_ui_layer_init_one(struct drm_device *drm,
+ 					    enum drm_plane_type type,
+-					    struct regmap *regs,
+ 					    int index, int phy_index,
+ 					    int plane_cnt,
+-					    const struct sun8i_layer_cfg *cfg);
++					    const struct sun8i_layer_cfg *cfg,
++					    struct sun8i_rdma *rdma,
++					    void __iomem *reg_base);
+ #endif /* _SUN8I_UI_LAYER_H_ */
+diff --git a/drivers/gpu/drm/sun4i/sun8i_ui_scaler.c b/drivers/gpu/drm/sun4i/sun8i_ui_scaler.c
+index a178da8..c092f0f 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_ui_scaler.c
++++ b/drivers/gpu/drm/sun4i/sun8i_ui_scaler.c
+@@ -10,8 +10,19 @@
+  */
+ 
+ #include "sun8i_ui_scaler.h"
++#include "sun8i_rdma.h"
+ #include "sun8i_vi_scaler.h"
+ 
++static const struct reg_region sun8i_ui_scaler_regions[] = {
++	{ 0x000, 1 },
++	{ 0x040, 1 },
++	{ 0x080, 1 },
++	{ 0x088, 3 },
++	{ 0x098, 1 },
++	{ 0x200, SUN8I_UI_SCALER_COEFF_COUNT },
++	{ }
++};
++
+ static const u32 lan2coefftab16[240] = {
+ 	0x00004000, 0x00033ffe, 0x00063efc, 0x000a3bfb,
+ 	0xff0f37fb, 0xfe1433fb, 0xfd192ffb, 0xfd1f29fb,
+@@ -103,7 +114,19 @@ static u32 sun8i_ui_scaler_base(struct sun8i_layer *layer)
+ 		       DE2_UI_SCALER_UNIT_SIZE * (layer->channel - offset);
+ }
+ 
+-static int sun8i_ui_scaler_coef_index(unsigned int step)
++int sun8i_ui_scaler_init(struct sun8i_layer *layer, struct sun8i_rdma *rdma,
++			 void __iomem *reg_base, u32 reg_offset_base)
++{
++	u32 base = sun8i_ui_scaler_base(layer);
++
++	layer->scaler_rdma = sun8i_rdma_add_unit(rdma, reg_base + base,
++						 reg_offset_base + base, 0x240,
++						 sun8i_ui_scaler_regions);
++
++	return layer->scaler_rdma ? 0 : -ENOMEM;
++}
++
++static int sun8i_ui_scaler_coef_offset(unsigned int step)
+ {
+ 	unsigned int scale, int_part, float_part;
+ 
+@@ -115,23 +138,21 @@ static int sun8i_ui_scaler_coef_index(unsigned int step)
+ 	case 0:
+ 		return 0;
+ 	case 1:
+-		return float_part;
++		return float_part * SUN8I_UI_SCALER_COEFF_COUNT;
+ 	case 2:
+-		return 8 + (float_part >> 1);
++		return (8 + (float_part >> 1)) * SUN8I_UI_SCALER_COEFF_COUNT;
+ 	case 3:
+-		return 12;
++		return 12 * SUN8I_UI_SCALER_COEFF_COUNT;
+ 	case 4:
+-		return 13;
++		return 13 * SUN8I_UI_SCALER_COEFF_COUNT;
+ 	default:
+-		return 14;
++		return 14 * SUN8I_UI_SCALER_COEFF_COUNT;
+ 	}
+ }
+ 
+ void sun8i_ui_scaler_enable(struct sun8i_layer *layer, bool enable)
+ {
+-	u32 val, base;
+-
+-	base = sun8i_ui_scaler_base(layer);
++	u32 val;
+ 
+ 	if (enable)
+ 		val = SUN8I_SCALER_GSU_CTRL_EN |
+@@ -139,7 +160,8 @@ void sun8i_ui_scaler_enable(struct sun8i_layer *layer, bool enable)
+ 	else
+ 		val = 0;
+ 
+-	regmap_write(layer->regs, SUN8I_SCALER_GSU_CTRL(base), val);
++	sun8i_rdma_write(layer->scaler_rdma,
++			 SUN8I_SCALER_GSU_CTRL, val);
+ }
+ 
+ void sun8i_ui_scaler_setup(struct sun8i_layer *layer,
+@@ -147,10 +169,7 @@ void sun8i_ui_scaler_setup(struct sun8i_layer *layer,
+ 			   u32 hscale, u32 vscale, u32 hphase, u32 vphase)
+ {
+ 	u32 insize, outsize;
+-	int i, offset;
+-	u32 base;
+-
+-	base = sun8i_ui_scaler_base(layer);
++	int offset;
+ 
+ 	hphase <<= SUN8I_UI_SCALER_PHASE_FRAC - 16;
+ 	vphase <<= SUN8I_UI_SCALER_PHASE_FRAC - 16;
+@@ -160,22 +179,20 @@ void sun8i_ui_scaler_setup(struct sun8i_layer *layer,
+ 	insize = SUN8I_UI_SCALER_SIZE(src_w, src_h);
+ 	outsize = SUN8I_UI_SCALER_SIZE(dst_w, dst_h);
+ 
+-	regmap_write(layer->regs,
+-		     SUN8I_SCALER_GSU_OUTSIZE(base), outsize);
+-	regmap_write(layer->regs,
+-		     SUN8I_SCALER_GSU_INSIZE(base), insize);
+-	regmap_write(layer->regs,
+-		     SUN8I_SCALER_GSU_HSTEP(base), hscale);
+-	regmap_write(layer->regs,
+-		     SUN8I_SCALER_GSU_VSTEP(base), vscale);
+-	regmap_write(layer->regs,
+-		     SUN8I_SCALER_GSU_HPHASE(base), hphase);
+-	regmap_write(layer->regs,
+-		     SUN8I_SCALER_GSU_VPHASE(base), vphase);
+-	offset = sun8i_ui_scaler_coef_index(hscale) *
+-			SUN8I_UI_SCALER_COEFF_COUNT;
+-	for (i = 0; i < SUN8I_UI_SCALER_COEFF_COUNT; i++)
+-		regmap_write(layer->regs,
+-			     SUN8I_SCALER_GSU_HCOEFF(base, i),
+-			     lan2coefftab16[offset + i]);
++	sun8i_rdma_write(layer->scaler_rdma, SUN8I_SCALER_GSU_OUTSIZE,
++			 outsize);
++	sun8i_rdma_write(layer->scaler_rdma, SUN8I_SCALER_GSU_INSIZE,
++			 insize);
++	sun8i_rdma_write(layer->scaler_rdma, SUN8I_SCALER_GSU_HSTEP,
++			 hscale);
++	sun8i_rdma_write(layer->scaler_rdma, SUN8I_SCALER_GSU_VSTEP,
++			 vscale);
++	sun8i_rdma_write(layer->scaler_rdma, SUN8I_SCALER_GSU_HPHASE,
++			 hphase);
++	sun8i_rdma_write(layer->scaler_rdma, SUN8I_SCALER_GSU_VPHASE,
++			 vphase);
++	offset = sun8i_ui_scaler_coef_offset(hscale);
++	sun8i_rdma_memcpy(layer->scaler_rdma,
++			  SUN8I_SCALER_GSU_HCOEFF(0),
++			  &lan2coefftab16[offset], SUN8I_UI_SCALER_COEFF_COUNT);
+ }
+diff --git a/drivers/gpu/drm/sun4i/sun8i_ui_scaler.h b/drivers/gpu/drm/sun4i/sun8i_ui_scaler.h
+index 872d88a..35c7565 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_ui_scaler.h
++++ b/drivers/gpu/drm/sun4i/sun8i_ui_scaler.h
+@@ -23,19 +23,21 @@
+ #define SUN8I_UI_SCALER_COEFF_COUNT		16
+ #define SUN8I_UI_SCALER_SIZE(w, h)		(((h) - 1) << 16 | ((w) - 1))
+ 
+-#define SUN8I_SCALER_GSU_CTRL(base)		((base) + 0x0)
+-#define SUN8I_SCALER_GSU_OUTSIZE(base)		((base) + 0x40)
+-#define SUN8I_SCALER_GSU_INSIZE(base)		((base) + 0x80)
+-#define SUN8I_SCALER_GSU_HSTEP(base)		((base) + 0x88)
+-#define SUN8I_SCALER_GSU_VSTEP(base)		((base) + 0x8c)
+-#define SUN8I_SCALER_GSU_HPHASE(base)		((base) + 0x90)
+-#define SUN8I_SCALER_GSU_VPHASE(base)		((base) + 0x98)
+-#define SUN8I_SCALER_GSU_HCOEFF(base, index)	((base) + 0x200 + 0x4 * (index))
++#define SUN8I_SCALER_GSU_CTRL			0x0
++#define SUN8I_SCALER_GSU_OUTSIZE		0x40
++#define SUN8I_SCALER_GSU_INSIZE			0x80
++#define SUN8I_SCALER_GSU_HSTEP			0x88
++#define SUN8I_SCALER_GSU_VSTEP			0x8c
++#define SUN8I_SCALER_GSU_HPHASE			0x90
++#define SUN8I_SCALER_GSU_VPHASE			0x98
++#define SUN8I_SCALER_GSU_HCOEFF(index)		(0x200 + 0x4 * (index))
+ 
+ #define SUN8I_SCALER_GSU_CTRL_EN		BIT(0)
+ #define SUN8I_SCALER_GSU_CTRL_COEFF_RDY		BIT(4)
+ 
+ void sun8i_ui_scaler_enable(struct sun8i_layer *layer, bool enable);
++int sun8i_ui_scaler_init(struct sun8i_layer *layer, struct sun8i_rdma *rdma,
++			 void __iomem *reg_base, u32 reg_offset_base);
+ void sun8i_ui_scaler_setup(struct sun8i_layer *layer,
+ 			   u32 src_w, u32 src_h, u32 dst_w, u32 dst_h,
+ 			   u32 hscale, u32 vscale, u32 hphase, u32 vphase);
+diff --git a/drivers/gpu/drm/sun4i/sun8i_vi_layer.c b/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
+index cf9a8bf..9912435 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
+@@ -11,21 +11,23 @@
+ #include <drm/drm_framebuffer.h>
+ #include <drm/drm_gem_atomic_helper.h>
+ #include <drm/drm_gem_dma_helper.h>
++#include <drm/drm_gem_framebuffer_helper.h>
+ #include <drm/drm_print.h>
+ #include <drm/drm_probe_helper.h>
+ 
+ #include "sun4i_crtc.h"
++#include "sun50i_afbc.h"
+ #include "sun8i_csc.h"
+ #include "sun8i_mixer.h"
++#include "sun8i_rdma.h"
+ #include "sun8i_vi_layer.h"
+ #include "sun8i_vi_scaler.h"
+ 
+ static void sun8i_vi_layer_disable(struct sun8i_layer *layer)
+ {
+-	u32 ch_base = sun8i_channel_base(layer);
+-
+-	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_VI_LAYER_ATTR(ch_base, layer->overlay), 0);
++	sun8i_rdma_write(layer->layer_rdma,
++			 SUN8I_MIXER_CHAN_VI_LAYER_ATTR(layer->overlay), 0);
++	sun50i_afbc_disable(layer);
+ }
+ 
+ static void sun8i_vi_layer_update_attributes(struct sun8i_layer *layer,
+@@ -33,35 +35,37 @@ static void sun8i_vi_layer_update_attributes(struct sun8i_layer *layer,
+ {
+ 	struct drm_plane_state *state = plane->state;
+ 	const struct drm_format_info *fmt;
+-	u32 val, ch_base, hw_fmt;
++	u32 val, hw_fmt;
+ 
+-	ch_base = sun8i_channel_base(layer);
+ 	fmt = state->fb->format;
+ 	sun8i_mixer_drm_format_to_hw(fmt->format, &hw_fmt);
+ 
+ 	val = hw_fmt << SUN8I_MIXER_CHAN_VI_LAYER_ATTR_FBFMT_OFFSET;
+-	if (!fmt->is_yuv)
++	if (!fmt->is_yuv || fmt->format == DRM_FORMAT_AYUV)
+ 		val |= SUN8I_MIXER_CHAN_VI_LAYER_ATTR_RGB_MODE;
+ 	val |= SUN8I_MIXER_CHAN_VI_LAYER_ATTR_EN;
+ 	if (layer->cfg->de_type >= SUN8I_MIXER_DE3) {
+ 		val |= SUN50I_MIXER_CHAN_VI_LAYER_ATTR_ALPHA(state->alpha >> 8);
+-		val |= (state->alpha == DRM_BLEND_ALPHA_OPAQUE) ?
+-			SUN50I_MIXER_CHAN_VI_LAYER_ATTR_ALPHA_MODE_PIXEL :
+-			SUN50I_MIXER_CHAN_VI_LAYER_ATTR_ALPHA_MODE_COMBINED;
++		if (!fmt->has_alpha)
++			val |= SUN50I_MIXER_CHAN_VI_LAYER_ATTR_ALPHA_MODE_LAYER;
++		else if (state->alpha == DRM_BLEND_ALPHA_OPAQUE)
++			val |= SUN50I_MIXER_CHAN_VI_LAYER_ATTR_ALPHA_MODE_PIXEL;
++		else
++			val |= SUN50I_MIXER_CHAN_VI_LAYER_ATTR_ALPHA_MODE_COMBINED;
+ 	}
+ 
+-	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_VI_LAYER_ATTR(ch_base, layer->overlay), val);
++	sun8i_rdma_write(layer->layer_rdma,
++			 SUN8I_MIXER_CHAN_VI_LAYER_ATTR(layer->overlay), val);
+ 
+ 	if (layer->cfg->de2_fcc_alpha) {
+-		regmap_write(layer->regs,
+-			     SUN8I_MIXER_FCC_GLOBAL_ALPHA_REG,
+-			     SUN8I_MIXER_FCC_GLOBAL_ALPHA(state->alpha >> 8));
++		sun8i_rdma_write(layer->fcc_rdma,
++				 SUN8I_MIXER_FCC_GLOBAL_ALPHA_REG,
++				 SUN8I_MIXER_FCC_GLOBAL_ALPHA(state->alpha >> 8));
+ 	}
+ }
+ 
+ static void sun8i_vi_layer_update_coord(struct sun8i_layer *layer,
+-					struct drm_plane *plane)
++					struct drm_plane *plane, bool afbc)
+ {
+ 	struct drm_plane_state *state = plane->state;
+ 	struct sun4i_crtc *scrtc = drm_crtc_to_sun4i_crtc(state->crtc);
+@@ -73,13 +77,10 @@ static void sun8i_vi_layer_update_coord(struct sun8i_layer *layer,
+ 	u32 hn = 0, hm = 0;
+ 	u32 vn = 0, vm = 0;
+ 	bool subsampled;
+-	u32 ch_base;
+ 
+ 	DRM_DEBUG_DRIVER("Updating VI channel %d overlay %d\n",
+ 			 layer->channel, layer->overlay);
+ 
+-	ch_base = sun8i_channel_base(layer);
+-
+ 	src_w = drm_rect_width(&state->src) >> 16;
+ 	src_h = drm_rect_height(&state->src) >> 16;
+ 	dst_w = drm_rect_width(&state->dst);
+@@ -115,12 +116,10 @@ static void sun8i_vi_layer_update_coord(struct sun8i_layer *layer,
+ 			 (state->src.x1 >> 16) & ~(format->hsub - 1),
+ 			 (state->src.y1 >> 16) & ~(format->vsub - 1));
+ 	DRM_DEBUG_DRIVER("Layer source size W: %d H: %d\n", src_w, src_h);
+-	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_VI_LAYER_SIZE(ch_base, layer->overlay),
+-		     insize);
+-	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_VI_OVL_SIZE(ch_base),
+-		     insize);
++	sun8i_rdma_write(layer->layer_rdma,
++			 SUN8I_MIXER_CHAN_VI_LAYER_SIZE(layer->overlay), insize);
++	sun8i_rdma_write(layer->layer_rdma,
++			 SUN8I_MIXER_CHAN_VI_OVL_SIZE, insize);
+ 
+ 	/*
+ 	 * Scaler must be enabled for subsampled formats, so it scales
+@@ -145,17 +144,19 @@ static void sun8i_vi_layer_update_coord(struct sun8i_layer *layer,
+ 
+ 		required = src_h * 100 / dst_h;
+ 
+-		if (ability < required) {
++		if (!afbc && ability < required) {
+ 			DRM_DEBUG_DRIVER("Using vertical coarse scaling\n");
+ 			vm = src_h;
+ 			vn = (u32)ability * dst_h / 100;
+ 			src_h = vn;
+ 		}
+ 
+-		/* it seems that every RGB scaler has buffer for 2048 pixels */
+-		scanline = subsampled ? layer->cfg->scanline_yuv : 2048;
++		if (subsampled)
++			scanline = layer->cfg->scanline_yuv[layer->channel];
++		else
++			scanline = layer->cfg->scanline_rgb[layer->channel];
+ 
+-		if (src_w > scanline) {
++		if (!afbc && src_w > scanline) {
+ 			DRM_DEBUG_DRIVER("Using horizontal coarse scaling\n");
+ 			hm = src_w;
+ 			hn = scanline;
+@@ -166,29 +167,30 @@ static void sun8i_vi_layer_update_coord(struct sun8i_layer *layer,
+ 		vscale = (src_h << 16) / dst_h;
+ 
+ 		sun8i_vi_scaler_setup(layer, src_w, src_h, dst_w, dst_h,
+-				      hscale, vscale, hphase, vphase, format);
++				      hscale, vscale, hphase, vphase, format,
++				      afbc);
+ 		sun8i_vi_scaler_enable(layer, true);
+ 	} else {
+ 		DRM_DEBUG_DRIVER("HW scaling is not needed\n");
+ 		sun8i_vi_scaler_enable(layer, false);
+ 	}
+ 
+-	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_VI_HDS_Y(ch_base),
+-		     SUN8I_MIXER_CHAN_VI_DS_N(hn) |
+-		     SUN8I_MIXER_CHAN_VI_DS_M(hm));
+-	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_VI_HDS_UV(ch_base),
+-		     SUN8I_MIXER_CHAN_VI_DS_N(hn) |
+-		     SUN8I_MIXER_CHAN_VI_DS_M(hm));
+-	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_VI_VDS_Y(ch_base),
+-		     SUN8I_MIXER_CHAN_VI_DS_N(vn) |
+-		     SUN8I_MIXER_CHAN_VI_DS_M(vm));
+-	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_VI_VDS_UV(ch_base),
+-		     SUN8I_MIXER_CHAN_VI_DS_N(vn) |
+-		     SUN8I_MIXER_CHAN_VI_DS_M(vm));
++	sun8i_rdma_write(layer->layer_rdma,
++			 SUN8I_MIXER_CHAN_VI_HDS_Y,
++			 SUN8I_MIXER_CHAN_VI_DS_N(hn) |
++			 SUN8I_MIXER_CHAN_VI_DS_M(hm));
++	sun8i_rdma_write(layer->layer_rdma,
++			 SUN8I_MIXER_CHAN_VI_HDS_UV,
++			 SUN8I_MIXER_CHAN_VI_DS_N(hn) |
++			 SUN8I_MIXER_CHAN_VI_DS_M(hm));
++	sun8i_rdma_write(layer->layer_rdma,
++			 SUN8I_MIXER_CHAN_VI_VDS_Y,
++			 SUN8I_MIXER_CHAN_VI_DS_N(vn) |
++			 SUN8I_MIXER_CHAN_VI_DS_M(vm));
++	sun8i_rdma_write(layer->layer_rdma,
++			 SUN8I_MIXER_CHAN_VI_VDS_UV,
++			 SUN8I_MIXER_CHAN_VI_DS_N(vn) |
++			 SUN8I_MIXER_CHAN_VI_DS_M(vm));
+ }
+ 
+ static void sun8i_vi_layer_update_buffer(struct sun8i_layer *layer,
+@@ -197,31 +199,42 @@ static void sun8i_vi_layer_update_buffer(struct sun8i_layer *layer,
+ 	struct drm_plane_state *state = plane->state;
+ 	struct drm_framebuffer *fb = state->fb;
+ 	const struct drm_format_info *format = fb->format;
++	struct drm_gem_dma_object *gem;
+ 	dma_addr_t dma_addr;
+-	u32 ch_base;
++	u32 dx, dy, src_x, src_y;
+ 	int i;
+ 
+-	ch_base = sun8i_channel_base(layer);
++	/* Keep every plane aligned to its chroma sampling grid. */
++	src_x = (state->src.x1 >> 16) & ~(format->hsub - 1);
++	src_y = (state->src.y1 >> 16) & ~(format->vsub - 1);
+ 
+ 	for (i = 0; i < format->num_planes; i++) {
+-		/* Get the start of the displayed memory */
+-		dma_addr = drm_fb_dma_get_gem_addr(fb, state, i);
++		gem = drm_fb_dma_get_gem_obj(fb, i);
++		dma_addr = gem->dma_addr + fb->offsets[i];
++
++		dx = src_x;
++		dy = src_y;
++		if (i > 0) {
++			dx /= format->hsub;
++			dy /= format->vsub;
++		}
++
++		dma_addr += dx * format->cpp[i];
++		dma_addr += dy * fb->pitches[i];
+ 
+ 		/* Set the line width */
+ 		DRM_DEBUG_DRIVER("Layer %d. line width: %d bytes\n",
+ 				 i + 1, fb->pitches[i]);
+-		regmap_write(layer->regs,
+-			     SUN8I_MIXER_CHAN_VI_LAYER_PITCH(ch_base,
+-							     layer->overlay, i),
+-			     fb->pitches[i]);
++		sun8i_rdma_write(layer->layer_rdma,
++				 SUN8I_MIXER_CHAN_VI_LAYER_PITCH(layer->overlay, i),
++				 fb->pitches[i]);
+ 
+ 		DRM_DEBUG_DRIVER("Setting %d. buffer address to %pad\n",
+ 				 i + 1, &dma_addr);
+ 
+-		regmap_write(layer->regs,
+-			     SUN8I_MIXER_CHAN_VI_LAYER_TOP_LADDR(ch_base,
+-								 layer->overlay, i),
+-			     lower_32_bits(dma_addr));
++		sun8i_rdma_write(layer->layer_rdma,
++				 SUN8I_MIXER_CHAN_VI_LAYER_TOP_LADDR(layer->overlay, i),
++				 lower_32_bits(dma_addr));
+ 	}
+ }
+ 
+@@ -244,17 +257,27 @@ static int sun8i_vi_layer_atomic_check(struct drm_plane *plane,
+ 	if (WARN_ON(!crtc_state))
+ 		return -EINVAL;
+ 
+-	fmt = new_plane_state->fb->format;
+-	ret = sun8i_mixer_drm_format_to_hw(fmt->format, &hw_fmt);
+-	if (ret) {
+-		DRM_DEBUG_DRIVER("Invalid plane format\n");
+-		return ret;
++	if (drm_is_afbc(new_plane_state->fb->modifier)) {
++		struct drm_framebuffer *fb = new_plane_state->fb;
++
++		/* FBD size fields are 12 bits wide. */
++		if (fb->width > 4096 || fb->height > 4096) {
++			DRM_DEBUG_DRIVER("AFBC framebuffer too large\n");
++			return -EINVAL;
++		}
++	} else {
++		fmt = new_plane_state->fb->format;
++		ret = sun8i_mixer_drm_format_to_hw(fmt->format, &hw_fmt);
++		if (ret) {
++			DRM_DEBUG_DRIVER("Invalid plane format\n");
++			return ret;
++		}
+ 	}
+ 
+ 	min_scale = DRM_PLANE_NO_SCALING;
+ 	max_scale = DRM_PLANE_NO_SCALING;
+ 
+-	if (layer->cfg->scaler_mask & BIT(layer->channel)) {
++	if (layer->cfg->scaler_type[layer->channel] != SUN8I_SCALER_NONE) {
+ 		min_scale = SUN8I_VI_SCALER_SCALE_MIN;
+ 		max_scale = SUN8I_VI_SCALER_SCALE_MAX;
+ 	}
+@@ -265,6 +288,14 @@ static int sun8i_vi_layer_atomic_check(struct drm_plane *plane,
+ 						   true, true);
+ }
+ 
++static void sun8i_vi_layer_atomic_disable(struct drm_plane *plane,
++					  struct drm_atomic_commit *state)
++{
++	struct sun8i_layer *layer = plane_to_sun8i_layer(plane);
++
++	sun8i_vi_layer_disable(layer);
++}
++
+ static void sun8i_vi_layer_atomic_update(struct drm_plane *plane,
+ 					 struct drm_atomic_commit *state)
+ {
+@@ -277,15 +308,33 @@ static void sun8i_vi_layer_atomic_update(struct drm_plane *plane,
+ 		return;
+ 	}
+ 
+-	sun8i_vi_layer_update_attributes(layer, plane);
+-	sun8i_vi_layer_update_coord(layer, plane);
+-	sun8i_csc_config(layer, new_state);
+-	sun8i_vi_layer_update_buffer(layer, plane);
++	if (drm_is_afbc(new_state->fb->modifier)) {
++		sun8i_rdma_write(layer->layer_rdma,
++				 SUN8I_MIXER_CHAN_VI_LAYER_ATTR(layer->overlay), 0);
++		sun50i_afbc_atomic_update(layer, plane);
++		sun8i_vi_layer_update_coord(layer, plane, true);
++		sun8i_csc_config(layer, new_state);
++	} else {
++		sun50i_afbc_disable(layer);
++		sun8i_vi_layer_update_attributes(layer, plane);
++		sun8i_vi_layer_update_coord(layer, plane, false);
++		sun8i_csc_config(layer, new_state);
++		sun8i_vi_layer_update_buffer(layer, plane);
++	}
++}
++
++static bool sun8i_vi_layer_format_mod_supported(struct drm_plane *plane,
++						u32 format, u64 modifier)
++{
++	struct sun8i_layer *layer = plane_to_sun8i_layer(plane);
++
++	return sun50i_afbc_format_mod_supported(layer, format, modifier);
+ }
+ 
+ static const struct drm_plane_helper_funcs sun8i_vi_layer_helper_funcs = {
+ 	.atomic_check	= sun8i_vi_layer_atomic_check,
+ 	.atomic_update	= sun8i_vi_layer_atomic_update,
++	.atomic_disable	= sun8i_vi_layer_atomic_disable,
+ };
+ 
+ static const struct drm_plane_funcs sun8i_vi_layer_funcs = {
+@@ -295,6 +344,7 @@ static const struct drm_plane_funcs sun8i_vi_layer_funcs = {
+ 	.disable_plane		= drm_atomic_helper_disable_plane,
+ 	.reset			= drm_atomic_helper_plane_reset,
+ 	.update_plane		= drm_atomic_helper_update_plane,
++	.format_mod_supported	= sun8i_vi_layer_format_mod_supported,
+ };
+ 
+ /*
+@@ -337,6 +387,7 @@ static const u32 sun8i_vi_layer_formats[] = {
+ };
+ 
+ static const u32 sun8i_vi_layer_de3_formats[] = {
++	DRM_FORMAT_AYUV,
+ 	DRM_FORMAT_ABGR1555,
+ 	DRM_FORMAT_ABGR2101010,
+ 	DRM_FORMAT_ABGR4444,
+@@ -360,6 +411,7 @@ static const u32 sun8i_vi_layer_de3_formats[] = {
+ 	DRM_FORMAT_RGBA8888,
+ 	DRM_FORMAT_RGBX8888,
+ 	DRM_FORMAT_XBGR8888,
++	DRM_FORMAT_XRGB2101010,
+ 	DRM_FORMAT_XRGB8888,
+ 
+ 	DRM_FORMAT_NV16,
+@@ -378,6 +430,10 @@ static const u32 sun8i_vi_layer_de3_formats[] = {
+ 	DRM_FORMAT_YVU411,
+ 	DRM_FORMAT_YVU420,
+ 	DRM_FORMAT_YVU422,
++
++	DRM_FORMAT_YUV420_8BIT,
++	DRM_FORMAT_YUV420_10BIT,
++	DRM_FORMAT_Y210,
+ };
+ 
+ static const u32 sun8i_vi_layer_de3_no_yuv_formats[] = {
+@@ -407,22 +463,37 @@ static const u32 sun8i_vi_layer_de3_no_yuv_formats[] = {
+ 	DRM_FORMAT_XRGB8888,
+ };
+ 
+-static const uint64_t sun8i_layer_modifiers[] = {
++static const u64 sun8i_layer_modifiers[] = {
+ 	DRM_FORMAT_MOD_LINEAR,
+ 	DRM_FORMAT_MOD_INVALID
+ };
+ 
++static const struct reg_region vi_regions[] = {
++	{SUN8I_MIXER_CHAN_VI_LAYER_ATTR(0), 12},
++	{SUN8I_MIXER_CHAN_VI_OVL_SIZE, 6},
++	{ }
++};
++
++static const struct reg_region fcc_regions[] = {
++	{SUN8I_MIXER_FCC_GLOBAL_ALPHA_REG, 4},
++	{ }
++};
++
+ struct sun8i_layer *sun8i_vi_layer_init_one(struct drm_device *drm,
+ 					    enum drm_plane_type type,
+-					    struct regmap *regs,
+ 					    int index, int phy_index,
+ 					    int plane_cnt,
+-					    const struct sun8i_layer_cfg *cfg)
++					    const struct sun8i_layer_cfg *cfg,
++					    struct sun8i_rdma *rdma,
++					    void __iomem *reg_base)
+ {
+ 	u32 supported_encodings, supported_ranges;
+ 	unsigned int format_count;
+ 	struct sun8i_layer *layer;
++	bool yuv_support = true;
++	const u64 *modifiers;
+ 	const u32 *formats;
++	u32 ch_base;
+ 	int ret;
+ 
+ 	layer = devm_kzalloc(drm->dev, sizeof(*layer), GFP_KERNEL);
+@@ -433,31 +504,65 @@ struct sun8i_layer *sun8i_vi_layer_init_one(struct drm_device *drm,
+ 	layer->index = index;
+ 	layer->channel = phy_index;
+ 	layer->overlay = 0;
+-	layer->regs = regs;
+ 	layer->cfg = cfg;
+ 
++	ch_base = sun8i_channel_base(layer);
++	layer->layer_rdma = sun8i_rdma_add_unit(rdma, reg_base + ch_base,
++						(layer->cfg->de_type == SUN8I_MIXER_DE33 ?
++						 0x100000 : 0) + ch_base,
++						0x100, vi_regions);
++	if (!layer->layer_rdma)
++		return ERR_PTR(-ENOMEM);
++
++	if (layer->cfg->scaler_type[phy_index] != SUN8I_SCALER_NONE) {
++		ret = sun8i_vi_scaler_init(layer, rdma, reg_base,
++					   layer->cfg->de_type == SUN8I_MIXER_DE33 ?
++					   0x100000 : 0);
++		if (ret)
++			return ERR_PTR(ret);
++	}
++
++	ret = sun8i_csc_init(layer, rdma, reg_base,
++			     layer->cfg->de_type == SUN8I_MIXER_DE33 ?
++			     0x100000 : 0);
++	if (ret)
++		return ERR_PTR(ret);
++
++	if (layer->cfg->de2_fcc_alpha) {
++		layer->fcc_rdma = sun8i_rdma_add_unit(rdma, reg_base + SUN8I_MIXER_FCC,
++						      SUN8I_MIXER_FCC, 0x94,
++						      fcc_regions);
++		if (!layer->fcc_rdma)
++			return ERR_PTR(-ENOMEM);
++	}
++
++	ret = sun50i_afbc_init(layer, rdma, reg_base);
++	if (ret)
++		return ERR_PTR(ret);
++
+ 	if (layer->cfg->de_type >= SUN8I_MIXER_DE3) {
+-		/*
+-		 * TODO: DE33 drivers doesn't support scaling yet, which is a
+-		 * requirement for YUV support.
+-		 */
+-		if (layer->cfg->scaler_mask & BIT(phy_index)) {
++		yuv_support = layer->cfg->scaler_type[phy_index] !=
++			      SUN8I_SCALER_NONE;
++		if (yuv_support) {
+ 			formats = sun8i_vi_layer_de3_formats;
+ 			format_count = ARRAY_SIZE(sun8i_vi_layer_de3_formats);
+ 		} else {
+ 			formats = sun8i_vi_layer_de3_no_yuv_formats;
+ 			format_count = ARRAY_SIZE(sun8i_vi_layer_de3_no_yuv_formats);
+ 		}
++		modifiers = layer->cfg->afbc_mask & BIT(phy_index) ?
++			    sun50i_afbc_modifiers : sun8i_layer_modifiers;
+ 	} else {
+ 		formats = sun8i_vi_layer_formats;
+ 		format_count = ARRAY_SIZE(sun8i_vi_layer_formats);
++		modifiers = sun8i_layer_modifiers;
+ 	}
+ 
+ 	/* possible crtcs are set later */
+ 	ret = drm_universal_plane_init(drm, &layer->plane, 0,
+ 				       &sun8i_vi_layer_funcs,
+ 				       formats, format_count,
+-				       sun8i_layer_modifiers,
++				       modifiers,
+ 				       type, NULL);
+ 	if (ret) {
+ 		dev_err(drm->dev, "Couldn't initialize layer\n");
+diff --git a/drivers/gpu/drm/sun4i/sun8i_vi_layer.h b/drivers/gpu/drm/sun4i/sun8i_vi_layer.h
+index 29cc557..4f8efd5 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_vi_layer.h
++++ b/drivers/gpu/drm/sun4i/sun8i_vi_layer.h
+@@ -8,29 +8,23 @@
+ 
+ #include <drm/drm_plane.h>
+ 
+-#define SUN8I_MIXER_CHAN_VI_LAYER_ATTR(base, layer) \
+-		((base) + 0x30 * (layer) + 0x0)
+-#define SUN8I_MIXER_CHAN_VI_LAYER_SIZE(base, layer) \
+-		((base) + 0x30 * (layer) + 0x4)
+-#define SUN8I_MIXER_CHAN_VI_LAYER_COORD(base, layer) \
+-		((base) + 0x30 * (layer) + 0x8)
+-#define SUN8I_MIXER_CHAN_VI_LAYER_PITCH(base, layer, plane) \
+-		((base) + 0x30 * (layer) + 0xc + 4 * (plane))
+-#define SUN8I_MIXER_CHAN_VI_LAYER_TOP_LADDR(base, layer, plane) \
+-		((base) + 0x30 * (layer) + 0x18 + 4 * (plane))
+-#define SUN8I_MIXER_CHAN_VI_OVL_SIZE(base) \
+-		((base) + 0xe8)
+-#define SUN8I_MIXER_CHAN_VI_HDS_Y(base) \
+-		((base) + 0xf0)
+-#define SUN8I_MIXER_CHAN_VI_HDS_UV(base) \
+-		((base) + 0xf4)
+-#define SUN8I_MIXER_CHAN_VI_VDS_Y(base) \
+-		((base) + 0xf8)
+-#define SUN8I_MIXER_CHAN_VI_VDS_UV(base) \
+-		((base) + 0xfc)
+-
+-#define SUN8I_MIXER_FCC_GLOBAL_ALPHA_REG \
+-		(0xAA000 + 0x90)
++#define SUN8I_MIXER_CHAN_VI_LAYER_ATTR(layer) \
++		(0x30 * (layer) + 0x0)
++#define SUN8I_MIXER_CHAN_VI_LAYER_SIZE(layer) \
++		(0x30 * (layer) + 0x4)
++#define SUN8I_MIXER_CHAN_VI_LAYER_COORD(layer) \
++		(0x30 * (layer) + 0x8)
++#define SUN8I_MIXER_CHAN_VI_LAYER_PITCH(layer, plane) \
++		(0x30 * (layer) + 0xc + 4 * (plane))
++#define SUN8I_MIXER_CHAN_VI_LAYER_TOP_LADDR(layer, plane) \
++		(0x30 * (layer) + 0x18 + 4 * (plane))
++#define SUN8I_MIXER_CHAN_VI_OVL_SIZE	0xe8
++#define SUN8I_MIXER_CHAN_VI_HDS_Y	0xf0
++#define SUN8I_MIXER_CHAN_VI_HDS_UV	0xf4
++#define SUN8I_MIXER_CHAN_VI_VDS_Y	0xf8
++#define SUN8I_MIXER_CHAN_VI_VDS_UV	0xfc
++
++#define SUN8I_MIXER_FCC_GLOBAL_ALPHA_REG	0x90
+ 
+ #define SUN8I_MIXER_FCC_GLOBAL_ALPHA(x)			((x) << 24)
+ #define SUN8I_MIXER_FCC_GLOBAL_ALPHA_MASK		GENMASK(31, 24)
+@@ -56,8 +50,9 @@ struct sun8i_layer;
+ 
+ struct sun8i_layer *sun8i_vi_layer_init_one(struct drm_device *drm,
+ 					    enum drm_plane_type type,
+-					    struct regmap *regs,
+ 					    int index, int phy_index,
+ 					    int plane_cnt,
+-					    const struct sun8i_layer_cfg *cfg);
++					    const struct sun8i_layer_cfg *cfg,
++					    struct sun8i_rdma *rdma,
++					    void __iomem *reg_base);
+ #endif /* _SUN8I_VI_LAYER_H_ */
+diff --git a/drivers/gpu/drm/sun4i/sun8i_vi_scaler.c b/drivers/gpu/drm/sun4i/sun8i_vi_scaler.c
+index a5cc999..480829e 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_vi_scaler.c
++++ b/drivers/gpu/drm/sun4i/sun8i_vi_scaler.c
+@@ -9,8 +9,29 @@
+  * warranty of any kind, whether express or implied.
+  */
+ 
++#include "sun8i_rdma.h"
+ #include "sun8i_vi_scaler.h"
+ 
++static const struct reg_region sun8i_vi_scaler_regions[] = {
++	{ 0x000, 1 },
++	{ 0x010, 1 },
++	{ 0x020, 4 },
++	{ 0x040, 2 },
++	{ 0x080, 1 },
++	{ 0x088, 3 },
++	{ 0x098, 1 },
++	{ 0x0c0, 1 },
++	{ 0x0c8, 3 },
++	{ 0x0d8, 1 },
++	{ 0x200, SUN8I_VI_SCALER_COEFF_COUNT },
++	{ 0x300, SUN8I_VI_SCALER_COEFF_COUNT },
++	{ 0x400, SUN8I_VI_SCALER_COEFF_COUNT },
++	{ 0x600, SUN8I_VI_SCALER_COEFF_COUNT },
++	{ 0x700, SUN8I_VI_SCALER_COEFF_COUNT },
++	{ 0x800, SUN8I_VI_SCALER_COEFF_COUNT },
++	{ }
++};
++
+ static const u32 lan3coefftab32_left[480] = {
+ 	0x40000000, 0x40fe0000, 0x3ffd0100, 0x3efc0100,
+ 	0x3efb0100, 0x3dfa0200, 0x3cf90200, 0x3bf80200,
+@@ -846,7 +867,19 @@ static u32 sun8i_vi_scaler_base(struct sun8i_layer *layer)
+ 		       DE2_VI_SCALER_UNIT_SIZE * layer->channel;
+ }
+ 
+-static int sun8i_vi_scaler_coef_index(unsigned int step)
++int sun8i_vi_scaler_init(struct sun8i_layer *layer, struct sun8i_rdma *rdma,
++			 void __iomem *reg_base, u32 reg_offset_base)
++{
++	u32 base = sun8i_vi_scaler_base(layer);
++
++	layer->scaler_rdma = sun8i_rdma_add_unit(rdma, reg_base + base,
++						 reg_offset_base + base, 0x880,
++						 sun8i_vi_scaler_regions);
++
++	return layer->scaler_rdma ? 0 : -ENOMEM;
++}
++
++static int sun8i_vi_scaler_coef_offset(unsigned int step)
+ {
+ 	unsigned int scale, int_part, float_part;
+ 
+@@ -858,24 +891,48 @@ static int sun8i_vi_scaler_coef_index(unsigned int step)
+ 	case 0:
+ 		return 0;
+ 	case 1:
+-		return float_part;
++		return float_part * SUN8I_VI_SCALER_COEFF_COUNT;
+ 	case 2:
+-		return 8 + (float_part >> 1);
++		return (8 + (float_part >> 1)) * SUN8I_VI_SCALER_COEFF_COUNT;
+ 	case 3:
+-		return 12;
++		return 12 * SUN8I_VI_SCALER_COEFF_COUNT;
+ 	case 4:
+-		return 13;
++		return 13 * SUN8I_VI_SCALER_COEFF_COUNT;
+ 	default:
+-		return 14;
++		return 14 * SUN8I_VI_SCALER_COEFF_COUNT;
+ 	}
+ }
+ 
+-static void sun8i_vi_scaler_set_coeff(struct regmap *map, u32 base,
+-				      u32 hstep, u32 vstep,
+-				      const struct drm_format_info *format)
++static void sun8i_vi_scaler_set_coeff_8(struct sun8i_rdma_unit *rdma,
++					u32 hstep, u32 vstep,
++					const struct drm_format_info *format)
++{
++	const u32 *cy;
++	int offset;
++
++	if (format->hsub == 1 && format->vsub == 1)
++		cy = lan2coefftab32;
++	else
++		cy = bicubic4coefftab32;
++
++	offset = sun8i_vi_scaler_coef_offset(hstep);
++	sun8i_rdma_memcpy(rdma, SUN8I_SCALER_VSU_YHCOEFF0(0),
++			  &lan2coefftab32[offset], SUN8I_VI_SCALER_COEFF_COUNT);
++	offset = sun8i_vi_scaler_coef_offset(vstep);
++	sun8i_rdma_memcpy(rdma, SUN8I_SCALER_VSU_YVCOEFF(0),
++			  &lan2coefftab32[offset], SUN8I_VI_SCALER_COEFF_COUNT);
++
++	offset = sun8i_vi_scaler_coef_offset(hstep / format->hsub);
++	sun8i_rdma_memcpy(rdma, SUN8I_SCALER_VSU_CHCOEFF0(0),
++			  &cy[offset], SUN8I_VI_SCALER_COEFF_COUNT);
++}
++
++static void sun8i_vi_scaler_set_coeff_10(struct sun8i_rdma_unit *rdma,
++					 u32 hstep, u32 vstep,
++					 const struct drm_format_info *format)
+ {
+ 	const u32 *ch_left, *ch_right, *cy;
+-	int offset, i;
++	int offset;
+ 
+ 	if (format->hsub == 1 && format->vsub == 1) {
+ 		ch_left = lan3coefftab32_left;
+@@ -887,40 +944,28 @@ static void sun8i_vi_scaler_set_coeff(struct regmap *map, u32 base,
+ 		cy = bicubic4coefftab32;
+ 	}
+ 
+-	offset = sun8i_vi_scaler_coef_index(hstep) *
+-			SUN8I_VI_SCALER_COEFF_COUNT;
+-	for (i = 0; i < SUN8I_VI_SCALER_COEFF_COUNT; i++) {
+-		regmap_write(map, SUN8I_SCALER_VSU_YHCOEFF0(base, i),
+-			     lan3coefftab32_left[offset + i]);
+-		regmap_write(map, SUN8I_SCALER_VSU_YHCOEFF1(base, i),
+-			     lan3coefftab32_right[offset + i]);
+-	}
+-	offset = sun8i_vi_scaler_coef_index(vstep) *
+-			SUN8I_VI_SCALER_COEFF_COUNT;
+-	for (i = 0; i < SUN8I_VI_SCALER_COEFF_COUNT; i++)
+-		regmap_write(map, SUN8I_SCALER_VSU_YVCOEFF(base, i),
+-			     lan2coefftab32[offset + i]);
+-
+-	offset = sun8i_vi_scaler_coef_index(hstep / format->hsub) *
+-			SUN8I_VI_SCALER_COEFF_COUNT;
+-	for (i = 0; i < SUN8I_VI_SCALER_COEFF_COUNT; i++) {
+-		regmap_write(map, SUN8I_SCALER_VSU_CHCOEFF0(base, i),
+-			     ch_left[offset + i]);
+-		regmap_write(map, SUN8I_SCALER_VSU_CHCOEFF1(base, i),
+-			     ch_right[offset + i]);
+-	}
+-	offset = sun8i_vi_scaler_coef_index(vstep / format->vsub) *
+-			SUN8I_VI_SCALER_COEFF_COUNT;
+-	for (i = 0; i < SUN8I_VI_SCALER_COEFF_COUNT; i++)
+-		regmap_write(map, SUN8I_SCALER_VSU_CVCOEFF(base, i),
+-			     cy[offset + i]);
++	offset = sun8i_vi_scaler_coef_offset(hstep);
++	sun8i_rdma_memcpy(rdma, SUN8I_SCALER_VSU_YHCOEFF0(0),
++			  &lan3coefftab32_left[offset], SUN8I_VI_SCALER_COEFF_COUNT);
++	sun8i_rdma_memcpy(rdma, SUN8I_SCALER_VSU_YHCOEFF1(0),
++			  &lan3coefftab32_right[offset], SUN8I_VI_SCALER_COEFF_COUNT);
++	offset = sun8i_vi_scaler_coef_offset(vstep);
++	sun8i_rdma_memcpy(rdma, SUN8I_SCALER_VSU_YVCOEFF(0),
++			  &lan2coefftab32[offset], SUN8I_VI_SCALER_COEFF_COUNT);
++
++	offset = sun8i_vi_scaler_coef_offset(hstep / format->hsub);
++	sun8i_rdma_memcpy(rdma, SUN8I_SCALER_VSU_CHCOEFF0(0),
++			  &ch_left[offset], SUN8I_VI_SCALER_COEFF_COUNT);
++	sun8i_rdma_memcpy(rdma, SUN8I_SCALER_VSU_CHCOEFF1(0),
++			  &ch_right[offset], SUN8I_VI_SCALER_COEFF_COUNT);
++	offset = sun8i_vi_scaler_coef_offset(vstep / format->vsub);
++	sun8i_rdma_memcpy(rdma, SUN8I_SCALER_VSU_CVCOEFF(0),
++			  &cy[offset], SUN8I_VI_SCALER_COEFF_COUNT);
+ }
+ 
+ void sun8i_vi_scaler_enable(struct sun8i_layer *layer, bool enable)
+ {
+-	u32 val, base;
+-
+-	base = sun8i_vi_scaler_base(layer);
++	u32 val;
+ 
+ 	if (enable)
+ 		val = SUN8I_SCALER_VSU_CTRL_EN |
+@@ -928,20 +973,18 @@ void sun8i_vi_scaler_enable(struct sun8i_layer *layer, bool enable)
+ 	else
+ 		val = 0;
+ 
+-	regmap_write(layer->regs,
+-		     SUN8I_SCALER_VSU_CTRL(base), val);
++	sun8i_rdma_write(layer->scaler_rdma,
++			 SUN8I_SCALER_VSU_CTRL, val);
+ }
+ 
+ void sun8i_vi_scaler_setup(struct sun8i_layer *layer,
+ 			   u32 src_w, u32 src_h, u32 dst_w, u32 dst_h,
+ 			   u32 hscale, u32 vscale, u32 hphase, u32 vphase,
+-			   const struct drm_format_info *format)
++			   const struct drm_format_info *format, bool afbc)
+ {
++	unsigned int type = layer->cfg->scaler_type[layer->channel];
+ 	u32 chphase, cvphase;
+ 	u32 insize, outsize;
+-	u32 base;
+-
+-	base = sun8i_vi_scaler_base(layer);
+ 
+ 	hphase <<= SUN8I_VI_SCALER_PHASE_FRAC - 16;
+ 	vphase <<= SUN8I_VI_SCALER_PHASE_FRAC - 16;
+@@ -951,12 +994,13 @@ void sun8i_vi_scaler_setup(struct sun8i_layer *layer,
+ 	insize = SUN8I_VI_SCALER_SIZE(src_w, src_h);
+ 	outsize = SUN8I_VI_SCALER_SIZE(dst_w, dst_h);
+ 
+-	/*
+-	 * This is chroma V/H phase calculation as it appears in
+-	 * BSP driver. There is no detailed explanation. YUV 420
+-	 * chroma is threated specialy for some reason.
+-	 */
+-	if (format->hsub == 2 && format->vsub == 2) {
++	if (afbc && format->hsub == 2 && format->vsub == 2) {
++		/* The decompressor fixes luma at zero and chroma at -0.25. */
++		hphase = 0;
++		vphase = 0;
++		chphase = 0xfffe0000;
++		cvphase = 0xfffe0000;
++	} else if (format->hsub == 2 && format->vsub == 2) {
+ 		chphase = hphase >> 1;
+ 		cvphase = (vphase >> 1) -
+ 			(1UL << (SUN8I_VI_SCALER_SCALE_FRAC - 2));
+@@ -970,41 +1014,66 @@ void sun8i_vi_scaler_setup(struct sun8i_layer *layer,
+ 
+ 		if (format->hsub == 1 && format->vsub == 1)
+ 			val = SUN50I_SCALER_VSU_SCALE_MODE_UI;
++		else if (type == SUN8I_SCALER_VI_ED &&
++			 hscale > SUN8I_VI_SCALER_SCALE_UNIT &&
++			 vscale > SUN8I_VI_SCALER_SCALE_UNIT &&
++			 src_w <= layer->cfg->scanline_ed[layer->channel])
++			val = SUN50I_SCALER_VSU_SCALE_MODE_ED_SCALE;
+ 		else
+ 			val = SUN50I_SCALER_VSU_SCALE_MODE_NORMAL;
+ 
+-		regmap_write(layer->regs,
+-			     SUN50I_SCALER_VSU_SCALE_MODE(base), val);
+-		regmap_write(layer->regs,
+-			     SUN50I_SCALER_VSU_GLB_ALPHA(base), 0xff);
++		sun8i_rdma_write(layer->scaler_rdma,
++				 SUN50I_SCALER_VSU_SCALE_MODE, val);
++		sun8i_rdma_write(layer->scaler_rdma,
++				 SUN50I_SCALER_VSU_GLB_ALPHA, 0xff);
+ 	}
+ 
+-	regmap_write(layer->regs,
+-		     SUN8I_SCALER_VSU_OUTSIZE(base), outsize);
+-	regmap_write(layer->regs,
+-		     SUN8I_SCALER_VSU_YINSIZE(base), insize);
+-	regmap_write(layer->regs,
+-		     SUN8I_SCALER_VSU_YHSTEP(base), hscale);
+-	regmap_write(layer->regs,
+-		     SUN8I_SCALER_VSU_YVSTEP(base), vscale);
+-	regmap_write(layer->regs,
+-		     SUN8I_SCALER_VSU_YHPHASE(base), hphase);
+-	regmap_write(layer->regs,
+-		     SUN8I_SCALER_VSU_YVPHASE(base), vphase);
+-	regmap_write(layer->regs,
+-		     SUN8I_SCALER_VSU_CINSIZE(base),
+-		     SUN8I_VI_SCALER_SIZE(src_w / format->hsub,
+-					  src_h / format->vsub));
+-	regmap_write(layer->regs,
+-		     SUN8I_SCALER_VSU_CHSTEP(base),
+-		     hscale / format->hsub);
+-	regmap_write(layer->regs,
+-		     SUN8I_SCALER_VSU_CVSTEP(base),
+-		     vscale / format->vsub);
+-	regmap_write(layer->regs,
+-		     SUN8I_SCALER_VSU_CHPHASE(base), chphase);
+-	regmap_write(layer->regs,
+-		     SUN8I_SCALER_VSU_CVPHASE(base), cvphase);
+-	sun8i_vi_scaler_set_coeff(layer->regs, base,
+-				  hscale, vscale, format);
++	if (type == SUN8I_SCALER_VI_ED) {
++		sun8i_rdma_write(layer->scaler_rdma,
++				 SUN50I_SCALER_VSU_DIR_THR,
++				 SUN50I_SCALER_VSU_VERT_DIR_THR(0x01) |
++				 SUN50I_SCALER_VSU_HORZ_DIR_THR(0xff));
++		sun8i_rdma_write(layer->scaler_rdma,
++				 SUN50I_SCALER_VSU_EDGE_THR,
++				 SUN50I_SCALER_VSU_EDGE_SHIFT(8));
++		sun8i_rdma_write(layer->scaler_rdma,
++				 SUN50I_SCALER_VSU_EDSCL_CTRL, 0);
++		sun8i_rdma_write(layer->scaler_rdma,
++				 SUN50I_SCALER_VSU_ANGLE_THR,
++				 SUN50I_SCALER_VSU_ANGLE_SHIFT(2));
++	}
++
++	sun8i_rdma_write(layer->scaler_rdma,
++			 SUN8I_SCALER_VSU_OUTSIZE, outsize);
++	sun8i_rdma_write(layer->scaler_rdma,
++			 SUN8I_SCALER_VSU_YINSIZE, insize);
++	sun8i_rdma_write(layer->scaler_rdma,
++			 SUN8I_SCALER_VSU_YHSTEP, hscale);
++	sun8i_rdma_write(layer->scaler_rdma,
++			 SUN8I_SCALER_VSU_YVSTEP, vscale);
++	sun8i_rdma_write(layer->scaler_rdma,
++			 SUN8I_SCALER_VSU_YHPHASE, hphase);
++	sun8i_rdma_write(layer->scaler_rdma,
++			 SUN8I_SCALER_VSU_YVPHASE, vphase);
++	sun8i_rdma_write(layer->scaler_rdma,
++			 SUN8I_SCALER_VSU_CINSIZE,
++			 SUN8I_VI_SCALER_SIZE(src_w / format->hsub,
++					      src_h / format->vsub));
++	sun8i_rdma_write(layer->scaler_rdma,
++			 SUN8I_SCALER_VSU_CHSTEP,
++			 hscale / format->hsub);
++	sun8i_rdma_write(layer->scaler_rdma,
++			 SUN8I_SCALER_VSU_CVSTEP,
++			 vscale / format->vsub);
++	sun8i_rdma_write(layer->scaler_rdma,
++			 SUN8I_SCALER_VSU_CHPHASE, chphase);
++	sun8i_rdma_write(layer->scaler_rdma,
++			 SUN8I_SCALER_VSU_CVPHASE, cvphase);
++
++	if (type == SUN8I_SCALER_VI_8)
++		sun8i_vi_scaler_set_coeff_8(layer->scaler_rdma,
++					    hscale, vscale, format);
++	else
++		sun8i_vi_scaler_set_coeff_10(layer->scaler_rdma,
++					     hscale, vscale, format);
+ }
+diff --git a/drivers/gpu/drm/sun4i/sun8i_vi_scaler.h b/drivers/gpu/drm/sun4i/sun8i_vi_scaler.h
+index d89c0cb..c3c81bb 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_vi_scaler.h
++++ b/drivers/gpu/drm/sun4i/sun8i_vi_scaler.h
+@@ -25,34 +25,35 @@
+ #define SUN8I_VI_SCALER_SCALE_MAX		((1UL << 20) - 1)
+ 
+ #define SUN8I_VI_SCALER_SCALE_FRAC		20
++#define SUN8I_VI_SCALER_SCALE_UNIT		BIT(SUN8I_VI_SCALER_SCALE_FRAC)
+ #define SUN8I_VI_SCALER_PHASE_FRAC		20
+ #define SUN8I_VI_SCALER_COEFF_COUNT		32
+ #define SUN8I_VI_SCALER_SIZE(w, h)		(((h) - 1) << 16 | ((w) - 1))
+ 
+-#define SUN8I_SCALER_VSU_CTRL(base)		((base) + 0x0)
+-#define SUN50I_SCALER_VSU_SCALE_MODE(base)		((base) + 0x10)
+-#define SUN50I_SCALER_VSU_DIR_THR(base)		((base) + 0x20)
+-#define SUN50I_SCALER_VSU_EDGE_THR(base)		((base) + 0x24)
+-#define SUN50I_SCALER_VSU_EDSCL_CTRL(base)		((base) + 0x28)
+-#define SUN50I_SCALER_VSU_ANGLE_THR(base)		((base) + 0x2c)
+-#define SUN8I_SCALER_VSU_OUTSIZE(base)		((base) + 0x40)
+-#define SUN50I_SCALER_VSU_GLB_ALPHA(base)	((base) + 0x44)
+-#define SUN8I_SCALER_VSU_YINSIZE(base)		((base) + 0x80)
+-#define SUN8I_SCALER_VSU_YHSTEP(base)		((base) + 0x88)
+-#define SUN8I_SCALER_VSU_YVSTEP(base)		((base) + 0x8c)
+-#define SUN8I_SCALER_VSU_YHPHASE(base)		((base) + 0x90)
+-#define SUN8I_SCALER_VSU_YVPHASE(base)		((base) + 0x98)
+-#define SUN8I_SCALER_VSU_CINSIZE(base)		((base) + 0xc0)
+-#define SUN8I_SCALER_VSU_CHSTEP(base)		((base) + 0xc8)
+-#define SUN8I_SCALER_VSU_CVSTEP(base)		((base) + 0xcc)
+-#define SUN8I_SCALER_VSU_CHPHASE(base)		((base) + 0xd0)
+-#define SUN8I_SCALER_VSU_CVPHASE(base)		((base) + 0xd8)
+-#define SUN8I_SCALER_VSU_YHCOEFF0(base, i)	((base) + 0x200 + 0x4 * (i))
+-#define SUN8I_SCALER_VSU_YHCOEFF1(base, i)	((base) + 0x300 + 0x4 * (i))
+-#define SUN8I_SCALER_VSU_YVCOEFF(base, i)	((base) + 0x400 + 0x4 * (i))
+-#define SUN8I_SCALER_VSU_CHCOEFF0(base, i)	((base) + 0x600 + 0x4 * (i))
+-#define SUN8I_SCALER_VSU_CHCOEFF1(base, i)	((base) + 0x700 + 0x4 * (i))
+-#define SUN8I_SCALER_VSU_CVCOEFF(base, i)	((base) + 0x800 + 0x4 * (i))
++#define SUN8I_SCALER_VSU_CTRL			0x0
++#define SUN50I_SCALER_VSU_SCALE_MODE		0x10
++#define SUN50I_SCALER_VSU_DIR_THR		0x20
++#define SUN50I_SCALER_VSU_EDGE_THR		0x24
++#define SUN50I_SCALER_VSU_EDSCL_CTRL		0x28
++#define SUN50I_SCALER_VSU_ANGLE_THR		0x2c
++#define SUN8I_SCALER_VSU_OUTSIZE		0x40
++#define SUN50I_SCALER_VSU_GLB_ALPHA		0x44
++#define SUN8I_SCALER_VSU_YINSIZE		0x80
++#define SUN8I_SCALER_VSU_YHSTEP			0x88
++#define SUN8I_SCALER_VSU_YVSTEP			0x8c
++#define SUN8I_SCALER_VSU_YHPHASE		0x90
++#define SUN8I_SCALER_VSU_YVPHASE		0x98
++#define SUN8I_SCALER_VSU_CINSIZE		0xc0
++#define SUN8I_SCALER_VSU_CHSTEP			0xc8
++#define SUN8I_SCALER_VSU_CVSTEP			0xcc
++#define SUN8I_SCALER_VSU_CHPHASE		0xd0
++#define SUN8I_SCALER_VSU_CVPHASE		0xd8
++#define SUN8I_SCALER_VSU_YHCOEFF0(i)		(0x200 + 0x4 * (i))
++#define SUN8I_SCALER_VSU_YHCOEFF1(i)		(0x300 + 0x4 * (i))
++#define SUN8I_SCALER_VSU_YVCOEFF(i)		(0x400 + 0x4 * (i))
++#define SUN8I_SCALER_VSU_CHCOEFF0(i)		(0x600 + 0x4 * (i))
++#define SUN8I_SCALER_VSU_CHCOEFF1(i)		(0x700 + 0x4 * (i))
++#define SUN8I_SCALER_VSU_CVCOEFF(i)		(0x800 + 0x4 * (i))
+ 
+ #define SUN8I_SCALER_VSU_CTRL_EN		BIT(0)
+ #define SUN8I_SCALER_VSU_CTRL_COEFF_RDY		BIT(4)
+@@ -73,9 +74,11 @@
+ #define SUN50I_SCALER_VSU_ANGLE_OFFSET(x)		((x) & 0xFF)
+ 
+ void sun8i_vi_scaler_enable(struct sun8i_layer *layer, bool enable);
++int sun8i_vi_scaler_init(struct sun8i_layer *layer, struct sun8i_rdma *rdma,
++			 void __iomem *reg_base, u32 reg_offset_base);
+ void sun8i_vi_scaler_setup(struct sun8i_layer *layer,
+ 			   u32 src_w, u32 src_h, u32 dst_w, u32 dst_h,
+ 			   u32 hscale, u32 vscale, u32 hphase, u32 vphase,
+-			   const struct drm_format_info *format);
++			   const struct drm_format_info *format, bool afbc);
+ 
+ #endif
+diff --git a/drivers/gpu/drm/sun4i/sunxi_engine.h b/drivers/gpu/drm/sun4i/sunxi_engine.h
+index 90df989..fe5e402 100644
+--- a/drivers/gpu/drm/sun4i/sunxi_engine.h
++++ b/drivers/gpu/drm/sun4i/sunxi_engine.h
+@@ -21,6 +21,29 @@ struct sunxi_engine;
+  * implement the proper behaviour.
+  */
+ struct sunxi_engine_ops {
++	/**
++	 * @sync:
++	 *
++	 * This callback synchronizes with any pending register update
++	 * mechanism of the engine, so another update source (like the
++	 * writeback register queue) can be triggered without racing
++	 * with it.
++	 *
++	 * This function is optional.
++	 */
++	void (*sync)(struct sunxi_engine *engine);
++
++	/**
++	 * @wait_for_scanout:
++	 *
++	 * This callback waits until the engine no longer accesses scanout
++	 * buffers replaced by the current atomic update.
++	 *
++	 * This function is optional.
++	 */
++	void (*wait_for_scanout)(struct sunxi_engine *engine,
++				 struct drm_crtc *crtc);
++
+ 	/**
+ 	 * @atomic_begin:
+ 	 *
+@@ -148,6 +171,27 @@ struct sunxi_engine {
+ 	struct list_head		list;
+ };
+ 
++/**
++ * sunxi_engine_commit() - commit all changes of the engine
++ * @engine:	pointer to the engine
++ * @crtc:	pointer to crtc the engine is associated with
++ * @state:	atomic state
++ */
++static inline void
++sunxi_engine_sync(struct sunxi_engine *engine)
++{
++	if (engine->ops && engine->ops->sync)
++		engine->ops->sync(engine);
++}
++
++static inline void
++sunxi_engine_wait_for_scanout(struct sunxi_engine *engine,
++			      struct drm_crtc *crtc)
++{
++	if (engine->ops && engine->ops->wait_for_scanout)
++		engine->ops->wait_for_scanout(engine, crtc);
++}
++
+ /**
+  * sunxi_engine_commit() - commit all changes of the engine
+  * @engine:	pointer to the engine
+diff --git a/drivers/iommu/sun50i-iommu.c b/drivers/iommu/sun50i-iommu.c
+index 4d178ab..f8ec517 100644
+--- a/drivers/iommu/sun50i-iommu.c
++++ b/drivers/iommu/sun50i-iommu.c
+@@ -627,11 +627,16 @@ static int sun50i_iommu_map(struct iommu_domain *domain, unsigned long iova,
+ 	u32 *page_table, *pte_addr;
+ 	int ret = 0;
+ 
+-	/* the IOMMU can only handle 32-bit addresses, both input and output */
+-	if ((uint64_t)paddr >> 32) {
++	/*
++	 * Pages above the 4 GiB boundary are reached through the
++	 * interconnect's address wraparound; only addresses beyond
++	 * DRAM can't be represented.  sun50i_mk_pte() truncates the
++	 * physical address to its low 32 bits.
++	 */
++	if ((uint64_t)paddr >= SUN50I_IOMMU_DRAM_BASE + SZ_4G) {
+ 		ret = -EINVAL;
+ 		dev_warn_once(iommu->dev,
+-			      "attempt to map address beyond 4GB\n");
++			      "attempt to map address beyond 4GB DRAM\n");
+ 		goto out;
+ 	}
+ 
