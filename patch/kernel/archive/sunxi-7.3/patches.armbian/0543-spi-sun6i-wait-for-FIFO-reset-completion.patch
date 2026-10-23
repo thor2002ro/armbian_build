@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] spi: sun6i: wait for FIFO reset completion
+
+Wait for both FIFO resets before programming transfers.
+Return a timeout error when reset does not finish.
+
+Adapt Kickpi H618 SDK revision 3ad8e7bd26da.
+Use a 1 ms deadline instead of the vendor loop count.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/drivers/spi/spi-sun6i.c b/drivers/spi/spi-sun6i.c
+--- a/drivers/spi/spi-sun6i.c
++++ b/drivers/spi/spi-sun6i.c
+@@ -13,6 +13,7 @@
+ #include <linux/device.h>
+ #include <linux/interrupt.h>
+ #include <linux/io.h>
++#include <linux/iopoll.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+@@ -302,6 +303,14 @@
+ 	/* Reset FIFO */
+ 	sun6i_spi_write(sspi, SUN6I_FIFO_CTL_REG,
+ 			SUN6I_FIFO_CTL_RF_RST | SUN6I_FIFO_CTL_TF_RST);
++
++	ret = readl_poll_timeout(sspi->base_addr + SUN6I_FIFO_CTL_REG, reg,
++				 !(reg & (SUN6I_FIFO_CTL_RF_RST |
++					  SUN6I_FIFO_CTL_TF_RST)), 0, 1000);
++	if (ret) {
++		dev_err(&host->dev, "FIFO reset timed out\n");
++		return ret;
++	}
+ 
+ 	reg = 0;
+ 
