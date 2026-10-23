@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: James Hilliard <james.hilliard1@gmail.com>
+Date: Wed, 21 Oct 2026 18:08:55 -0600
+Subject: [PATCH 1/2] dt-bindings: clock: sun50i-h616: export the APB2 clock
+
+Expose the existing APB2 clock ID for UART baud clock references.
+Keep the existing clock numbering.
+
+Link: https://lists.openwall.net/linux-kernel/2026/10/22/28
+Signed-off-by: James Hilliard <james.hilliard1@gmail.com>
+---
+ include/dt-bindings/clock/sun50i-h616-ccu.h | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/include/dt-bindings/clock/sun50i-h616-ccu.h b/include/dt-bindings/clock/sun50i-h616-ccu.h
+--- a/include/dt-bindings/clock/sun50i-h616-ccu.h
++++ b/include/dt-bindings/clock/sun50i-h616-ccu.h
+@@ -11,6 +11,7 @@
+ #define CLK_CPUX		21
+ 
+ #define CLK_APB1		26
++#define CLK_APB2		27
+ 
+ #define CLK_DE			29
+ #define CLK_BUS_DE		30

@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: James Hilliard <james.hilliard1@gmail.com>
+Date: Wed, 21 Oct 2026 18:08:56 -0600
+Subject: [PATCH 2/2] clk: sunxi-ng: h616: drop the private APB2 clock definition
+
+Use the public APB2 clock definition from the included binding header.
+
+Link: https://lists.openwall.net/linux-kernel/2026/10/22/38
+Signed-off-by: James Hilliard <james.hilliard1@gmail.com>
+---
+ drivers/clk/sunxi-ng/ccu-sun50i-h616.h | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.h b/drivers/clk/sunxi-ng/ccu-sun50i-h616.h
+--- a/drivers/clk/sunxi-ng/ccu-sun50i-h616.h
++++ b/drivers/clk/sunxi-ng/ccu-sun50i-h616.h
+@@ -40,9 +40,8 @@
+ #define CLK_PSI_AHB1_AHB2	24
+ #define CLK_AHB3		25
+ 
+-/* APB1 clock exported for PIO */
++/* APB1 and APB2 clocks exported for PIO and UART baud clocks */
+ 
+-#define CLK_APB2		27
+ #define CLK_MBUS		28
+ 
+ /* All module clocks and bus gates are exported except DRAM */
