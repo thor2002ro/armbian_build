@@ -1,0 +1,86 @@
+From dbed729c3c76eaf0cba85438b69d30c4c77877af Mon Sep 17 00:00:00 2001
+From: Jernej Skrabec <jernej.skrabec@gmail.com>
+Date: Sat, 22 Aug 2026 07:10:21 +0200
+Subject: [PATCH] mmc: sunxi: Unwind probe failures
+
+The controller remains enabled when IRQ setup, descriptor allocation or
+host registration fails. Unwind it and runtime PM on each error path.
+
+Fixes: 3cbcb16095f9 ("mmc: sunxi: Add driver for SD/MMC hosts found on Allwinner sunxi SoCs")
+Signed-off-by: Jernej Skrabec <jernej.skrabec@gmail.com>
+
+[Armbian: Release the local runtime PM reference when host registration fails.]
+
+---
+diff --git a/drivers/mmc/host/sunxi-mmc.c b/drivers/mmc/host/sunxi-mmc.c
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -1370,8 +1370,13 @@
+ 		goto error_disable_mmc;
+ 	}
+ 
+-	return devm_request_threaded_irq(&pdev->dev, host->irq, sunxi_mmc_irq,
+-			sunxi_mmc_handle_manual_stop, 0, "sunxi-mmc", host);
++	ret = devm_request_threaded_irq(&pdev->dev, host->irq, sunxi_mmc_irq,
++					sunxi_mmc_handle_manual_stop, 0,
++					"sunxi-mmc", host);
++	if (ret)
++		goto error_disable_mmc;
++
++	return 0;
+ 
+ error_disable_mmc:
+ 	sunxi_mmc_disable(host);
+@@ -1382,6 +1387,7 @@
+ {
+ 	struct sunxi_mmc_host *host;
+ 	struct mmc_host *mmc;
++	bool pm_ref;
+ 	int ret;
+ 
+ 	mmc = devm_mmc_alloc_host(&pdev->dev, sizeof(*host));
+@@ -1401,9 +1407,11 @@
+ 
+ 	host->sg_cpu = dma_alloc_coherent(&pdev->dev, PAGE_SIZE,
+ 					  &host->sg_dma, GFP_KERNEL);
+-	if (!host->sg_cpu)
+-		return dev_err_probe(&pdev->dev, -ENOMEM,
+-				     "Failed to allocate DMA descriptor mem\n");
++	if (!host->sg_cpu) {
++		ret = dev_err_probe(&pdev->dev, -ENOMEM,
++				    "Failed to allocate DMA descriptor mem\n");
++		goto error_disable_mmc;
++	}
+ 
+ 	if (host->cfg->ccu_has_timings_switch) {
+ 		/*
+@@ -1486,12 +1494,13 @@
+ 	pm_runtime_enable(&pdev->dev);
+ 	/* Pin device active (intentionally un-paired get) to avoid circular PM deadlock */
+ 	ret = pm_runtime_resume_and_get(&pdev->dev);
++	pm_ref = ret >= 0;
+ 	if (ret < 0)
+ 		dev_warn(&pdev->dev, "failed to resume during probe: %d\n", ret);
+ 
+ 	ret = mmc_add_host(mmc);
+ 	if (ret)
+-		goto error_free_dma;
++		goto error_disable_pm;
+ 
+ 	dev_info(&pdev->dev, "initialized, max. request size: %u KB%s\n",
+ 		 mmc->max_req_size >> 10,
+@@ -1499,8 +1508,14 @@
+ 
+ 	return 0;
+ 
++error_disable_pm:
++	if (pm_ref)
++		pm_runtime_put_noidle(&pdev->dev);
++	pm_runtime_disable(&pdev->dev);
+ error_free_dma:
+ 	dma_free_coherent(&pdev->dev, PAGE_SIZE, host->sg_cpu, host->sg_dma);
++error_disable_mmc:
++	sunxi_mmc_disable(host);
+ 	return ret;
+ }
+ 
