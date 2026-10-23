@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thor2002ro <thor2002ro@gmail.com>
+Date: Fri, 23 Oct 2026 12:00:00 +0300
+Subject: [PATCH] drm/bridge: dw-hdmi: keep AVMUTE packets enabled
+
+Keep HDMI GCP transmission active across 8-bit mode changes.
+Use zero color depth for 8-bit packets. Disable GCP transmission for DVI.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
+--- a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
++++ b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
+@@ -1220,8 +1220,6 @@
+ 	unsigned int output_select = HDMI_VP_CONF_OUTPUT_SELECTOR_PP;
+ 	struct hdmi_data_info *hdmi_data = &hdmi->hdmi_data;
+ 	u8 val, vp_conf;
+-	u8 clear_gcp_auto = 0;
+-
+ 
+ 	if (hdmi_bus_fmt_is_rgb(hdmi->hdmi_data.enc_out_bus_format) ||
+ 	    hdmi_bus_fmt_is_yuv444(hdmi->hdmi_data.enc_out_bus_format) ||
+@@ -1229,9 +1227,8 @@
+ 		switch (hdmi_bus_fmt_color_depth(
+ 					hdmi->hdmi_data.enc_out_bus_format)) {
+ 		case 8:
+-			color_depth = 4;
++			color_depth = 0;
+ 			output_select = HDMI_VP_CONF_OUTPUT_SELECTOR_BYPASS;
+-			clear_gcp_auto = 1;
+ 			break;
+ 		case 10:
+ 			color_depth = 5;
+@@ -1251,7 +1248,6 @@
+ 		case 0:
+ 		case 8:
+ 			remap_size = HDMI_VP_REMAP_YCC422_16bit;
+-			clear_gcp_auto = 1;
+ 			break;
+ 		case 10:
+ 			remap_size = HDMI_VP_REMAP_YCC422_20bit;
+@@ -1276,18 +1272,10 @@
+ 		HDMI_VP_PR_CD_DESIRED_PR_FACTOR_MASK);
+ 	hdmi_writeb(hdmi, val, HDMI_VP_PR_CD);
+ 
+-	/* HDMI1.4b specification section 6.5.3:
+-	 * Source shall only send GCPs with non-zero CD to sinks
+-	 * that indicate support for Deep Color.
+-	 * GCP only transmit CD and do not handle AVMUTE, PP norDefault_Phase (yet).
+-	 * Disable Auto GCP when 24-bit color for sinks that not support Deep Color.
+-	 */
+-	val = hdmi_readb(hdmi, HDMI_FC_DATAUTO3);
+-	if (clear_gcp_auto == 1)
+-		val &= ~HDMI_FC_DATAUTO3_GCP_AUTO;
+-	else
+-		val |= HDMI_FC_DATAUTO3_GCP_AUTO;
+-	hdmi_writeb(hdmi, val, HDMI_FC_DATAUTO3);
++	/* Zero color depth permits AVMUTE packets without Deep Color support. */
++	val = hdmi->sink_is_hdmi ? HDMI_FC_DATAUTO3_GCP_AUTO : 0;
++	hdmi_modb(hdmi, val, HDMI_FC_DATAUTO3_GCP_AUTO, HDMI_FC_DATAUTO3);
++
+ 
+ 	hdmi_modb(hdmi, HDMI_VP_STUFF_PR_STUFFING_STUFFING_MODE,
+ 		  HDMI_VP_STUFF_PR_STUFFING_MASK, HDMI_VP_STUFF);
+@@ -2308,13 +2296,18 @@
+ 	hdmi->hdmi_data.hdcp_enable = 0;
+ 	hdmi->hdmi_data.video_mode.mdataenablepolarity = true;
+ 
+-	/*
+-	 * Mute the sink for the duration of the mode change, so it does
+-	 * not attempt to lock onto transitional, not yet fully configured
+-	 * timings. Some sinks otherwise fail to detect the new mode at
+-	 * all until the cable is unplugged and reconnected.
+-	 */
+-	hdmi_writeb(hdmi, HDMI_FC_GCP_SET_AVMUTE, HDMI_FC_GCP);
++	/* Enable GCP transmission before changing HDMI timings. */
++	if (hdmi->sink_is_hdmi) {
++		/* Discard firmware color depth before the first HDMI packet. */
++		if (!hdmi->phy.enabled)
++			hdmi_modb(hdmi, 0, HDMI_VP_PR_CD_COLOR_DEPTH_MASK,
++				  HDMI_VP_PR_CD);
++		hdmi_writeb(hdmi, HDMI_FC_GCP_SET_AVMUTE, HDMI_FC_GCP);
++		hdmi_modb(hdmi, HDMI_FC_DATAUTO3_GCP_AUTO,
++			  HDMI_FC_DATAUTO3_GCP_AUTO, HDMI_FC_DATAUTO3);
++	} else {
++		hdmi_modb(hdmi, 0, HDMI_FC_DATAUTO3_GCP_AUTO, HDMI_FC_DATAUTO3);
++	}
+ 
+ 	/* HDMI Initialization Step B.1 */
+ 	hdmi_av_composer(hdmi, &connector->display_info, mode);
+@@ -2324,7 +2317,8 @@
+ 				  &connector->display_info,
+ 				  &hdmi->previous_mode);
+ 	if (ret) {
+-		hdmi_writeb(hdmi, HDMI_FC_GCP_CLEAR_AVMUTE, HDMI_FC_GCP);
++		if (hdmi->sink_is_hdmi)
++			hdmi_writeb(hdmi, HDMI_FC_GCP_CLEAR_AVMUTE, HDMI_FC_GCP);
+ 		return ret;
+ 	}
+ 	hdmi->phy.enabled = true;
+@@ -2357,12 +2351,11 @@
+ 	hdmi_video_sample(hdmi);
+ 	hdmi_tx_hdcp_config(hdmi);
+ 
+-	/*
+-	 * Give the sink time to lock onto the now fully configured timing
+-	 * before unmuting.
+-	 */
+-	msleep(100);
+-	hdmi_writeb(hdmi, HDMI_FC_GCP_CLEAR_AVMUTE, HDMI_FC_GCP);
++	if (hdmi->sink_is_hdmi) {
++		/* Wait for the sink to lock before clearing AVMUTE. */
++		msleep(100);
++		hdmi_writeb(hdmi, HDMI_FC_GCP_CLEAR_AVMUTE, HDMI_FC_GCP);
++	}
+ 
+ 	dw_hdmi_clear_overflow(hdmi);
+ 
