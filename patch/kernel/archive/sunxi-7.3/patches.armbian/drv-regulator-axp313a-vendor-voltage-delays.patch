@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] regulator: axp20x: support AXP313A vendor voltage delays
+
+Honor the vendor step and final delay properties on AXP313A regulators.
+Keep any longer delay from the existing regulator constraints.
+
+Wait for each selector step, then wait for the final delay.
+Regulators without these properties retain the generic voltage delay.
+
+Link: https://github.com/orangepi-xunlong/linux-orangepi/blob/orange-pi-5.4-sun50iw9/drivers/regulator/axp2101-regulator.c
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/drivers/regulator/axp20x-regulator.c b/drivers/regulator/axp20x-regulator.c
+--- a/drivers/regulator/axp20x-regulator.c
++++ b/drivers/regulator/axp20x-regulator.c
+@@ -17,6 +17,7 @@
+ #include <linux/delay.h>
+ #include <linux/err.h>
+ #include <linux/init.h>
++#include <linux/limits.h>
+ #include <linux/mfd/axp20x.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+@@ -567,6 +568,32 @@
+ 	return regulator_enable_regmap(rdev);
+ };
+ 
++static int axp313a_set_voltage_time_sel(struct regulator_dev *rdev,
++					unsigned int old_selector,
++					unsigned int new_selector)
++{
++	u32 step = 0, final = 0;
++	unsigned int steps;
++	int ramp_delay;
++	u64 delay;
++
++	ramp_delay = regulator_set_voltage_time_sel(rdev, old_selector,
++						    new_selector);
++	if (ramp_delay < 0)
++		return ramp_delay;
++
++	of_property_read_u32(rdev->dev.of_node, "regulator-step-delay-us", &step);
++	of_property_read_u32(rdev->dev.of_node, "regulator-final-delay-us", &final);
++	steps = old_selector > new_selector ? old_selector - new_selector :
++					     new_selector - old_selector;
++	delay = (u64)steps * step + final;
++	if (delay > INT_MAX)
++		return -EINVAL;
++
++	/* Preserve a longer delay from the regulator constraints. */
++	return max_t(int, delay, ramp_delay);
++}
++
+ static const struct regulator_ops axp20x_ops_fixed = {
+ 	.list_voltage		= regulator_list_voltage_linear,
+ };
+@@ -588,6 +615,27 @@
+ 	.disable		= regulator_disable_regmap,
+ 	.is_enabled		= regulator_is_enabled_regmap,
+ 	.set_ramp_delay		= axp20x_set_ramp_delay,
++};
++
++static const struct regulator_ops axp313a_ops_range = {
++	.set_voltage_sel	= regulator_set_voltage_sel_regmap,
++	.get_voltage_sel	= regulator_get_voltage_sel_regmap,
++	.list_voltage		= regulator_list_voltage_linear_range,
++	.enable			= regulator_enable_regmap,
++	.disable		= regulator_disable_regmap,
++	.is_enabled		= regulator_is_enabled_regmap,
++	.set_voltage_time_sel	= axp313a_set_voltage_time_sel,
++};
++
++static const struct regulator_ops axp313a_ops = {
++	.set_voltage_sel	= regulator_set_voltage_sel_regmap,
++	.get_voltage_sel	= regulator_get_voltage_sel_regmap,
++	.list_voltage		= regulator_list_voltage_linear,
++	.enable			= axp20x_regulator_enable_regmap,
++	.disable		= regulator_disable_regmap,
++	.is_enabled		= regulator_is_enabled_regmap,
++	.set_ramp_delay		= axp20x_set_ramp_delay,
++	.set_voltage_time_sel	= axp313a_set_voltage_time_sel,
+ };
+ 
+ static const struct regulator_ops axp20x_ops_sw = {
+@@ -1687,6 +1735,17 @@
+ 			desc = new_desc;
+ 		}
+ 
++		if (axp20x->variant == AXP313A_ID && desc->n_voltages > 1) {
++			new_desc = devm_kmemdup(&pdev->dev, desc, sizeof(*desc),
++						GFP_KERNEL);
++			if (!new_desc)
++				return -ENOMEM;
++
++			new_desc->ops = desc->ops == &axp20x_ops_range ?
++				       &axp313a_ops_range : &axp313a_ops;
++			desc = new_desc;
++		}
++
+ 		rdev = devm_regulator_register(&pdev->dev, desc, &config);
+ 		if (IS_ERR(rdev)) {
+ 			dev_err(&pdev->dev, "Failed to register %s\n",
