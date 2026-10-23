@@ -1,0 +1,53 @@
+Subject: Local: media: cedrus: fix low-bit allocation and P010 output
+
+Ten-bit pictures require P010 capture sizes and strides. The ordinary NV12 allocation can expose an invalid output layout.
+
+Select the allocation from the negotiated bit depth. Eight-bit capture remains unchanged.
+---
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.h b/drivers/staging/media/sunxi/cedrus/cedrus.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -361,7 +361,7 @@
+  */
+ static inline u32 cedrus_dst_2bit_size(unsigned int width, unsigned int height)
+ {
+-	return ALIGN(width / 4, 32) * height * 3 / 2;
++	return ALIGN(DIV_ROUND_UP(width, 4), 32) * height * 3 / 2;
+ }
+ 
+ static inline bool cedrus_dst_is_p010(struct cedrus_ctx *ctx)
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+@@ -201,7 +201,7 @@
+ 		     VE_SECONDARY_OUT_FMT_EXT |
+ 		     VE_CHROMA_BUF_LEN_SDRT(chroma_size));
+ 	cedrus_write(dev, VE_PRIMARY_OUT_FMT,
+-		     VE_PRIMARY_OUT_FMT_NV12 | VE_SECONDARY_OUT_FMT_EXT_NV12);
++		     VE_PRIMARY_OUT_FMT_NV12 | VE_SECONDARY_OUT_FMT_EXT_P010);
+ 	cedrus_write(dev, VE_DEC_SECOND_OUT_CTRL, 0);
+ 	cedrus_write(dev, VE_DEC_SECOND_OUT_LUMA_ADDR, luma >> 8);
+ 	cedrus_write(dev, VE_DEC_SECOND_OUT_CHROMA_ADDR, chroma >> 8);
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_regs.h b/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
+@@ -107,6 +107,7 @@
+ #define VE_SECONDARY_OUT_FMT_EXT_YV12		(0x03 << 0)
+ #define VE_SECONDARY_OUT_FMT_EXT_NV12		(0x04 << 0)
+ #define VE_SECONDARY_OUT_FMT_EXT_NV21		(0x05 << 0)
++#define VE_SECONDARY_OUT_FMT_EXT_P010		(0x06 << 0)
+ 
+ #define VE_VERSION				0xf0
+ 
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_h265.c b/drivers/staging/media/sunxi/cedrus/cedrus_h265.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_h265.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_h265.c
+@@ -814,7 +814,7 @@
+ 
+ 	if (ctx->bit_depth > 8) {
+ 		struct v4l2_pix_format recon = cedrus_dst_frame_fmt(ctx);
+-		unsigned int stride = ALIGN(recon.width / 4, 32);
++		unsigned int stride = ALIGN(DIV_ROUND_UP(recon.width, 4), 32);
+ 
+ 		/*
+ 		 * Offset of the appended low-2-bit reconstruction plane from
