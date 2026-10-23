@@ -1,0 +1,426 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: media: cedrus: remove policy resolution and rate caps
+
+Accept frame dimensions within register and buffer limits.
+Preserve requested encoder timing within H.264 format limits.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.h b/drivers/staging/media/sunxi/cedrus/cedrus.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -218,11 +218,13 @@
+ 			dma_addr_t entry_dma;
+ 			void *neighbor;
+ 			dma_addr_t neighbor_dma;
++			size_t neighbor_size;
+ 			struct cedrus_buffer *dst;
+ 		} cavs2;
+ 		struct {
+ 			void *mb;
+ 			dma_addr_t mb_dma;
++			size_t mb_size;
+ 			void *mv;
+ 			dma_addr_t mv_dma;
+ 			size_t mv_size;
+@@ -287,7 +289,6 @@
+ 	struct video_device	vfd;
+ 	struct video_device	enc_vfd;
+ 	bool			enc_registered;
+-	u32			encoder_soc_id;
+ 	struct media_device	mdev;
+ 	struct media_pad	pad[2];
+ 	struct platform_device	*pdev;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_cavs.c b/drivers/staging/media/sunxi/cedrus/cedrus_cavs.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_cavs.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_cavs.c
+@@ -8,6 +8,7 @@
+ #include "cedrus.h"
+ #include "cedrus_hw.h"
+ #include "cedrus_regs.h"
++#include "cedrus_video.h"
+ 
+ #define CAVS_REG(n) (VE_ENGINE_DEC_H264 + (n))
+ #define CAVS_MB_INFO_SIZE 0xc000
+@@ -17,7 +18,8 @@
+ {
+ 	unsigned int i;
+ 
+-	if (!f || !f->width || f->width > 1920 || !f->height || f->height > 1088 ||
++	if (!f || !f->width || f->width > CEDRUS_MB_MAX_SIZE ||
++	    !f->height || f->height > CEDRUS_MB_MAX_SIZE ||
+ 	    (f->profile != 0x20 && f->profile != 0x48) ||
+ 	    f->picture_type < 1 || f->picture_type > 3 || f->picture_qp > 63 ||
+ 	    f->num_refs > 2 || (f->picture_type > 1 && !f->num_refs) ||
+@@ -230,14 +232,17 @@
+ 	cedrus_cavs_invalidate_buffers(ctx);
+ 	ctx->codec.cavs.mv_size = (ALIGN(ctx->src_fmt.width, 64) / 16) *
+ 				(ALIGN(ctx->src_fmt.height, 64) / 16) * 32;
+-	ctx->codec.cavs.mb = dma_alloc_coherent(dev->dev, CAVS_MB_INFO_SIZE,
+-					      &ctx->codec.cavs.mb_dma, GFP_KERNEL);
++	ctx->codec.cavs.mb_size = CAVS_MB_INFO_SIZE *
++		DIV_ROUND_UP(ctx->src_fmt.width, 1920) *
++		DIV_ROUND_UP(ctx->src_fmt.height, 1088);
++	ctx->codec.cavs.mb = dma_alloc_coherent(dev->dev, ctx->codec.cavs.mb_size,
++					       &ctx->codec.cavs.mb_dma, GFP_KERNEL);
+ 	if (!ctx->codec.cavs.mb)
+ 		return -ENOMEM;
+ 	ctx->codec.cavs.mv = dma_alloc_coherent(dev->dev, ctx->codec.cavs.mv_size,
+ 					      &ctx->codec.cavs.mv_dma, GFP_KERNEL);
+ 	if (!ctx->codec.cavs.mv) {
+-		dma_free_coherent(dev->dev, CAVS_MB_INFO_SIZE, ctx->codec.cavs.mb,
++		dma_free_coherent(dev->dev, ctx->codec.cavs.mb_size, ctx->codec.cavs.mb,
+ 				  ctx->codec.cavs.mb_dma);
+ 		ctx->codec.cavs.mb = NULL;
+ 		return -ENOMEM;
+@@ -252,7 +257,7 @@
+ 
+ 	cedrus_cavs_invalidate_buffers(ctx);
+ 
+-	dma_free_coherent(dev->dev, CAVS_MB_INFO_SIZE, ctx->codec.cavs.mb,
++	dma_free_coherent(dev->dev, ctx->codec.cavs.mb_size, ctx->codec.cavs.mb,
+ 			  ctx->codec.cavs.mb_dma);
+ 	dma_free_coherent(dev->dev, ctx->codec.cavs.mv_size, ctx->codec.cavs.mv,
+ 			  ctx->codec.cavs.mv_dma);
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_cavs2.c b/drivers/staging/media/sunxi/cedrus/cedrus_cavs2.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_cavs2.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_cavs2.c
+@@ -9,6 +9,7 @@
+ #include "cedrus.h"
+ #include "cedrus_hw.h"
+ #include "cedrus_regs.h"
++#include "cedrus_video.h"
+ 
+ #define CAVS2_REG(n) (VE_ENGINE_DEC_H265 + (n))
+ #define CAVS2_ENTRY_SIZE 512
+@@ -26,11 +27,12 @@
+ {
+ 	unsigned int i, j;
+ 
+-	if (!f || f->width < 64 || f->width > 4096 ||
+-	    f->height < 64 || f->height > 2304 ||
++	if (!f || f->width < 64 || f->width > CEDRUS_WIDE_MAX_SIZE ||
++	    f->height < 64 || f->height > CEDRUS_WIDE_MAX_SIZE ||
+ 	    (f->profile != 0x20 && f->profile != 0x22) ||
+ 	    (f->bit_depth != 8 && f->bit_depth != 10) ||
+ 	    (f->profile == 0x20 && f->bit_depth != 8) ||
++	    (f->bit_depth == 10 && f->width > CEDRUS_VP9_10BIT_MAX_WIDTH) ||
+ 	    f->log2_lcu_size < 4 || f->log2_lcu_size > 6 ||
+ 	    (f->sequence_flags & ~0x1fffU) || (f->flags & ~127U) ||
+ 	    (f->flags & V4L2_CAVS2_FRAME_INTERLACED &&
+@@ -318,9 +320,13 @@
+ 						 &ctx->codec.cavs2.entry_dma, GFP_KERNEL);
+ 	if (!ctx->codec.cavs2.entry)
+ 		return -ENOMEM;
+-	ctx->codec.cavs2.neighbor = dma_alloc_attrs(dev->dev, CAVS2_NEIGHBOR_SIZE,
+-						 &ctx->codec.cavs2.neighbor_dma,
+-						 GFP_KERNEL, DMA_ATTR_NO_KERNEL_MAPPING);
++	ctx->codec.cavs2.neighbor_size = CAVS2_NEIGHBOR_SIZE *
++		DIV_ROUND_UP(ctx->src_fmt.width, CEDRUS_MAX_WIDTH) *
++		DIV_ROUND_UP(ctx->src_fmt.height, CEDRUS_MAX_HEIGHT);
++	ctx->codec.cavs2.neighbor = dma_alloc_attrs(dev->dev,
++						   ctx->codec.cavs2.neighbor_size,
++						   &ctx->codec.cavs2.neighbor_dma,
++						   GFP_KERNEL, DMA_ATTR_NO_KERNEL_MAPPING);
+ 	if (!ctx->codec.cavs2.neighbor) {
+ 		dma_free_coherent(dev->dev, CAVS2_ENTRY_SIZE, ctx->codec.cavs2.entry,
+ 				  ctx->codec.cavs2.entry_dma);
+@@ -360,7 +366,8 @@
+ 		buf = vb2_to_cedrus_buffer(vb);
+ 		cedrus_cavs2_buf_cleanup(ctx, buf);
+ 	}
+-	dma_free_attrs(dev->dev, CAVS2_NEIGHBOR_SIZE, ctx->codec.cavs2.neighbor,
++	dma_free_attrs(dev->dev, ctx->codec.cavs2.neighbor_size,
++		       ctx->codec.cavs2.neighbor,
+ 		       ctx->codec.cavs2.neighbor_dma, DMA_ATTR_NO_KERNEL_MAPPING);
+ 	dma_free_coherent(dev->dev, CAVS2_ENTRY_SIZE, ctx->codec.cavs2.entry,
+ 			  ctx->codec.cavs2.entry_dma);
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
+@@ -1,8 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /* Stateful H616 encoder sharing the decoder's hardware scheduler. */
+ #include <linux/module.h>
+-#include <linux/nvmem-consumer.h>
+-#include <linux/property.h>
+ #include <linux/iopoll.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/reset.h>
+@@ -30,11 +28,12 @@
+ {
+ 	struct v4l2_pix_format *pix = &f->fmt.pix;
+ 	bool jpeg = cedrus_enc_is_jpeg(ctx);
+-	u32 maximum = jpeg ? 8192 : 4096;
++	u32 max_width = jpeg ? CEDRUS_JPEG_ENC_MAX_WIDTH : 4096;
++	u32 max_height = jpeg ? CEDRUS_JPEG_ENC_MAX_HEIGHT : 4096;
+ 
+ 	if (f->type == V4L2_BUF_TYPE_VIDEO_OUTPUT) {
+-		pix->width = ALIGN(clamp_t(u32, pix->width, 96, maximum), 16);
+-		pix->height = ALIGN(clamp_t(u32, pix->height, 48, maximum), jpeg ? 8 : 16);
++		pix->width = ALIGN(clamp_t(u32, pix->width, 96, max_width), 16);
++		pix->height = ALIGN(clamp_t(u32, pix->height, 48, max_height), jpeg ? 8 : 16);
+ 		pix->pixelformat = V4L2_PIX_FMT_NV12;
+ 		pix->bytesperline = pix->width;
+ 		pix->sizeimage = pix->width * pix->height * 3 / 2;
+@@ -101,7 +100,7 @@
+ 		ctx->enc->timeperframe = *period;
+ 		return 0;
+ 	}
+-	ret = cedrus_h264_config(width, height, ctx->dev->encoder_soc_id,
++	ret = cedrus_h264_config(width, height,
+ 				 &period->numerator, &period->denominator, &level);
+ 	if (ret)
+ 		return ret;
+@@ -180,10 +179,10 @@
+ 	f->type = V4L2_FRMSIZE_TYPE_STEPWISE;
+ 	f->stepwise = (struct v4l2_frmsize_stepwise) {
+ 		.min_width = 96,
+-		.max_width = jpeg ? 8192 : 4096,
++		.max_width = jpeg ? CEDRUS_JPEG_ENC_MAX_WIDTH : 4096,
+ 		.step_width = 16,
+ 		.min_height = 48,
+-		.max_height = jpeg ? 8192 : 4096,
++		.max_height = jpeg ? CEDRUS_JPEG_ENC_MAX_HEIGHT : 4096,
+ 		.step_height = jpeg ? 8 : 16,
+ 	};
+ 	return 0;
+@@ -203,7 +202,7 @@
+ 	if (cedrus_enc_jpeg_format(f->pixel_format) ||
+ 	    (f->pixel_format == V4L2_PIX_FMT_NV12 && cedrus_enc_is_jpeg(ctx)))
+ 		return -ENOTTY;
+-	ret = cedrus_h264_config(f->width, f->height, ctx->dev->encoder_soc_id,
++	ret = cedrus_h264_config(f->width, f->height,
+ 				 &numerator, &denominator, &level);
+ 	if (ret)
+ 		return ret;
+@@ -627,11 +626,6 @@
+ 
+ 	if (!h264_encode || !(dev->capabilities & CEDRUS_CAPABILITY_H264_ENC))
+ 		return 0;
+-	if (device_property_present(dev->dev, "nvmem-cells")) {
+-		ret = nvmem_cell_read_variable_le_u32(dev->dev, "soc-id", &dev->encoder_soc_id);
+-		if (ret)
+-			return dev_err_probe(dev->dev, ret, "Cannot read encoder SoC ID\n");
+-	}
+ 	strscpy(vfd->name, "cedrus-encoder", sizeof(vfd->name));
+ 	vfd->vfl_dir = VFL_DIR_M2M;
+ 	vfd->fops = &cedrus_enc_fops;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.h b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.h
+@@ -66,24 +66,6 @@
+ 		CEDRUS_H264_STREAM_MAX : ALIGN(requested, 256);
+ }
+ 
+-static inline u32 cedrus_h264_fps_limit(u32 sid, u32 width)
+-{
+-	switch (sid) {
+-	case 0x5000:
+-	case 0x5400:
+-	case 0x6c00:
+-	case 0x7400:
+-	case 0x2400:
+-		return width > 3800 ? 25 : 0;
+-	case 0x5c00:
+-	case 0x7c00:
+-	case 0x2c00:
+-		return width >= 1901 ? 60 : 0;
+-	default:
+-		return 0;
+-	}
+-}
+-
+ static inline u32 cedrus_h264_gcd(u32 a, u32 b)
+ {
+ 	while (b) {
+@@ -95,12 +77,12 @@
+ 	return a;
+ }
+ 
+-static inline int cedrus_h264_config(u32 width, u32 height, u32 sid,
++static inline int cedrus_h264_config(u32 width, u32 height,
+ 				     u32 *numerator, u32 *denominator, u32 *level)
+ {
+ 	struct cedrus_h264_layout layout;
+ 	u32 n = *numerator, d = *denominator;
+-	u32 mbs, limit, divisor, i;
++	u32 mbs, divisor, i;
+ 	int ret;
+ 
+ 	ret = cedrus_h264_layout(width, height, &layout);
+@@ -119,11 +101,6 @@
+ 	if ((u64)d * mbs > (u64)n * 16711680) {
+ 		n = mbs;
+ 		d = 16711680;
+-	}
+-	limit = cedrus_h264_fps_limit(sid, width);
+-	if (limit && (u64)d > (u64)n * limit) {
+-		n = 1;
+-		d = limit;
+ 	}
+ 	divisor = cedrus_h264_gcd(n, d);
+ 	n /= divisor;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.c
+@@ -53,7 +53,8 @@
+ 	unsigned int i;
+ 	int ret;
+ 
+-	if (width < 96 || width > 8192 || height < 48 || height > 8192 ||
++	if (width < 96 || width > CEDRUS_JPEG_ENC_MAX_WIDTH ||
++	    height < 48 || height > CEDRUS_JPEG_ENC_MAX_HEIGHT ||
+ 	    (width & 15) || (height & 7) ||
+ 	    ctx->src_fmt.pixelformat != V4L2_PIX_FMT_NV12 ||
+ 	    ctx->src_fmt.bytesperline != width ||
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.h b/drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.h
+@@ -7,6 +7,8 @@
+ #include <media/v4l2-jpeg.h>
+ 
+ #define CEDRUS_JPEG_ENC_HEADER_SIZE 623U
++#define CEDRUS_JPEG_ENC_MAX_WIDTH ((2047U * 8) & ~15U)
++#define CEDRUS_JPEG_ENC_MAX_HEIGHT (2047U * 8)
+ 
+ struct cedrus_jpeg_enc_tables {
+ 	u8 quant[2][64];
+@@ -81,7 +83,8 @@
+ 	static const u8 jfif[] = { 'J', 'F', 'I', 'F', 0, 1, 1, 0, 0, 1, 0, 1, 0, 0 };
+ 	unsigned int i, component;
+ 
+-	if (!width || width > 8192 || !height || height > 8192)
++	if (!width || width > CEDRUS_JPEG_ENC_MAX_WIDTH ||
++	    !height || height > CEDRUS_JPEG_ENC_MAX_HEIGHT)
+ 		return -EINVAL;
+ 	cedrus_jpeg_enc_marker(writer, 0xd8);
+ 	cedrus_jpeg_enc_marker(writer, 0xe0);
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_h265.c b/drivers/staging/media/sunxi/cedrus/cedrus_h265.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_h265.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_h265.c
+@@ -440,6 +440,10 @@
+ 	    sps->pic_height_in_luma_samples > ctx->src_fmt.height)
+ 		return -EINVAL;
+ 
++	if (ctx->bit_depth > 8 &&
++	    ctx->src_fmt.width > CEDRUS_H265_10BIT_MAX_WIDTH)
++		return -ERANGE;
++
+ 	if (num_entry_point_offsets >
+ 	    CEDRUS_H265_ENTRY_POINTS_BUF_SIZE / (4 * sizeof(u32)))
+ 		return -ERANGE;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+@@ -214,8 +214,9 @@
+ 	unsigned long timeout;
+ 
+ 	/* Allow two seconds plus one JPEG frame at 45 megapixels per second. */
+-	if (ctx && !ctx->encoder &&
+-	    ctx->src_fmt.pixelformat == V4L2_PIX_FMT_JPEG)
++	if (ctx && ((!ctx->encoder &&
++		     ctx->src_fmt.pixelformat == V4L2_PIX_FMT_JPEG) ||
++		    (ctx->encoder && cedrus_enc_is_jpeg(ctx))))
+ 		timeout_ms += DIV_ROUND_UP(ctx->src_fmt.width * ctx->src_fmt.height,
+ 				   45000);
+ 	timeout = msecs_to_jiffies(timeout_ms);
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_video.c b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_video.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+@@ -214,14 +214,30 @@
+ 
+ 	pix_fmt->field = V4L2_FIELD_NONE;
+ 
++	if (cedrus_is_capable(ctx, CEDRUS_CAPABILITY_H265_8K_DEC)) {
++		switch (source_format) {
++		case V4L2_PIX_FMT_H264_SLICE:
++			max_height = 256U * 16;
++			break;
++		case V4L2_PIX_FMT_MPEG2_SLICE:
++		case V4L2_PIX_FMT_VP8_FRAME:
++		case V4L2_PIX_FMT_VC1_SLICE:
++			max_width = CEDRUS_MB_MAX_SIZE;
++			max_height = CEDRUS_MB_MAX_SIZE;
++			break;
++		}
++	}
++
+ 	if (source_format == V4L2_PIX_FMT_HEVC_SLICE &&
+ 	    cedrus_is_capable(ctx, CEDRUS_CAPABILITY_H265_8K_DEC)) {
+-		max_width = CEDRUS_H265_8K_MAX_WIDTH;
+-		max_height = CEDRUS_H265_8K_MAX_HEIGHT;
++		max_width = ctx->bit_depth > 8 ?
++			CEDRUS_H265_10BIT_MAX_WIDTH : CEDRUS_WIDE_MAX_SIZE;
++		max_height = CEDRUS_WIDE_MAX_SIZE;
+ 	} else if (source_format == V4L2_PIX_FMT_VP9_FRAME &&
+ 		   cedrus_is_capable(ctx, CEDRUS_CAPABILITY_VP9_8K_DEC)) {
+-		max_width = CEDRUS_VP9_8K_MAX_WIDTH;
+-		max_height = CEDRUS_VP9_8K_MAX_HEIGHT;
++		max_width = ctx->bit_depth > 8 ?
++			CEDRUS_VP9_10BIT_MAX_WIDTH : CEDRUS_WIDE_MAX_SIZE;
++		max_height = CEDRUS_WIDE_MAX_SIZE;
+ 	} else if (source_format == V4L2_PIX_FMT_JPEG) {
+ 		max_width = cedrus_is_capable(ctx, CEDRUS_CAPABILITY_JPEG_16K_DEC) ?
+ 			CEDRUS_JPEG_MAX_SIZE : 2048U;
+@@ -229,8 +245,12 @@
+ 	}
+ 
+ 	if (source_format == V4L2_PIX_FMT_CAVS_FRAME) {
+-		max_width = 1920;
+-		max_height = 1088;
++		max_width = CEDRUS_MB_MAX_SIZE;
++		max_height = CEDRUS_MB_MAX_SIZE;
++	} else if (source_format == V4L2_PIX_FMT_CAVS2_FRAME) {
++		max_width = ctx->bit_depth > 8 ?
++			CEDRUS_VP9_10BIT_MAX_WIDTH : CEDRUS_WIDE_MAX_SIZE;
++		max_height = CEDRUS_WIDE_MAX_SIZE;
+ 	}
+ 
+ 	/* Limit to hardware min/max. */
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_video.h b/drivers/staging/media/sunxi/cedrus/cedrus_video.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_video.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_video.h
+@@ -16,6 +16,8 @@
+ #ifndef _CEDRUS_VIDEO_H_
+ #define _CEDRUS_VIDEO_H_
+ 
++#include <linux/bits.h>
++
+ struct cedrus_format {
+ 	u32		pixelformat;
+ 	u32		directions;
+@@ -28,10 +30,13 @@
+ #define CEDRUS_MIN_HEIGHT	16U
+ #define CEDRUS_MAX_WIDTH	4096U
+ #define CEDRUS_MAX_HEIGHT	2304U
+-#define CEDRUS_H265_8K_MAX_WIDTH	7680U
+-#define CEDRUS_H265_8K_MAX_HEIGHT	4320U
+-#define CEDRUS_VP9_8K_MAX_WIDTH	7680U
+-#define CEDRUS_VP9_8K_MAX_HEIGHT	4320U
++/* Eight-bit macroblock counts store values from 1 through 255. */
++#define CEDRUS_MB_MAX_SIZE	(255U * 16)
++/* Keep aligned dimensions inside the 14-bit picture fields. */
++#define CEDRUS_WIDE_MAX_SIZE	(GENMASK(13, 0) & ~31U)
++/* Align low-bit strides to 32 bytes. */
++#define CEDRUS_H265_10BIT_MAX_WIDTH	((GENMASK(10, 0) & ~31U) * 4)
++#define CEDRUS_VP9_10BIT_MAX_WIDTH	((GENMASK(11, 0) & ~31U) * 4)
+ #define CEDRUS_JPEG_MAX_SIZE	16384U
+ 
+ extern const struct v4l2_ioctl_ops cedrus_ioctl_ops;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_vp9.c b/drivers/staging/media/sunxi/cedrus/cedrus_vp9.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_vp9.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_vp9.c
+@@ -757,6 +757,10 @@
+ 	if (cur_w > ctx->src_fmt.width || cur_h > ctx->src_fmt.height)
+ 		return -EINVAL;
+ 
++	if (dec->bit_depth > 8 &&
++	    ctx->src_fmt.width > CEDRUS_VP9_10BIT_MAX_WIDTH)
++		return -ERANGE;
++
+ 	p010 = cedrus_dst_is_p010(ctx);
+ 	afbc = cedrus_dst_is_afbc(ctx);
+ 
+-- 
+Armbian
