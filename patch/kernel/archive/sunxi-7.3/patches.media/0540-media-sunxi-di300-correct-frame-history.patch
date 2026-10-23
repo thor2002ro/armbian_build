@@ -1,0 +1,298 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] media: sunxi: di300: require real motion references
+
+Match output timestamps to the processed source.
+Use single-field bob when temporal references are missing.
+Return source buffers with one retained motion reference.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
+--- a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
++++ b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
+@@ -25,6 +25,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/reset.h>
++#include <linux/string.h>
+ 
+ #include <media/v4l2-device.h>
+ #include <media/v4l2-ioctl.h>
+@@ -184,11 +185,28 @@
+ 	deinterlace_write(dev, hreg, 0);
+ }
+ 
++static void deinterlace_bob(struct deinterlace_ctx *ctx)
++{
++	struct deinterlace_dev *dev = ctx->dev;
++	struct vb2_v4l2_buffer *dst = ctx->bob_field ? ctx->dst1 : ctx->dst0;
++	dma_addr_t out = vb2_dma_contig_plane_dma_addr(&dst->vb2_buf, 0);
++
++	deinterlace_write(dev, DEINTERLACE_FIELD_ORDER,
++			  (ctx->first_field ^ ctx->bob_field) ?
++			  DEINTERLACE_FIELD_ORDER_BFF : 0);
++	deinterlace_write_out_addr(dev, DEINTERLACE_OUT_DIT1_ADDR(0),
++				   DEINTERLACE_OUT_DIT1_HADDR, out,
++				   &ctx->dst_fmt);
++	deinterlace_set_bits(dev, DEINTERLACE_INT_CTL,
++			     DEINTERLACE_INT_CTL_FINISH_EN);
++	deinterlace_set_bits(dev, DEINTERLACE_START, DEINTERLACE_START_EN);
++}
++
+ static void deinterlace_device_run(void *priv)
+ {
+ 	struct deinterlace_ctx *ctx = priv;
+ 	struct deinterlace_dev *dev = ctx->dev;
+-	struct vb2_v4l2_buffer *src, *dst0, *dst1;
++	struct vb2_v4l2_buffer *src, *next_src, *dst0, *dst1;
+ 	struct v4l2_m2m_buffer *b;
+ 	dma_addr_t next, curr, prev, out0, out1;
+ 	unsigned int hwfmt = deinterlace_hw_format(ctx->src_fmt.pixelformat);
+@@ -196,6 +214,13 @@
+ 	bool motion;
+ 
+ 	src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
++	next_src = NULL;
++	v4l2_m2m_for_each_src_buf(ctx->fh.m2m_ctx, b) {
++		if (&b->vb == src)
++			continue;
++		next_src = &b->vb;
++		break;
++	}
+ 
+ 	/*
+ 	 * Pick the two buffers actually at the front of the ready
+@@ -222,21 +247,14 @@
+ 	v4l2_m2m_buf_copy_metadata(src, dst0);
+ 	v4l2_m2m_buf_copy_metadata(src, dst1);
+ 
+-	next = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0);
+-	curr = ctx->prev[0] ?
+-		vb2_dma_contig_plane_dma_addr(&ctx->prev[0]->vb2_buf, 0) : next;
+-	prev = ctx->prev[1] ?
+-		vb2_dma_contig_plane_dma_addr(&ctx->prev[1]->vb2_buf, 0) : curr;
+-
+-	/*
+-	 * A single real temporal neighbour (prev[0]) is enough to turn
+-	 * motion mode on: the missing prev[1] slot then just duplicates
+-	 * curr, which reads as "no motion" between those two and leaves
+-	 * the genuine next-vs-curr comparison to drive the spatial/
+-	 * temporal blend. Requiring both slots real only delays real
+-	 * motion-adaptive output by an extra frame at stream start.
+-	 */
+-	motion = ctx->prev[0] != NULL;
++	curr = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0);
++	motion = ctx->prev && next_src;
++	if (motion && !ctx->motion) {
++		memset(ctx->flag1_buf, 0, DEINTERLACE_FLAG_SIZE);
++		memset(ctx->flag2_buf, 0, DEINTERLACE_FLAG_SIZE);
++	}
++	ctx->motion = motion;
++	ctx->bob_field = 0;
+ 
+ 	deinterlace_write(dev, DEINTERLACE_SIZE,
+ 			  DEINTERLACE_SIZE_WIDTH(ctx->src_fmt.width) |
+@@ -266,38 +284,44 @@
+ 		deinterlace_write(dev, DEINTERLACE_OUT_DIT_PITCH(i), out_pitch);
+ 	}
+ 
+-	/* IN_F0 is the past, IN_F1 the current and IN_F2 the future frame */
+-	deinterlace_write_in_addr(dev, DEINTERLACE_IN_F0_TOP_ADDR(0),
+-				  DEINTERLACE_IN_F0_TOP_HADDR,
+-				  DEINTERLACE_IN_F0_BOT_ADDR(0),
+-				  DEINTERLACE_IN_F0_BOT_HADDR,
+-				  prev, &ctx->src_fmt);
++	/* Bob reads only IN_F1. Motion needs both temporal references. */
+ 	deinterlace_write_in_addr(dev, DEINTERLACE_IN_F1_TOP_ADDR(0),
+ 				  DEINTERLACE_IN_F1_TOP_HADDR,
+ 				  DEINTERLACE_IN_F1_BOT_ADDR(0),
+ 				  DEINTERLACE_IN_F1_BOT_HADDR,
+ 				  curr, &ctx->src_fmt);
+-	deinterlace_write_in_addr(dev, DEINTERLACE_IN_F2_TOP_ADDR(0),
+-				  DEINTERLACE_IN_F2_TOP_HADDR,
+-				  DEINTERLACE_IN_F2_BOT_ADDR(0),
+-				  DEINTERLACE_IN_F2_BOT_HADDR,
+-				  next, &ctx->src_fmt);
+-
+-	out0 = vb2_dma_contig_plane_dma_addr(&dst0->vb2_buf, 0);
+-	out1 = vb2_dma_contig_plane_dma_addr(&dst1->vb2_buf, 0);
+-	deinterlace_write_out_addr(dev, DEINTERLACE_OUT_DIT0_ADDR(0),
+-				   DEINTERLACE_OUT_DIT0_HADDR, out0,
+-				   &ctx->dst_fmt);
+-	deinterlace_write_out_addr(dev, DEINTERLACE_OUT_DIT1_ADDR(0),
+-				   DEINTERLACE_OUT_DIT1_HADDR, out1,
+-				   &ctx->dst_fmt);
+-
+-	deinterlace_write(dev, DEINTERLACE_FLAG_PITCH, 0x200);
+-	deinterlace_write(dev, DEINTERLACE_IN_FLAG_ADDR, ctx->flag1_buf_dma);
+-	deinterlace_write(dev, DEINTERLACE_OUT_FLAG_ADDR, ctx->flag2_buf_dma);
+-	deinterlace_write(dev, DEINTERLACE_FLAG_HADDR, 0);
+-	swap(ctx->flag1_buf_dma, ctx->flag2_buf_dma);
+-	swap(ctx->flag1_buf, ctx->flag2_buf);
++	if (motion) {
++		prev = vb2_dma_contig_plane_dma_addr(&ctx->prev->vb2_buf, 0);
++		next = vb2_dma_contig_plane_dma_addr(&next_src->vb2_buf, 0);
++		deinterlace_write_in_addr(dev, DEINTERLACE_IN_F0_TOP_ADDR(0),
++					  DEINTERLACE_IN_F0_TOP_HADDR,
++					  DEINTERLACE_IN_F0_BOT_ADDR(0),
++					  DEINTERLACE_IN_F0_BOT_HADDR,
++					  prev, &ctx->src_fmt);
++		deinterlace_write_in_addr(dev, DEINTERLACE_IN_F2_TOP_ADDR(0),
++					  DEINTERLACE_IN_F2_TOP_HADDR,
++					  DEINTERLACE_IN_F2_BOT_ADDR(0),
++					  DEINTERLACE_IN_F2_BOT_HADDR,
++					  next, &ctx->src_fmt);
++
++		out0 = vb2_dma_contig_plane_dma_addr(&dst0->vb2_buf, 0);
++		out1 = vb2_dma_contig_plane_dma_addr(&dst1->vb2_buf, 0);
++		deinterlace_write_out_addr(dev, DEINTERLACE_OUT_DIT0_ADDR(0),
++					   DEINTERLACE_OUT_DIT0_HADDR, out0,
++					   &ctx->dst_fmt);
++		deinterlace_write_out_addr(dev, DEINTERLACE_OUT_DIT1_ADDR(0),
++					   DEINTERLACE_OUT_DIT1_HADDR, out1,
++					   &ctx->dst_fmt);
++
++		deinterlace_write(dev, DEINTERLACE_FLAG_PITCH, 0x200);
++		deinterlace_write(dev, DEINTERLACE_IN_FLAG_ADDR, ctx->flag1_buf_dma);
++		deinterlace_write(dev, DEINTERLACE_OUT_FLAG_ADDR, ctx->flag2_buf_dma);
++		deinterlace_write(dev, DEINTERLACE_FLAG_HADDR, 0);
++		swap(ctx->flag1_buf_dma, ctx->flag2_buf_dma);
++		swap(ctx->flag1_buf, ctx->flag2_buf);
++	} else {
++		deinterlace_write(dev, DEINTERLACE_FLAG_PITCH, 0);
++	}
+ 
+ 	/*
+ 	 * Restrict the deinterlace and motion-detect blocks to the full
+@@ -317,14 +341,7 @@
+ 		reg |= DEINTERLACE_FUNC_EN_MD;
+ 	deinterlace_write(dev, DEINTERLACE_FUNC_EN, reg);
+ 
+-	/*
+-	 * The mode bits select interpolation over weaving, so they stay set
+-	 * even without a temporal neighbour: that is the vendor's bob mode.
+-	 * Cleared they select weave, which outputs the fields woven back
+-	 * together, i.e. still interlaced. Motion blending needs the motion
+-	 * detector and so only comes on with it. The demo window enables
+-	 * are set as the vendor driver sets them.
+-	 */
++	/* Match the vendor's motion mode or single-field bob mode. */
+ 	reg = DEINTERLACE_DIT_SETTING_MODE_LUMA |
+ 	      DEINTERLACE_DIT_SETTING_MODE_CHROMA |
+ 	      DEINTERLACE_DIT_SETTING_DIAG_INTP_EN |
+@@ -332,17 +349,25 @@
+ 	if (motion)
+ 		reg |= DEINTERLACE_DIT_SETTING_MOTION_BLEND_LUMA |
+ 		       DEINTERLACE_DIT_SETTING_MOTION_BLEND_CHROMA;
++	else
++		reg |= DEINTERLACE_DIT_SETTING_OUTPUT_1FRAME;
+ 	deinterlace_write(dev, DEINTERLACE_DIT_SETTING, reg);
+ 
+ 	deinterlace_write(dev, DEINTERLACE_DIT_INTER_PARA,
+ 			  DEINTERLACE_DIT_INTER_PARA_DEFAULT);
+ 
+-	reg = DEINTERLACE_DMA_CTL_C | DEINTERLACE_DMA_CTL_P |
+-	      DEINTERLACE_DMA_CTL_DI | DEINTERLACE_DMA_CTL_W0 |
+-	      DEINTERLACE_DMA_CTL_W1 | DEINTERLACE_DMA_CTL_MCLK_GATE;
++	reg = DEINTERLACE_DMA_CTL_P | DEINTERLACE_DMA_CTL_W1 |
++	      DEINTERLACE_DMA_CTL_MCLK_GATE;
+ 	if (motion)
+-		reg |= DEINTERLACE_DMA_CTL_FR | DEINTERLACE_DMA_CTL_FW;
++		reg |= DEINTERLACE_DMA_CTL_C | DEINTERLACE_DMA_CTL_DI |
++		       DEINTERLACE_DMA_CTL_W0 | DEINTERLACE_DMA_CTL_FR |
++		       DEINTERLACE_DMA_CTL_FW;
+ 	deinterlace_write(dev, DEINTERLACE_DMA_CTL, reg);
++
++	if (!motion) {
++		deinterlace_bob(ctx);
++		return;
++	}
+ 
+ 	deinterlace_set_bits(dev, DEINTERLACE_INT_CTL,
+ 			     DEINTERLACE_INT_CTL_FINISH_EN);
+@@ -386,6 +411,13 @@
+ 	deinterlace_write(dev, DEINTERLACE_INT_CTL, 0);
+ 	deinterlace_set_bits(dev, DEINTERLACE_STATUS, DEINTERLACE_STATUS_FINISH);
+ 	deinterlace_clr_bits(dev, DEINTERLACE_START, DEINTERLACE_START_EN);
++
++	/* Bob needs two runs. Keep the buffers until both fields complete. */
++	if (!ctx->motion && !ctx->bob_field && !ctx->aborting) {
++		ctx->bob_field = 1;
++		deinterlace_bob(ctx);
++		return IRQ_HANDLED;
++	}
+ 
+ 	state = ctx->aborting ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE;
+ 
+@@ -397,10 +429,9 @@
+ 	v4l2_m2m_buf_done(dst1, state);
+ 
+ 	src = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
+-	if (ctx->prev[1])
+-		v4l2_m2m_buf_done(ctx->prev[1], state);
+-	ctx->prev[1] = ctx->prev[0];
+-	ctx->prev[0] = src;
++	if (ctx->prev)
++		v4l2_m2m_buf_done(ctx->prev, state);
++	ctx->prev = src;
+ 
+ 	v4l2_m2m_job_finish(ctx->dev->m2m_dev, ctx->fh.m2m_ctx);
+ 
+@@ -725,12 +756,9 @@
+ 	} while (vbuf);
+ 
+ 	if (V4L2_TYPE_IS_OUTPUT(vq->type)) {
+-		if (ctx->prev[0])
+-			v4l2_m2m_buf_done(ctx->prev[0], state);
+-		if (ctx->prev[1])
+-			v4l2_m2m_buf_done(ctx->prev[1], state);
+-		ctx->prev[0] = NULL;
+-		ctx->prev[1] = NULL;
++		if (ctx->prev)
++			v4l2_m2m_buf_done(ctx->prev, state);
++		ctx->prev = NULL;
+ 	}
+ }
+ 
+@@ -751,8 +779,8 @@
+ 		ctx->first_field =
+ 			ctx->src_fmt.field == V4L2_FIELD_INTERLACED_BT;
+ 
+-		ctx->prev[0] = NULL;
+-		ctx->prev[1] = NULL;
++		ctx->prev = NULL;
++		ctx->motion = false;
+ 		ctx->aborting = 0;
+ 
+ 		ctx->flag1_buf = dma_alloc_coherent(dev, DEINTERLACE_FLAG_SIZE,
+@@ -821,6 +849,7 @@
+ 	int ret;
+ 
+ 	src_vq->type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
++	src_vq->min_queued_buffers = 2;
+ 	src_vq->io_modes = VB2_MMAP | VB2_DMABUF;
+ 	src_vq->drv_priv = ctx;
+ 	src_vq->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
+diff --git a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.h b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.h
+--- a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.h
++++ b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.h
+@@ -163,14 +163,16 @@
+ 	void			*flag2_buf;
+ 	dma_addr_t		flag2_buf_dma;
+ 
+-	/* prev[0]: one frame back, prev[1]: two frames back */
+-	struct vb2_v4l2_buffer	*prev[2];
++	/* Previous source retained as a motion reference. */
++	struct vb2_v4l2_buffer	*prev;
+ 
+ 	/* destination buffers picked for the in-flight job */
+ 	struct vb2_v4l2_buffer	*dst0;
+ 	struct vb2_v4l2_buffer	*dst1;
+ 
+ 	unsigned int		first_field;
++	unsigned int		bob_field;
++	bool			motion;
+ 
+ 	int			aborting;
+ };
