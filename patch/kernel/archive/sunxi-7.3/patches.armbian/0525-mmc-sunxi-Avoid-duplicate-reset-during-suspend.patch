@@ -1,0 +1,22 @@
+From a78da076992fbe611b0e85c79e103eb1e9ec453b Mon Sep 17 00:00:00 2001
+From: Jernej Skrabec <jernej.skrabec@gmail.com>
+Date: Sat, 22 Aug 2026 07:29:37 +0200
+Subject: [PATCH 23/33] mmc: sunxi: Avoid duplicate reset during suspend
+
+sunxi_mmc_disable() already resets the controller before gating clocks.
+
+Fixes: 9a8e1e8cc2c0 ("mmc: sunxi: Add runtime_pm support")
+Signed-off-by: Jernej Skrabec <jernej.skrabec@gmail.com>
+
+---
+diff --git a/drivers/mmc/host/sunxi-mmc.c b/drivers/mmc/host/sunxi-mmc.c
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -1615,7 +1615,6 @@
+ 	 */
+ 	sunxi_mmc_oclk_onoff(host, 0);
+ 
+-	sunxi_mmc_reset_host(host);
+ 	sunxi_mmc_disable(host);
+ 
+ 	return 0;
