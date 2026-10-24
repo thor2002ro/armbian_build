@@ -1,0 +1,1012 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: avcodec: add JPEG and MJPEG V4L2 decoding
+
+Decode 8-bit sequential JPEG and MJPEG with requests or direct M2M queues.
+Preserve frame geometry, stream tables, and packet metadata.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/configure b/configure
+--- a/configure
++++ b/configure
+@@ -3445,6 +3445,9 @@
+ hevc_vulkan_hwaccel_select="hevc_decoder"
+ mjpeg_nvdec_hwaccel_deps="nvdec"
+ mjpeg_nvdec_hwaccel_select="mjpeg_decoder"
++mjpeg_v4l2request_hwaccel_deps="v4l2_request"
++mjpeg_v4l2request_hwaccel_select="mjpeg_decoder"
++mjpeg_v4l2m2m_decoder_deps="v4l2_m2m"
+ mjpeg_vaapi_hwaccel_deps="vaapi"
+ mjpeg_vaapi_hwaccel_select="mjpeg_decoder"
+ mpeg1_nvdec_hwaccel_deps="nvdec"
+diff --git a/libavcodec/Makefile b/libavcodec/Makefile
+--- a/libavcodec/Makefile
++++ b/libavcodec/Makefile
+@@ -541,6 +541,8 @@
+ OBJS-$(CONFIG_MJPEG_ENCODER)           += mjpegenc.o mjpegenc_common.o \
+                                           mjpegenc_huffman.o gain_map.o
+ OBJS-$(CONFIG_MJPEG_V4L2M2M_ENCODER)   += v4l2_m2m_enc.o
++OBJS-$(CONFIG_MJPEG_V4L2M2M_DECODER)   += v4l2_m2m_jpeg.o v4l2_jpeg.o jpegtables.o
++OBJS-$(CONFIG_MJPEG_V4L2REQUEST_HWACCEL) += v4l2_request_mjpeg.o v4l2_jpeg.o jpegtables.o
+ OBJS-$(CONFIG_MJPEGB_DECODER)          += mjpegbdec.o
+ OBJS-$(CONFIG_MJPEG_CUVID_DECODER)     += cuviddec.o
+ OBJS-$(CONFIG_MJPEG_QSV_ENCODER)       += qsvenc_jpeg.o
+diff --git a/libavcodec/allcodecs.c b/libavcodec/allcodecs.c
+--- a/libavcodec/allcodecs.c
++++ b/libavcodec/allcodecs.c
+@@ -903,6 +903,7 @@
+ extern const FFCodec ff_libkvazaar_encoder;
+ extern const FFCodec ff_mjpeg_cuvid_decoder;
+ extern const FFCodec ff_mjpeg_v4l2m2m_encoder;
++extern const FFCodec ff_mjpeg_v4l2m2m_decoder;
+ extern const FFCodec ff_mjpeg_qsv_encoder;
+ extern const FFCodec ff_mjpeg_qsv_decoder;
+ extern const FFCodec ff_mjpeg_vaapi_encoder;
+diff --git a/libavcodec/hwaccels.h b/libavcodec/hwaccels.h
+--- a/libavcodec/hwaccels.h
++++ b/libavcodec/hwaccels.h
+@@ -61,6 +61,7 @@
+ extern const struct FFHWAccel ff_hevc_vulkan_hwaccel;
+ extern const struct FFHWAccel ff_mjpeg_nvdec_hwaccel;
+ extern const struct FFHWAccel ff_mjpeg_vaapi_hwaccel;
++extern const struct FFHWAccel ff_mjpeg_v4l2request_hwaccel;
+ extern const struct FFHWAccel ff_mpeg1_nvdec_hwaccel;
+ extern const struct FFHWAccel ff_mpeg1_nvdec_cuarray_hwaccel;
+ extern const struct FFHWAccel ff_mpeg1_vdpau_hwaccel;
+diff --git a/libavcodec/mjpegdec.c b/libavcodec/mjpegdec.c
+--- a/libavcodec/mjpegdec.c
++++ b/libavcodec/mjpegdec.c
+@@ -33,6 +33,10 @@
+ #include "config_components.h"
+ 
+ #include "libavutil/attributes.h"
++#if CONFIG_MJPEG_V4L2REQUEST_HWACCEL
++#include "libavutil/hwcontext.h"
++#include "libavutil/hwcontext_v4l2request.h"
++#endif
+ #include "libavutil/imgutils.h"
+ #include "libavutil/avassert.h"
+ #include "libavutil/mem.h"
+@@ -307,6 +311,21 @@
+     }
+     return 0;
+ }
++
++#if CONFIG_MJPEG_V4L2REQUEST_HWACCEL
++static int mjpeg_v4l2request_needs_reinit(const MJpegDecodeContext *s)
++{
++    const AVHWFramesContext *frames;
++    const AVV4L2RequestFramesContext *ctx;
++    if (!s->avctx->hw_frames_ctx)
++        return 0;
++    frames = (const AVHWFramesContext *)s->avctx->hw_frames_ctx->data;
++    if (frames->device_ctx->type != AV_HWDEVICE_TYPE_V4L2REQUEST)
++        return 0;
++    ctx = frames->hwctx;
++    return (uint64_t)s->raw_image_buffer_size + 2048 > ctx->output_buffer_size;
++}
++#endif
+ 
+ int ff_mjpeg_decode_sof(MJpegDecodeContext *s)
+ {
+@@ -748,10 +767,17 @@
+             return AVERROR_BUG;
+         }
+ 
+-        if (s->avctx->pix_fmt == s->hwaccel_sw_pix_fmt && !size_change) {
++        if (s->avctx->pix_fmt == s->hwaccel_sw_pix_fmt && !size_change
++#if CONFIG_MJPEG_V4L2REQUEST_HWACCEL
++            && !mjpeg_v4l2request_needs_reinit(s)
++#endif
++        ) {
+             s->avctx->pix_fmt = s->hwaccel_pix_fmt;
+         } else {
+             enum AVPixelFormat pix_fmts[] = {
++#if CONFIG_MJPEG_V4L2REQUEST_HWACCEL
++                AV_PIX_FMT_DRM_PRIME,
++#endif
+ #if CONFIG_MJPEG_NVDEC_HWACCEL
+                 AV_PIX_FMT_CUDA,
+ #endif
+@@ -3018,6 +3044,9 @@
+                       FF_CODEC_CAP_SKIP_FRAME_FILL_PARAM |
+                       FF_CODEC_CAP_ICC_PROFILES,
+     .hw_configs     = (const AVCodecHWConfigInternal *const []) {
++#if CONFIG_MJPEG_V4L2REQUEST_HWACCEL
++                        HWACCEL_V4L2REQUEST(mjpeg),
++#endif
+ #if CONFIG_MJPEG_NVDEC_HWACCEL
+                         HWACCEL_NVDEC(mjpeg),
+ #endif
+diff --git a/libavcodec/v4l2_request.c b/libavcodec/v4l2_request.c
+--- a/libavcodec/v4l2_request.c
++++ b/libavcodec/v4l2_request.c
+@@ -250,7 +250,7 @@
+         goto fail;
+ 
+     while (ctx->queued_capture & (UINT64_C(1) << index)) {
+-        int ret = poll(&pollfd, 1, 2000);
++        int ret = poll(&pollfd, 1, ctx->timeout_ms);
+         if (ret <= 0)
+             goto fail;
+ 
+@@ -296,7 +296,7 @@
+ 
+     // Wait on the specific OUTPUT buffer
+     while (ctx->queued_output & (1 << output->index)) {
+-        int ret = poll(&pollfd, 1, 2000);
++        int ret = poll(&pollfd, 1, ctx->timeout_ms);
+         if (ret <= 0)
+             goto fail;
+ 
+@@ -329,7 +329,7 @@
+ 
+     // Wait on the specific request to complete
+     while (ctx->queued_request & (1 << output->index)) {
+-        int ret = poll(&pollfd, 1, 2000);
++        int ret = poll(&pollfd, 1, ctx->timeout_ms);
+         if (ret <= 0)
+             break;
+ 
+@@ -585,7 +585,7 @@
+ 
+     // Wait on any remaining OUTPUT buffer
+     while (ctx->queued_output) {
+-        int ret = poll(&pollfd, 1, 2000);
++        int ret = poll(&pollfd, 1, ctx->timeout_ms);
+         if (ret <= 0)
+             break;
+ 
+@@ -745,6 +745,7 @@
+     ctx->av_class = &v4l2_request_context_class;
+     ctx->init_controls = control;
+     ctx->nb_init_controls = count;
++    ctx->timeout_ms = 2000;
+     ff_mutex_init(&ctx->mutex, NULL);
+     for (int i = 0; i < FF_ARRAY_ELEMS(ctx->output); i++) {
+         ctx->output[i].index = i;
+diff --git a/libavcodec/v4l2_request.h b/libavcodec/v4l2_request.h
+--- a/libavcodec/v4l2_request.h
++++ b/libavcodec/v4l2_request.h
+@@ -53,6 +53,7 @@
+     uint64_t errored_capture;
+     struct v4l2_ext_control *init_controls;
+     int nb_init_controls;
++    unsigned timeout_ms;
+ } V4L2RequestContext;
+ 
+ typedef struct V4L2RequestPictureContext {
+diff --git a/libavutil/hwcontext_v4l2request.h b/libavutil/hwcontext_v4l2request.h
+--- a/libavutil/hwcontext_v4l2request.h
++++ b/libavutil/hwcontext_v4l2request.h
+@@ -65,6 +65,9 @@
+      */
+     struct v4l2_ext_control *init_controls;
+     int nb_init_controls;
++
++    /** Minimum coded OUTPUT buffer size. Zero selects the default. */
++    uint32_t output_buffer_size;
+ } AVV4L2RequestFramesContext;
+ 
+ #endif /* AVUTIL_HWCONTEXT_V4L2REQUEST_H */
+diff --git a/libavutil/hwcontext_v4l2request.c b/libavutil/hwcontext_v4l2request.c
+--- a/libavutil/hwcontext_v4l2request.c
++++ b/libavutil/hwcontext_v4l2request.c
+@@ -711,6 +711,7 @@
+         return AVERROR(ENOMEM);
+ 
+     buffersize = FFMAX(hwfc->width * hwfc->height * 3 / 2, 256 * 1024);
++    buffersize = FFMAX(buffersize, fctx->output_buffer_size);
+ 
+     // Probe all media devices (auto-detection)
+     ret = v4l2request_probe_media_devices(hwfc, udev, fctx->pixelformat, buffersize);
+diff --git a/libavcodec/v4l2_jpeg.h b/libavcodec/v4l2_jpeg.h
+new file mode 100644
+--- /dev/null
++++ b/libavcodec/v4l2_jpeg.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#ifndef AVCODEC_V4L2_JPEG_H
++#define AVCODEC_V4L2_JPEG_H
++
++#include <stdint.h>
++#include "packet.h"
++
++typedef struct V4L2JPEGContext {
++    uint8_t quant[4][64];
++    unsigned quant_mask;
++    uint8_t huffman[4][273];
++    unsigned huffman_size[4];
++} V4L2JPEGContext;
++
++void ff_v4l2_jpeg_reset(V4L2JPEGContext *ctx);
++int ff_v4l2_jpeg_prepare(V4L2JPEGContext *ctx, const AVPacket *input,
++                         AVPacket *output, int *width, int *height);
++
++#endif
+diff --git a/libavcodec/v4l2_jpeg.c b/libavcodec/v4l2_jpeg.c
+new file mode 100644
+--- /dev/null
++++ b/libavcodec/v4l2_jpeg.c
+@@ -0,0 +1,220 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#include <limits.h>
++#include <string.h>
++#include "libavutil/error.h"
++#include "libavutil/intreadwrite.h"
++#include "defs.h"
++#include "jpegtables.h"
++#include "v4l2_jpeg.h"
++
++static void jpeg_default_huffman(V4L2JPEGContext *ctx, unsigned index,
++                                  const uint8_t *bits, const uint8_t *values,
++                                  unsigned count)
++{
++    ctx->huffman[index][0] = (index / 2) << 4 | (index % 2);
++    memcpy(ctx->huffman[index] + 1, bits + 1, 16);
++    memcpy(ctx->huffman[index] + 17, values, count);
++    ctx->huffman_size[index] = 17 + count;
++}
++
++void ff_v4l2_jpeg_reset(V4L2JPEGContext *ctx)
++{
++    memset(ctx, 0, sizeof(*ctx));
++    jpeg_default_huffman(ctx, 0, ff_mjpeg_bits_dc_luminance, ff_mjpeg_val_dc, 12);
++    jpeg_default_huffman(ctx, 1, ff_mjpeg_bits_dc_chrominance, ff_mjpeg_val_dc, 12);
++    jpeg_default_huffman(ctx, 2, ff_mjpeg_bits_ac_luminance, ff_mjpeg_val_ac_luminance, 162);
++    jpeg_default_huffman(ctx, 3, ff_mjpeg_bits_ac_chrominance, ff_mjpeg_val_ac_chrominance, 162);
++}
++
++static int jpeg_quant_tables(V4L2JPEGContext *ctx, const uint8_t *data, unsigned size)
++{
++    while (size) {
++        unsigned index = *data++;
++        size--;
++        if (index > 3 || size < 64)
++            return AVERROR_INVALIDDATA;
++        for (unsigned i = 0; i < 64; i++)
++            if (!data[i])
++                return AVERROR_INVALIDDATA;
++        memcpy(ctx->quant[index], data, 64);
++        ctx->quant_mask |= 1U << index;
++        data += 64;
++        size -= 64;
++    }
++    return 0;
++}
++
++static int jpeg_huffman_tables(V4L2JPEGContext *ctx, const uint8_t *data, unsigned size)
++{
++    while (size) {
++        unsigned selector, index, count = 0;
++        int slots = 1;
++        uint8_t symbols[256] = { 0 };
++        if (size < 17)
++            return AVERROR_INVALIDDATA;
++        selector = data[0];
++        if ((selector & ~0x11U) || (selector & 15) > 1)
++            return AVERROR(ENOSYS);
++        index = (selector >> 4) * 2 + (selector & 1);
++        for (unsigned i = 0; i < 16; i++) {
++            count += data[1 + i];
++            slots = slots * 2 - data[1 + i];
++            if (slots < 0)
++                return AVERROR_INVALIDDATA;
++        }
++        if (!count || count > (index < 2 ? 12 : 162) || size < 17 + count)
++            return AVERROR_INVALIDDATA;
++        for (unsigned i = 0; i < count; i++) {
++            unsigned value = data[17 + i];
++            if (symbols[value]++ || (index < 2 && value > 11) ||
++                (index >= 2 && ((value & 15) > 10 ||
++                 (!(value & 15) && value != 0 && value != 0xf0))))
++                return AVERROR_INVALIDDATA;
++        }
++        ctx->huffman_size[index] = 17 + count;
++        memcpy(ctx->huffman[index], data, 17 + count);
++        data += 17 + count;
++        size -= 17 + count;
++    }
++    return 0;
++}
++
++int ff_v4l2_jpeg_prepare(V4L2JPEGContext *ctx, const AVPacket *input,
++                         AVPacket *output, int *width, int *height)
++{
++    V4L2JPEGContext next = *ctx;
++    const uint8_t *data = input->data;
++    unsigned size = input->size, pos = 2, prefix = 0, end = 0;
++    uint8_t ids[3] = { 0 }, quant[3] = { 0 }, dc[3] = { 0 }, ac[3] = { 0 };
++    int frame = 0, scan = 0, w = 0, h = 0, ret;
++    uint8_t *dst;
++
++    if (!data || input->size < 4 || AV_RB16(data) != 0xffd8)
++        return AVERROR_INVALIDDATA;
++    while (pos < size) {
++        unsigned marker, length, n;
++        const uint8_t *p;
++        if (data[pos++] != 0xff)
++            return AVERROR_INVALIDDATA;
++        while (pos < size && data[pos] == 0xff)
++            pos++;
++        if (pos >= size)
++            return AVERROR_INVALIDDATA;
++        marker = data[pos++];
++        if (marker == 0xd9 || marker == 0xd8 || marker == 0 ||
++            (marker >= 0xd0 && marker <= 0xd7) || size - pos < 2)
++            return AVERROR_INVALIDDATA;
++        length = AV_RB16(data + pos);
++        if (length < 2 || length > size - pos)
++            return AVERROR_INVALIDDATA;
++        p = data + pos + 2;
++        n = length - 2;
++        pos += length;
++        if (marker == 0xdb) {
++            ret = jpeg_quant_tables(&next, p, n);
++            if (ret < 0)
++                return ret;
++        } else if (marker == 0xc4) {
++            ret = jpeg_huffman_tables(&next, p, n);
++            if (ret < 0)
++                return ret;
++        } else if (marker == 0xc0 || marker == 0xc1) {
++            if (frame || n != 15 || p[0] != 8 || p[5] != 3)
++                return AVERROR(ENOSYS);
++            h = AV_RB16(p + 1);
++            w = AV_RB16(p + 3);
++            if (!w || !h || (p[7] != 0x11 && p[7] != 0x21 && p[7] != 0x22) ||
++                p[10] != 0x11 || p[13] != 0x11)
++                return AVERROR(ENOSYS);
++            for (unsigned i = 0; i < 3; i++) {
++                ids[i] = p[6 + 3 * i];
++                quant[i] = p[8 + 3 * i];
++                if (quant[i] > 3)
++                    return AVERROR_INVALIDDATA;
++                for (unsigned j = 0; j < i; j++)
++                    if (ids[j] == ids[i])
++                        return AVERROR_INVALIDDATA;
++            }
++            if (quant[1] != quant[2])
++                return AVERROR(ENOSYS);
++            frame = 1;
++        } else if (marker >= 0xc0 && marker <= 0xcf) {
++            return AVERROR(ENOSYS);
++        } else if (marker == 0xee && n >= 12 && !memcmp(p, "Adobe", 5) && !p[11]) {
++            return AVERROR(ENOSYS);
++        } else if (marker == 0xe0 && n >= 5 && !memcmp(p, "AVI1", 4) && p[4]) {
++            return AVERROR(ENOSYS);
++        } else if (marker == 0xda) {
++            if (!frame || scan || n != 10 || p[0] != 3 || p[7] || p[8] != 63 || p[9])
++                return AVERROR(ENOSYS);
++            for (unsigned i = 0; i < 3; i++) {
++                unsigned selector = p[2 + i * 2];
++                if (p[1 + i * 2] != ids[i] || (selector & ~0x11U) ||
++                    !(next.quant_mask & (1U << quant[i])))
++                    return AVERROR_INVALIDDATA;
++                dc[i] = selector >> 4;
++                ac[i] = selector & 15;
++            }
++            if (dc[1] != dc[2] || ac[1] != ac[2])
++                return AVERROR(ENOSYS);
++            scan = 1;
++            while (pos < size) {
++                if (data[pos++] != 0xff)
++                    continue;
++                while (pos < size && data[pos] == 0xff)
++                    pos++;
++                if (pos >= size)
++                    break;
++                marker = data[pos++];
++                if (!marker || (marker >= 0xd0 && marker <= 0xd7))
++                    continue;
++                if (marker != 0xd9)
++                    return AVERROR(ENOSYS);
++                end = pos;
++                while (pos < size)
++                    if (data[pos++])
++                        return AVERROR_INVALIDDATA;
++                break;
++            }
++            break;
++        }
++    }
++    if (!scan || !end)
++        return AVERROR_INVALIDDATA;
++    for (unsigned i = 0; i < 4; i++) {
++        if (next.quant_mask & (1U << i))
++            prefix += 69;
++        prefix += 4 + next.huffman_size[i];
++    }
++    if (end > INT_MAX - AV_INPUT_BUFFER_PADDING_SIZE - prefix)
++        return AVERROR(ERANGE);
++    ret = av_new_packet(output, end + prefix);
++    if (ret < 0)
++        return ret;
++    dst = output->data;
++    *dst++ = 0xff;
++    *dst++ = 0xd8;
++    for (unsigned i = 0; i < 4; i++) {
++        if (next.quant_mask & (1U << i)) {
++            AV_WB16(dst, 0xffdb);
++            AV_WB16(dst + 2, 67);
++            dst[4] = i;
++            memcpy(dst + 5, next.quant[i], 64);
++            dst += 69;
++        }
++        AV_WB16(dst, 0xffc4);
++        AV_WB16(dst + 2, 2 + next.huffman_size[i]);
++        memcpy(dst + 4, next.huffman[i], next.huffman_size[i]);
++        dst += 4 + next.huffman_size[i];
++    }
++    memcpy(dst, data + 2, end - 2);
++    ret = av_packet_copy_props(output, input);
++    if (ret < 0) {
++        av_packet_unref(output);
++        return ret;
++    }
++    *ctx = next;
++    *width = w;
++    *height = h;
++    return 0;
++}
+diff --git a/libavcodec/v4l2_m2m_jpeg.c b/libavcodec/v4l2_m2m_jpeg.c
+new file mode 100644
+--- /dev/null
++++ b/libavcodec/v4l2_m2m_jpeg.c
+@@ -0,0 +1,362 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#include <dirent.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <linux/videodev2.h>
++#include <poll.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <unistd.h>
++
++#include "libavutil/file_open.h"
++#include "libavutil/imgutils.h"
++#include "libavutil/opt.h"
++#include "libavutil/time.h"
++#include "codec_internal.h"
++#include "decode.h"
++#include "v4l2_jpeg.h"
++
++typedef struct V4L2JPEGBuffer {
++    uint8_t *data;
++    unsigned size;
++    int streaming;
++} V4L2JPEGBuffer;
++
++typedef struct V4L2JPEGDecoder {
++    const AVClass *class;
++    char *device;
++    int fd;
++    int width, height;
++    struct v4l2_pix_format capture_format;
++    V4L2JPEGBuffer output, capture;
++    V4L2JPEGContext jpeg;
++} V4L2JPEGDecoder;
++
++static void jpeg_close_device(V4L2JPEGDecoder *s)
++{
++    V4L2JPEGBuffer *buffers[] = { &s->output, &s->capture };
++    for (unsigned i = 0; i < 2; i++) {
++        enum v4l2_buf_type type = i ? V4L2_BUF_TYPE_VIDEO_CAPTURE : V4L2_BUF_TYPE_VIDEO_OUTPUT;
++        if (buffers[i]->streaming)
++            ioctl(s->fd, VIDIOC_STREAMOFF, &type);
++        if (buffers[i]->data)
++            munmap(buffers[i]->data, buffers[i]->size);
++        memset(buffers[i], 0, sizeof(*buffers[i]));
++    }
++    if (s->fd >= 0)
++        close(s->fd);
++    s->fd = -1;
++    s->width = s->height = 0;
++}
++
++static int jpeg_buffer_init(V4L2JPEGDecoder *s, enum v4l2_buf_type type,
++                              V4L2JPEGBuffer *buffer)
++{
++    struct v4l2_requestbuffers request = { .type = type, .memory = V4L2_MEMORY_MMAP, .count = 1 };
++    struct v4l2_buffer query = { .type = type, .memory = V4L2_MEMORY_MMAP };
++    void *address;
++    if (ioctl(s->fd, VIDIOC_REQBUFS, &request) < 0)
++        return AVERROR(errno);
++    if (!request.count)
++        return AVERROR(ENOMEM);
++    if (ioctl(s->fd, VIDIOC_QUERYBUF, &query) < 0)
++        return AVERROR(errno);
++    if (!query.length)
++        return AVERROR_INVALIDDATA;
++    address = mmap(NULL, query.length, PROT_READ | PROT_WRITE, MAP_SHARED, s->fd, query.m.offset);
++    if (address == MAP_FAILED)
++        return AVERROR(errno);
++    buffer->data = address;
++    buffer->size = query.length;
++    return 0;
++}
++
++static int jpeg_configure_device(AVCodecContext *avctx, const char *path,
++                                  int width, int height, unsigned size)
++{
++    V4L2JPEGDecoder *s = avctx->priv_data;
++    struct v4l2_capability cap;
++    struct v4l2_format output = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT };
++    struct v4l2_format capture = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE };
++    uint32_t capabilities;
++    uint64_t needed;
++    int ret;
++
++    s->fd = avpriv_open(path, O_RDWR | O_NONBLOCK);
++    if (s->fd < 0)
++        return AVERROR(errno);
++    if (ioctl(s->fd, VIDIOC_QUERYCAP, &cap) < 0) {
++        ret = AVERROR(errno);
++        goto fail;
++    }
++    capabilities = cap.capabilities & V4L2_CAP_DEVICE_CAPS ? cap.device_caps : cap.capabilities;
++    if ((capabilities & (V4L2_CAP_VIDEO_M2M | V4L2_CAP_STREAMING)) !=
++        (V4L2_CAP_VIDEO_M2M | V4L2_CAP_STREAMING)) {
++        ret = AVERROR(ENOSYS);
++        goto fail;
++    }
++    output.fmt.pix = (struct v4l2_pix_format) {
++        .width = width, .height = height, .pixelformat = V4L2_PIX_FMT_JPEG,
++        .sizeimage = size, .field = V4L2_FIELD_NONE, .colorspace = V4L2_COLORSPACE_JPEG,
++    };
++    if (ioctl(s->fd, VIDIOC_S_FMT, &output) < 0) {
++        ret = AVERROR(errno);
++        goto fail;
++    }
++    if (output.fmt.pix.pixelformat != V4L2_PIX_FMT_JPEG ||
++        output.fmt.pix.width != width || output.fmt.pix.height != height ||
++        output.fmt.pix.sizeimage < size) {
++        ret = AVERROR(ENOSYS);
++        goto fail;
++    }
++    capture.fmt.pix = (struct v4l2_pix_format) {
++        .width = width, .height = height, .pixelformat = V4L2_PIX_FMT_NV12,
++        .field = V4L2_FIELD_NONE, .colorspace = V4L2_COLORSPACE_JPEG,
++    };
++    if (ioctl(s->fd, VIDIOC_S_FMT, &capture) < 0) {
++        ret = AVERROR(errno);
++        goto fail;
++    }
++    needed = (uint64_t)capture.fmt.pix.bytesperline * capture.fmt.pix.height * 3 / 2;
++    if (capture.fmt.pix.pixelformat != V4L2_PIX_FMT_NV12 ||
++        capture.fmt.pix.width < width || capture.fmt.pix.height < height ||
++        capture.fmt.pix.bytesperline < FFALIGN(width, 2) ||
++        (capture.fmt.pix.height & 1) || needed > capture.fmt.pix.sizeimage) {
++        ret = AVERROR(ENOSYS);
++        goto fail;
++    }
++    s->capture_format = capture.fmt.pix;
++    ret = jpeg_buffer_init(s, V4L2_BUF_TYPE_VIDEO_OUTPUT, &s->output);
++    if (ret < 0)
++        goto fail;
++    ret = jpeg_buffer_init(s, V4L2_BUF_TYPE_VIDEO_CAPTURE, &s->capture);
++    if (ret < 0)
++        goto fail;
++    if (s->output.size < size || s->capture.size < needed) {
++        ret = AVERROR_INVALIDDATA;
++        goto fail;
++    }
++    s->width = width;
++    s->height = height;
++    av_log(avctx, AV_LOG_VERBOSE, "JPEG decoder uses %s\n", path);
++    return 0;
++fail:
++    jpeg_close_device(s);
++    return ret;
++}
++
++static int jpeg_open_device(AVCodecContext *avctx, int width, int height, unsigned size)
++{
++    V4L2JPEGDecoder *s = avctx->priv_data;
++    struct dirent *entry;
++    DIR *directory;
++    int ret = AVERROR(ENODEV);
++    char path[PATH_MAX];
++
++    jpeg_close_device(s);
++    if (s->device)
++        return jpeg_configure_device(avctx, s->device, width, height, size);
++    directory = opendir("/dev");
++    if (!directory)
++        return AVERROR(errno);
++    while ((entry = readdir(directory))) {
++        if (strncmp(entry->d_name, "video", 5))
++            continue;
++        snprintf(path, sizeof(path), "/dev/%s", entry->d_name);
++        ret = jpeg_configure_device(avctx, path, width, height, size);
++        if (!ret)
++            break;
++    }
++    closedir(directory);
++    return ret;
++}
++
++static int jpeg_queue(V4L2JPEGDecoder *s, enum v4l2_buf_type type, unsigned used)
++{
++    struct v4l2_buffer buffer = { .type = type, .memory = V4L2_MEMORY_MMAP, .bytesused = used };
++    return ioctl(s->fd, VIDIOC_QBUF, &buffer) < 0 ? AVERROR(errno) : 0;
++}
++
++static int jpeg_wait(V4L2JPEGDecoder *s, unsigned *bytesused)
++{
++    unsigned pending = 3;
++    int timeout = 2000 + ((uint64_t)s->width * s->height + 44999) / 45000;
++    int64_t deadline = av_gettime_relative() + (int64_t)timeout * 1000;
++    while (pending) {
++        struct pollfd pollfd = { .fd = s->fd };
++        int ret;
++        for (unsigned i = 0; i < 2; i++) {
++            struct v4l2_buffer buffer = {
++                .type = i ? V4L2_BUF_TYPE_VIDEO_CAPTURE : V4L2_BUF_TYPE_VIDEO_OUTPUT,
++                .memory = V4L2_MEMORY_MMAP,
++            };
++            if (!(pending & (1U << i)))
++                continue;
++            if (ioctl(s->fd, VIDIOC_DQBUF, &buffer) < 0) {
++                if (errno == EAGAIN)
++                    continue;
++                if (errno == EINTR)
++                    continue;
++                return AVERROR(errno);
++            }
++            if (buffer.index || buffer.flags & V4L2_BUF_FLAG_ERROR)
++                return AVERROR_INVALIDDATA;
++            if (i)
++                *bytesused = buffer.bytesused;
++            pending &= ~(1U << i);
++        }
++        if (!pending)
++            return 0;
++        timeout = (deadline - av_gettime_relative() + 999) / 1000;
++        if (timeout <= 0)
++            return AVERROR(ETIMEDOUT);
++        pollfd.events = (pending & 1 ? POLLOUT : 0) | (pending & 2 ? POLLIN : 0);
++        ret = poll(&pollfd, 1, timeout);
++        if (ret < 0 && errno == EINTR)
++            continue;
++        if (ret < 0)
++            return AVERROR(errno);
++        if (!ret)
++            return AVERROR(ETIMEDOUT);
++        if (pollfd.revents & (POLLERR | POLLHUP | POLLNVAL))
++            return AVERROR(EIO);
++    }
++    return 0;
++}
++
++static int jpeg_decode_frame(AVCodecContext *avctx, AVFrame *frame,
++                              int *got_frame, AVPacket *input)
++{
++    V4L2JPEGDecoder *s = avctx->priv_data;
++    AVPacket packet = { 0 };
++    int width, height, ret;
++    unsigned bytesused = 0;
++    uint64_t needed;
++    enum v4l2_buf_type type;
++
++    *got_frame = 0;
++    if (!input->size)
++        return 0;
++    ret = ff_v4l2_jpeg_prepare(&s->jpeg, input, &packet, &width, &height);
++    if (ret < 0)
++        return ret;
++    ret = av_image_check_size2(width, height, avctx->max_pixels, AV_PIX_FMT_NV12, 0, avctx);
++    if (ret < 0)
++        goto done;
++    if (s->fd < 0 || s->width != width || s->height != height ||
++        s->output.size < packet.size + AV_INPUT_BUFFER_PADDING_SIZE) {
++        ret = jpeg_open_device(avctx, width, height, packet.size + AV_INPUT_BUFFER_PADDING_SIZE);
++        if (ret < 0)
++            goto done;
++    }
++    memcpy(s->output.data, packet.data, packet.size);
++    memset(s->output.data + packet.size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
++    ret = jpeg_queue(s, V4L2_BUF_TYPE_VIDEO_CAPTURE, 0);
++    if (ret < 0)
++        goto reset;
++    ret = jpeg_queue(s, V4L2_BUF_TYPE_VIDEO_OUTPUT, packet.size);
++    if (ret < 0)
++        goto reset;
++    if (!s->output.streaming) {
++        type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
++        if (ioctl(s->fd, VIDIOC_STREAMON, &type) < 0) {
++            ret = AVERROR(errno);
++            goto reset;
++        }
++        s->output.streaming = 1;
++    }
++    if (!s->capture.streaming) {
++        type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++        if (ioctl(s->fd, VIDIOC_STREAMON, &type) < 0) {
++            ret = AVERROR(errno);
++            goto reset;
++        }
++        s->capture.streaming = 1;
++    }
++    ret = jpeg_wait(s, &bytesused);
++    if (ret < 0)
++        goto reset;
++    needed = (uint64_t)s->capture_format.bytesperline * s->capture_format.height +
++             (uint64_t)s->capture_format.bytesperline * ((height + 1) / 2 - 1) + FFALIGN(width, 2);
++    if (bytesused < needed || bytesused > s->capture.size) {
++        ret = AVERROR_INVALIDDATA;
++        goto reset;
++    }
++    ret = ff_set_dimensions(avctx, width, height);
++    if (ret < 0)
++        goto done;
++    avctx->pix_fmt = AV_PIX_FMT_NV12;
++    avctx->color_range = AVCOL_RANGE_JPEG;
++    avctx->colorspace = AVCOL_SPC_BT470BG;
++    ret = ff_get_buffer(avctx, frame, 0);
++    if (ret < 0)
++        goto done;
++    av_image_copy_plane(frame->data[0], frame->linesize[0], s->capture.data,
++                        s->capture_format.bytesperline, width, height);
++    av_image_copy_plane(frame->data[1], frame->linesize[1],
++                        s->capture.data + s->capture_format.bytesperline * s->capture_format.height,
++                        s->capture_format.bytesperline, FFALIGN(width, 2), (height + 1) / 2);
++    frame->pts = input->pts;
++    frame->duration = input->duration;
++    frame->pict_type = AV_PICTURE_TYPE_I;
++    frame->flags |= AV_FRAME_FLAG_KEY;
++    *got_frame = 1;
++    ret = input->size;
++    goto done;
++reset:
++    jpeg_close_device(s);
++done:
++    av_packet_unref(&packet);
++    return ret;
++}
++
++static av_cold int jpeg_decode_init(AVCodecContext *avctx)
++{
++    V4L2JPEGDecoder *s = avctx->priv_data;
++    s->fd = -1;
++    ff_v4l2_jpeg_reset(&s->jpeg);
++    avctx->pix_fmt = AV_PIX_FMT_NV12;
++    return 0;
++}
++
++static av_cold int jpeg_decode_close(AVCodecContext *avctx)
++{
++    jpeg_close_device(avctx->priv_data);
++    return 0;
++}
++
++static void jpeg_decode_flush(AVCodecContext *avctx)
++{
++    V4L2JPEGDecoder *s = avctx->priv_data;
++    /* Retain stream tables, matching the software MJPEG decoder. */
++    jpeg_close_device(s);
++}
++
++static const AVOption jpeg_options[] = {
++    { "device", "JPEG decoder video device", offsetof(V4L2JPEGDecoder, device), AV_OPT_TYPE_STRING,
++      { .str = NULL }, 0, 0, AV_OPT_FLAG_DECODING_PARAM | AV_OPT_FLAG_VIDEO_PARAM },
++    { NULL },
++};
++
++static const AVClass jpeg_class = {
++    .class_name = "JPEG V4L2 M2M decoder", .item_name = av_default_item_name,
++    .option = jpeg_options, .version = LIBAVUTIL_VERSION_INT,
++};
++
++const FFCodec ff_mjpeg_v4l2m2m_decoder = {
++    .p.name = "mjpeg_v4l2m2m",
++    CODEC_LONG_NAME("V4L2 mem2mem JPEG/MJPEG decoder"),
++    .p.type = AVMEDIA_TYPE_VIDEO,
++    .p.id = AV_CODEC_ID_MJPEG,
++    .p.priv_class = &jpeg_class,
++    .p.wrapper_name = "v4l2m2m",
++    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_HARDWARE | AV_CODEC_CAP_AVOID_PROBING,
++    .priv_data_size = sizeof(V4L2JPEGDecoder),
++    .init = jpeg_decode_init,
++    .close = jpeg_decode_close,
++    .flush = jpeg_decode_flush,
++    FF_CODEC_DECODE_CB(jpeg_decode_frame),
++    CODEC_PIXFMTS(AV_PIX_FMT_NV12),
++    .caps_internal = FF_CODEC_CAP_INIT_CLEANUP,
++};
+diff --git a/libavcodec/v4l2_request_mjpeg.c b/libavcodec/v4l2_request_mjpeg.c
+new file mode 100644
+--- /dev/null
++++ b/libavcodec/v4l2_request_mjpeg.c
+@@ -0,0 +1,187 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#include <limits.h>
++#include <string.h>
++#include "libavutil/hwcontext_v4l2request_internal.h"
++#include "hwaccel_internal.h"
++#include "internal.h"
++#include "mjpegdec.h"
++#include "v4l2_jpeg.h"
++#include "v4l2_request.h"
++
++typedef struct V4L2JPEGRequestContext {
++    V4L2RequestContext request;
++    V4L2JPEGContext jpeg;
++} V4L2JPEGRequestContext;
++
++static int v4l2_request_mjpeg_tables(V4L2JPEGContext *ctx, const MJpegDecodeContext *s)
++{
++    ff_v4l2_jpeg_reset(ctx);
++    /* Software parsing owns inherited tables across hardware reinitialization. */
++    for (unsigned q = 0; q < 4; q++) {
++        unsigned valid = 1;
++        for (unsigned i = 0; i < 64; i++) {
++            unsigned value = s->quant_matrixes[q][i];
++            if (!value || value > 255)
++                valid = 0;
++            ctx->quant[q][i] = value;
++        }
++        if (valid)
++            ctx->quant_mask |= 1U << q;
++    }
++    for (unsigned i = 0; i < 4; i++) {
++        const uint8_t *lengths = s->raw_huffman_lengths[i / 2][i % 2];
++        unsigned count = 0;
++        for (unsigned j = 0; j < 16; j++)
++            count += lengths[j];
++        if (!count)
++            continue;
++        if (count > (i < 2 ? 12 : 162))
++            return AVERROR(ENOSYS);
++        ctx->huffman[i][0] = (i / 2) << 4 | (i % 2);
++        memcpy(ctx->huffman[i] + 1, lengths, 16);
++        memcpy(ctx->huffman[i] + 17, s->raw_huffman_values[i / 2][i % 2], count);
++        ctx->huffman_size[i] = 17 + count;
++    }
++    return 0;
++}
++
++static int v4l2_request_mjpeg_start_frame(AVCodecContext *avctx,
++                                          av_unused const AVBufferRef *buffer_ref,
++                                          const uint8_t *buffer, uint32_t size)
++{
++    const MJpegDecodeContext *s = avctx->priv_data;
++    V4L2JPEGRequestContext *ctx = avctx->internal->hwaccel_priv_data;
++    V4L2RequestPictureContext *pic = s->hwaccel_picture_private;
++    AVPacket input = { 0 }, output = { 0 };
++    int width, height, ret;
++
++    if (!buffer || size > INT_MAX - AV_INPUT_BUFFER_PADDING_SIZE - 2 ||
++        s->interlaced || s->progressive || s->lossless || s->ls || s->bits != 8)
++        return AVERROR(ENOSYS);
++    ret = v4l2_request_mjpeg_tables(&ctx->jpeg, s);
++    if (ret < 0)
++        return ret;
++    /* The MJPEG decoder passes the bytes after SOI. */
++    ret = av_new_packet(&input, size + 2);
++    if (ret < 0)
++        return ret;
++    input.data[0] = 0xff;
++    input.data[1] = 0xd8;
++    memcpy(input.data + 2, buffer, size);
++    ret = ff_v4l2_jpeg_prepare(&ctx->jpeg, &input, &output, &width, &height);
++    if (ret < 0)
++        goto done;
++    if (width != avctx->coded_width || height != avctx->coded_height) {
++        ret = AVERROR_INVALIDDATA;
++        goto done;
++    }
++    ret = ff_v4l2_request_start_frame(avctx, pic, s->picture_ptr);
++    if (!ret)
++        ret = ff_v4l2_request_append_output(avctx, pic, output.data, output.size);
++done:
++    av_packet_unref(&input);
++    av_packet_unref(&output);
++    return ret;
++}
++
++static int v4l2_request_mjpeg_decode_slice(AVCodecContext *avctx,
++                                           av_unused const uint8_t *buffer,
++                                           av_unused uint32_t size)
++{
++    const MJpegDecodeContext *s = avctx->priv_data;
++    if (s->cur_scan != 1 || s->nb_components_sos != 3 || s->Ss || s->Se != 63 || s->Ah || s->Al)
++        return AVERROR(ENOSYS);
++    return 0;
++}
++
++static int v4l2_request_mjpeg_end_frame(AVCodecContext *avctx)
++{
++    const MJpegDecodeContext *s = avctx->priv_data;
++    return ff_v4l2_request_decode_frame(avctx, s->hwaccel_picture_private, NULL, 0);
++}
++
++static int v4l2_request_mjpeg_post_frames(AVCodecContext *avctx)
++{
++    V4L2JPEGRequestContext *ctx = avctx->internal->hwaccel_priv_data;
++    const struct v4l2_format *format = &ctx->request.fctxi->output.format;
++    AVHWFramesContext *frames = (AVHWFramesContext *)ctx->request.frames_ref->data;
++    AVV4L2RequestFramesContext *public = frames->hwctx;
++    unsigned width, height;
++    public->output_buffer_size = V4L2_TYPE_IS_MULTIPLANAR(format->type) ?
++                                 format->fmt.pix_mp.plane_fmt[0].sizeimage : format->fmt.pix.sizeimage;
++    if (V4L2_TYPE_IS_MULTIPLANAR(format->type)) {
++        width = format->fmt.pix_mp.width;
++        height = format->fmt.pix_mp.height;
++    } else {
++        width = format->fmt.pix.width;
++        height = format->fmt.pix.height;
++    }
++    return width == avctx->coded_width && height == avctx->coded_height ? 0 : AVERROR(ENOSYS);
++}
++
++static int v4l2_request_mjpeg_init(AVCodecContext *avctx)
++{
++    const MJpegDecodeContext *s = avctx->priv_data;
++    V4L2JPEGRequestContext *ctx = avctx->internal->hwaccel_priv_data;
++    int ret;
++    if (avctx->lowres || s->bits != 8 || s->nb_components != 3 || s->rgb ||
++        s->progressive || s->lossless || s->ls || s->interlaced ||
++        (avctx->profile != AV_PROFILE_MJPEG_HUFFMAN_BASELINE_DCT &&
++         avctx->profile != AV_PROFILE_MJPEG_HUFFMAN_EXTENDED_SEQUENTIAL_DCT))
++        return AVERROR(ENOSYS);
++    ff_v4l2_jpeg_reset(&ctx->jpeg);
++    ret = ff_v4l2_request_init(avctx, NULL, 0, v4l2_request_mjpeg_post_frames);
++    if (ret >= 0)
++        ctx->request.timeout_ms += ((uint64_t)avctx->coded_width * avctx->coded_height + 44999) / 45000;
++    else
++        ctx->request.av_class = NULL;
++    return ret;
++}
++
++static int v4l2_request_mjpeg_frame_params(AVCodecContext *avctx, AVBufferRef *frames)
++{
++    const MJpegDecodeContext *s = avctx->priv_data;
++    AVHWFramesContext *hwfc = (AVHWFramesContext *)frames->data;
++    AVV4L2RequestFramesContext *ctx = hwfc->hwctx;
++    int ret;
++    if (s->raw_image_buffer_size > INT_MAX - 2048)
++        return AVERROR(ERANGE);
++    ret = ff_v4l2_request_frame_params(avctx, frames, V4L2_PIX_FMT_JPEG, 8);
++    if (!ret)
++        ctx->output_buffer_size = s->raw_image_buffer_size + 2048;
++    return ret;
++}
++
++static int v4l2_request_mjpeg_uninit(AVCodecContext *avctx)
++{
++    V4L2JPEGRequestContext *ctx = avctx->internal->hwaccel_priv_data;
++    if (ctx->request.av_class) {
++        ff_v4l2_request_uninit(avctx);
++        ctx->request.av_class = NULL;
++    }
++    return 0;
++}
++
++static void v4l2_request_mjpeg_flush(AVCodecContext *avctx)
++{
++    V4L2JPEGRequestContext *ctx = avctx->internal->hwaccel_priv_data;
++    ff_v4l2_request_flush(avctx);
++    ff_v4l2_jpeg_reset(&ctx->jpeg);
++}
++
++const FFHWAccel ff_mjpeg_v4l2request_hwaccel = {
++    .p.name = "mjpeg_v4l2request",
++    .p.type = AVMEDIA_TYPE_VIDEO,
++    .p.id = AV_CODEC_ID_MJPEG,
++    .p.pix_fmt = AV_PIX_FMT_DRM_PRIME,
++    .start_frame = v4l2_request_mjpeg_start_frame,
++    .decode_slice = v4l2_request_mjpeg_decode_slice,
++    .end_frame = v4l2_request_mjpeg_end_frame,
++    .flush = v4l2_request_mjpeg_flush,
++    .frame_priv_data_size = sizeof(V4L2RequestPictureContext),
++    .init = v4l2_request_mjpeg_init,
++    .uninit = v4l2_request_mjpeg_uninit,
++    .priv_data_size = sizeof(V4L2JPEGRequestContext),
++    .frame_params = v4l2_request_mjpeg_frame_params,
++    .caps_internal = HWACCEL_CAP_ASYNC_SAFE,
++};
+-- 
+Armbian
