@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] drm/sun4i: declare coverage blending on H616 shared planes
+
+H616 uses fixed coverage blending for straight-alpha inputs.
+Expose this capability on all six shared UI and VI planes.
+Prevent the Linux 7.3 warnings without changing register programming.
+
+Link: https://git.kernel.org/torvalds/c/860e748bddcc9291cbdd23e801640aeeba30cc44
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/drivers/gpu/drm/sun4i/sun50i_planes.c b/drivers/gpu/drm/sun4i/sun50i_planes.c
+--- a/drivers/gpu/drm/sun4i/sun50i_planes.c
++++ b/drivers/gpu/drm/sun4i/sun50i_planes.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0+
+ /* Copyright (c) 2025 Jernej Skrabec <jernej.skrabec@gmail.com> */
+ 
++#include <drm/drm_blend.h>
+ #include <drm/drm_device.h>
+ 
+ #include <linux/device.h>
+@@ -92,6 +93,7 @@
+ 		unsigned int phy_ch = map->map[i];
+ 		struct sun8i_layer *layer;
+ 		enum drm_plane_type type;
++		int ret;
+ 
+ 		if ((i == 0 && map->num_ch == 1) || i == 1)
+ 			type = DRM_PLANE_TYPE_PRIMARY;
+@@ -115,6 +117,11 @@
+ 			return ERR_CAST(layer);
+ 		}
+ 
++		ret = drm_plane_create_blend_mode_property(&layer->plane,
++						 BIT(DRM_MODE_BLEND_COVERAGE));
++		if (ret)
++			return ERR_PTR(ret);
++
+ 		drm_planes[i] = &layer->plane;
+ 	}
+ 
+-- 
+Armbian
