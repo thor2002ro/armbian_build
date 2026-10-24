@@ -23,8 +23,11 @@ function compile_ffmpeg-v4l2-request() {
 	run_host_command_logged_raw git -C "${source_dir}" archive \
 		--output="${tmp_dir}/source.tar" "${FFMPEG_V4L2_REQUEST_COMMIT}"
 	run_host_command_logged_raw tar -xf "${tmp_dir}/source.tar" -C "${rootfs}/build/src"
-	run_host_command_logged_raw git -C "${rootfs}/build/src" apply \
-		"${SRC}/patch/misc/ffmpeg-v4l2-request.patch"
+	declare codec_patch
+	for codec_patch in ffmpeg-v4l2-request.patch ffmpeg-jpeg-v4l2-decode.patch; do
+		run_host_command_logged_raw env GIT_CEILING_DIRECTORIES="${rootfs}/build" \
+			git -C "${rootfs}/build/src" apply "${SRC}/patch/misc/${codec_patch}"
+	done
 	cp "${SRC}/packages/ffmpeg-v4l2-request/build.sh" "${rootfs}/build/build.sh"
 	declare source_date_epoch
 	source_date_epoch="$(git -C "${source_dir}" show -s --format=%ct "${FFMPEG_V4L2_REQUEST_COMMIT}")"

@@ -1,0 +1,115 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: media: cedrus: allow H616/H618 16K JPEG testing
+
+Raise the H616 and H618 JPEG limit to 16384x16384.
+Allow larger JPEG frames to complete before the watchdog expires.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.c b/drivers/staging/media/sunxi/cedrus/cedrus.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.c
+@@ -763,6 +763,7 @@
+ 			  CEDRUS_CAPABILITY_H265_10_DEC |
+ 			  CEDRUS_CAPABILITY_H265_8K_DEC |
+ 			  CEDRUS_CAPABILITY_VP9_8K_DEC |
++			  CEDRUS_CAPABILITY_JPEG_16K_DEC |
+ 			  CEDRUS_CAPABILITY_VP8_DEC |
+ 			  CEDRUS_CAPABILITY_VP9_DEC |
+ 			  CEDRUS_CAPABILITY_VC1_DEC,
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.h b/drivers/staging/media/sunxi/cedrus/cedrus.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -40,6 +40,7 @@
+ #define CEDRUS_CAPABILITY_H264_ENC	BIT(9)
+ #define CEDRUS_CAPABILITY_H265_8K_DEC	BIT(10)
+ #define CEDRUS_CAPABILITY_VP9_8K_DEC	BIT(11)
++#define CEDRUS_CAPABILITY_JPEG_16K_DEC	BIT(12)
+ 
+ enum cedrus_irq_status {
+ 	CEDRUS_IRQ_NONE,
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_video.c b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_video.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+@@ -199,6 +199,10 @@
+ 		   cedrus_is_capable(ctx, CEDRUS_CAPABILITY_VP9_8K_DEC)) {
+ 		max_width = CEDRUS_VP9_8K_MAX_WIDTH;
+ 		max_height = CEDRUS_VP9_8K_MAX_HEIGHT;
++	} else if (source_format == V4L2_PIX_FMT_JPEG) {
++		max_width = cedrus_is_capable(ctx, CEDRUS_CAPABILITY_JPEG_16K_DEC) ?
++			CEDRUS_JPEG_MAX_SIZE : 2048U;
++		max_height = max_width;
+ 	}
+ 
+ 	/* Limit to hardware min/max. */
+@@ -429,10 +433,6 @@
+ 		return -EINVAL;
+ 
+ 	pix_fmt->pixelformat = fmt->pixelformat;
+-	if (pix_fmt->pixelformat == V4L2_PIX_FMT_JPEG) {
+-		pix_fmt->width = min(pix_fmt->width, 2048U);
+-		pix_fmt->height = min(pix_fmt->height, 2048U);
+-	}
+ 	cedrus_prepare_format(ctx, pix_fmt, pix_fmt->pixelformat);
+ 
+ 	return 0;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_video.h b/drivers/staging/media/sunxi/cedrus/cedrus_video.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_video.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_video.h
+@@ -32,6 +32,7 @@
+ #define CEDRUS_H265_8K_MAX_HEIGHT	4320U
+ #define CEDRUS_VP9_8K_MAX_WIDTH	7680U
+ #define CEDRUS_VP9_8K_MAX_HEIGHT	4320U
++#define CEDRUS_JPEG_MAX_SIZE	16384U
+ 
+ extern const struct v4l2_ioctl_ops cedrus_ioctl_ops;
+ 
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_jpeg.c b/drivers/staging/media/sunxi/cedrus/cedrus_jpeg.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_jpeg.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_jpeg.c
+@@ -13,6 +13,7 @@
+ #include "cedrus.h"
+ #include "cedrus_hw.h"
+ #include "cedrus_regs.h"
++#include "cedrus_video.h"
+ 
+ static enum cedrus_irq_status cedrus_jpeg_irq_status(struct cedrus_ctx *ctx)
+ {
+@@ -86,10 +87,13 @@
+ {
+ 	struct v4l2_jpeg_frame_header *frame = &header->frame;
+ 	struct v4l2_jpeg_scan_header *scan = header->scan;
++	unsigned int max_size =
++		cedrus_is_capable(ctx, CEDRUS_CAPABILITY_JPEG_16K_DEC) ?
++		CEDRUS_JPEG_MAX_SIZE : 2048U;
+ 	unsigned int i, j;
+ 
+ 	if (!frame->width || !frame->height ||
+-	    frame->width > 2048 || frame->height > 2048 ||
++	    frame->width > max_size || frame->height > max_size ||
+ 	    frame->width != ctx->src_fmt.width ||
+ 	    frame->height != ctx->src_fmt.height ||
+ 	    frame->width > ctx->dst_fmt.width ||
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+@@ -201,7 +201,16 @@
+ 
+ void cedrus_watchdog_start(struct cedrus_dev *dev)
+ {
+-	unsigned long timeout = msecs_to_jiffies(2000);
++	struct cedrus_ctx *ctx = v4l2_m2m_get_curr_priv(dev->m2m_dev);
++	unsigned int timeout_ms = 2000;
++	unsigned long timeout;
++
++	/* Allow two seconds plus one JPEG frame at 45 megapixels per second. */
++	if (ctx && !ctx->encoder &&
++	    ctx->src_fmt.pixelformat == V4L2_PIX_FMT_JPEG)
++		timeout_ms += DIV_ROUND_UP(ctx->src_fmt.width * ctx->src_fmt.height,
++				   45000);
++	timeout = msecs_to_jiffies(timeout_ms);
+ 
+ 	WRITE_ONCE(dev->watchdog_deadline, jiffies + timeout);
+ 	schedule_delayed_work(&dev->watchdog_work, timeout);
+-- 
+Armbian
