@@ -1,0 +1,42 @@
+Subject: [PATCH] Local: iommu: sun50i: retain raw fault diagnostics
+
+The fault handler clears the hardware status after each IOMMU fault. That normally removes the address and access details needed for diagnosis.
+
+Record the raw fault state before acknowledging it. Recovery behavior remains unchanged.
+---
+diff --git a/drivers/iommu/sun50i-iommu.c b/drivers/iommu/sun50i-iommu.c
+--- a/drivers/iommu/sun50i-iommu.c
++++ b/drivers/iommu/sun50i-iommu.c
+@@ -1018,6 +1018,7 @@
+ static irqreturn_t sun50i_iommu_irq(int irq, void *dev_id)
+ {
+ 	u32 status, l1_status, l2_status, resets;
++	unsigned int master;
+ 	struct sun50i_iommu *iommu = dev_id;
+ 
+ 	spin_lock(&iommu->iommu_lock);
+@@ -1030,6 +1031,24 @@
+ 
+ 	l1_status = iommu_read(iommu, IOMMU_L1PG_INT_REG);
+ 	l2_status = iommu_read(iommu, IOMMU_L2PG_INT_REG);
++
++	dev_dbg(iommu->dev,
++		"fault config: enable=%08x bypass=%08x ttb=%08x prefetch=%08x\n",
++		iommu_read(iommu, IOMMU_ENABLE_REG),
++		iommu_read(iommu, IOMMU_BYPASS_REG),
++		iommu_read(iommu, IOMMU_TTB_REG), iommu_read(iommu, IOMMU_TLB_PREFETCH_REG));
++	dev_dbg(iommu->dev,
++		"fault state: status=%08x l1=%08x l2=%08x l1_addr=%08x l2_addr=%08x\n",
++		status, l1_status, l2_status,
++		iommu_read(iommu, IOMMU_INT_ERR_ADDR_L1_REG),
++		iommu_read(iommu, IOMMU_INT_ERR_ADDR_L2_REG));
++	for (master = 0; master < 6; master++) {
++		if (!((status | l1_status | l2_status) & BIT(master)))
++			continue;
++		dev_dbg(iommu->dev, "fault master %u: addr=%08x data=%08x\n",
++			master, iommu_read(iommu, IOMMU_INT_ERR_ADDR_REG(master)),
++			iommu_read(iommu, IOMMU_INT_ERR_DATA_REG(master)));
++	}
+ 
+ 	if (status & IOMMU_INT_INVALID_L2PG)
+ 		sun50i_iommu_handle_pt_irq(iommu,

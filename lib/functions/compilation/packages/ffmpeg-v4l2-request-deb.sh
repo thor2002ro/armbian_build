@@ -24,7 +24,7 @@ function compile_ffmpeg-v4l2-request() {
 		--output="${tmp_dir}/source.tar" "${FFMPEG_V4L2_REQUEST_COMMIT}"
 	run_host_command_logged_raw tar -xf "${tmp_dir}/source.tar" -C "${rootfs}/build/src"
 	declare codec_patch
-	for codec_patch in ffmpeg-v4l2-request.patch ffmpeg-mjpeg-v4l2m2m.patch ffmpeg-cavs2-v4l2-request.patch ffmpeg-cavs-v4l2-request.patch ffmpeg-cavs-legacy-v4l2-request.patch ffmpeg-jpeg-v4l2-decode.patch ffmpeg-mpeg4-v4l2-request.patch ffmpeg-cavs2-fields-v4l2-request.patch ffmpeg-cedrus-mpeg1-sorenson.patch ffmpeg-h263-annex-v4l2-request.patch; do
+	for codec_patch in ffmpeg-v4l2-request.patch ffmpeg-mjpeg-v4l2m2m.patch ffmpeg-cavs2-v4l2-request.patch ffmpeg-cavs-v4l2-request.patch ffmpeg-cavs-legacy-v4l2-request.patch ffmpeg-jpeg-v4l2-decode.patch ffmpeg-mpeg4-v4l2-request.patch ffmpeg-cavs2-fields-v4l2-request.patch ffmpeg-cedrus-mpeg1-sorenson.patch ffmpeg-cedrus-encoder-rate-roi.patch ffmpeg-h263-annex-v4l2-request.patch ffmpeg-cedrus-adaptive-vbr.patch; do
 		run_host_command_logged_raw env GIT_CEILING_DIRECTORIES="${rootfs}/build" \
 			git -C "${rootfs}/build/src" apply "${SRC}/patch/misc/${codec_patch}"
 	done

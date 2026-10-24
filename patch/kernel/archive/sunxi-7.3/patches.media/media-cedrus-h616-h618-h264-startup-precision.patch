@@ -1,0 +1,92 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: media: cedrus: preserve H264 startup rate precision
+
+Match vendor startup QP thresholds using full bitrate and frame rate.
+Preserve the vendor 4K adjustment and configured QP limits.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_controls.h b/drivers/staging/media/sunxi/cedrus/cedrus_enc_controls.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_controls.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_controls.h
+@@ -573,6 +573,51 @@
+ 		qp += (u64)bits * 100 > pixels * 21 ? 6 :
+ 		      (u64)bits * 100 > pixels * 12 ? 5 : 4;
+ 	return qp;
++}
++
++static inline u32 cedrus_h264_startup_qp(u32 bitrate, u32 numerator, u32 denominator,
++					 u32 width, u32 height)
++{
++#ifdef __SIZEOF_INT128__
++	struct cedrus_mad_fp fps, pixels, bpp, low, medium, high, value;
++	u32 qp = 35;
++
++	if (!bitrate || !numerator || !denominator || !width || !height)
++		return qp;
++	/* The vendor rounds bitrate, frame rate, and pixel rate to binary32. */
++	fps = cedrus_mad_float(cedrus_mad_div(cedrus_mad_from(denominator, 0),
++					      cedrus_mad_from(numerator, 0)));
++	pixels = cedrus_mad_float(cedrus_mad_mul(cedrus_mad_from(width, 0), fps));
++	pixels = cedrus_mad_float(cedrus_mad_mul(pixels, cedrus_mad_from(height, 0)));
++	bpp = cedrus_mad_div(cedrus_mad_float(cedrus_mad_from(bitrate, 0)), pixels);
++	low = cedrus_mad_div(cedrus_mad_from(1, 0), cedrus_mad_from(20, 0));
++	medium = cedrus_mad_div(cedrus_mad_from(3, 0), cedrus_mad_from(10, 0));
++	high = cedrus_mad_div(cedrus_mad_from(3, 0), cedrus_mad_from(5, 0));
++	if (cedrus_mad_greater(bpp, high)) {
++		qp = 10;
++	} else if (cedrus_mad_greater(bpp, medium)) {
++		qp = 20;
++	} else if (cedrus_mad_greater(bpp, low)) {
++		value = cedrus_mad_add(bpp, cedrus_mad_neg(low));
++		value = cedrus_mad_mul(value, cedrus_mad_from(4, 0));
++		value = cedrus_mad_fma(cedrus_mad_neg(value), cedrus_mad_from(10, 0),
++				       cedrus_mad_from(35, 0));
++		qp = cedrus_mad_u32(value, 0);
++	}
++	if (width == 3840 && height == 2160) {
++		low = cedrus_mad_div(cedrus_mad_from(3, 0), cedrus_mad_from(25, 0));
++		high = cedrus_mad_div(cedrus_mad_from(21, 0), cedrus_mad_from(100, 0));
++		qp += cedrus_mad_greater(bpp, high) ? 6 : cedrus_mad_greater(bpp, low) ? 5 : 4;
++	}
++	return qp;
++#else
++	u64 bits;
++
++	if (!bitrate || !numerator || !denominator || !width || !height)
++		return 35;
++	bits = div_u64((u64)bitrate * numerator, denominator);
++	return cedrus_h264_initial_qp(min_t(u64, bits, 0xffffffffU), width, height);
++#endif
+ }
+ 
+ #ifdef __SIZEOF_INT128__
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+@@ -285,7 +285,10 @@
+ 		ret = cedrus_h264_rc_configure(&enc->rc, enc->rc_ctrls[5]->val);
+ 		if (ret)
+ 			return ret;
+-		enc->rc.qp = cedrus_h264_initial_qp(enc->rc.target_bits, ctx->src_fmt.width,
++		enc->rc.qp = cedrus_h264_startup_qp(enc->rc.bitrate,
++						    enc->timeperframe.numerator,
++						    enc->timeperframe.denominator,
++						    ctx->src_fmt.width,
+ 						    ctx->src_fmt.height);
+ 		enc->rc.qp = clamp_t(u32, enc->rc.qp, enc->min_qp, enc->max_qp);
+ 		if (enc->avbr) {
+@@ -371,7 +374,10 @@
+ 			enc->rc.debt = 0;
+ 			if (!enc->frames) {
+ 				cedrus_h264_model_seed(&enc->rc.model, bitrate);
+-				enc->rc.qp = cedrus_h264_initial_qp(target, ctx->src_fmt.width,
++				enc->rc.qp = cedrus_h264_startup_qp(bitrate,
++								    enc->timeperframe.numerator,
++								    enc->timeperframe.denominator,
++								    ctx->src_fmt.width,
+ 								    ctx->src_fmt.height);
+ 				enc->rc.qp = clamp_t(u32, enc->rc.qp, enc->min_qp, enc->max_qp);
+ 			}
+-- 
+Armbian
