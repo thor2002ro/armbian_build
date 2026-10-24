@@ -1,0 +1,110 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: iommu: sun50i: preserve bypass for undeclared masters
+
+Keep physical DMA working for masters without IOMMU bindings.
+Preserve display and deinterlacer address translation.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/drivers/iommu/sun50i-iommu.c b/drivers/iommu/sun50i-iommu.c
+--- a/drivers/iommu/sun50i-iommu.c
++++ b/drivers/iommu/sun50i-iommu.c
+@@ -35,6 +35,7 @@
+ #define IOMMU_ENABLE_ENABLE			BIT(0)
+ 
+ #define IOMMU_BYPASS_REG		0x030
++#define IOMMU_BYPASS_ALL			GENMASK(6, 0)
+ #define IOMMU_AUTO_GATING_REG		0x040
+ #define IOMMU_AUTO_GATING_ENABLE		BIT(0)
+ 
+@@ -113,6 +114,7 @@
+ 
+ 	/* Lock to modify the IOMMU registers */
+ 	spinlock_t iommu_lock;
++	u32 bypass;
+ 
+ 	const struct sun50i_iommu_variant *variant;
+ 
+@@ -477,7 +479,7 @@
+ 	iommu_write(iommu, IOMMU_TTB_REG, sun50i_domain->dt_dma);
+ 	iommu_write(iommu, IOMMU_TLB_PREFETCH_REG,
+ 		    iommu->variant->tlb_prefetch);
+-	iommu_write(iommu, IOMMU_BYPASS_REG, 0);
++	iommu_write(iommu, IOMMU_BYPASS_REG, iommu->bypass);
+ 	iommu_write(iommu, IOMMU_INT_ENABLE_REG, IOMMU_INT_MASK);
+ 	iommu_write(iommu, IOMMU_DM_AUT_CTRL_REG(SUN50I_IOMMU_ACI_NONE),
+ 		    IOMMU_DM_AUT_CTRL_RD_UNAVAIL(SUN50I_IOMMU_ACI_NONE, 0) |
+@@ -833,6 +835,7 @@
+ {
+ 	struct sun50i_iommu_domain *sun50i_domain = to_sun50i_domain(domain);
+ 	struct sun50i_iommu *iommu;
++	unsigned long flags;
+ 
+ 	iommu = sun50i_iommu_from_dev(dev);
+ 	if (!iommu)
+@@ -842,8 +845,12 @@
+ 
+ 	refcount_inc(&sun50i_domain->refcnt);
+ 
+-	if (iommu->domain == domain)
++	if (iommu->domain == domain) {
++		spin_lock_irqsave(&iommu->iommu_lock, flags);
++		iommu_write(iommu, IOMMU_BYPASS_REG, iommu->bypass);
++		spin_unlock_irqrestore(&iommu->iommu_lock, flags);
+ 		return 0;
++	}
+ 
+ 	sun50i_iommu_identity_attach(&sun50i_iommu_identity_domain, dev, old);
+ 
+@@ -866,14 +873,34 @@
+ static int sun50i_iommu_of_xlate(struct device *dev,
+ 				 const struct of_phandle_args *args)
+ {
+-	struct platform_device *iommu_pdev = of_find_device_by_node(args->np);
+-	unsigned id = args->args[0];
+-
+-	dev_iommu_priv_set(dev, platform_get_drvdata(iommu_pdev));
+-
++	struct platform_device *iommu_pdev;
++	struct sun50i_iommu *iommu;
++	unsigned long flags;
++	unsigned int id;
++	int ret;
++
++	if (args->args_count != 1)
++		return -EINVAL;
++	id = args->args[0];
++	if (id >= 6)
++		return -EINVAL;
++	iommu_pdev = of_find_device_by_node(args->np);
++	if (!iommu_pdev)
++		return -ENODEV;
++	iommu = platform_get_drvdata(iommu_pdev);
+ 	put_device(&iommu_pdev->dev);
+-
+-	return iommu_fwspec_add_ids(dev, &id, 1);
++	if (!iommu)
++		return -EPROBE_DEFER;
++	dev_iommu_priv_set(dev, iommu);
++	ret = iommu_fwspec_add_ids(dev, &id, 1);
++	if (ret)
++		return ret;
++
++	spin_lock_irqsave(&iommu->iommu_lock, flags);
++	iommu->bypass &= ~BIT(id);
++	spin_unlock_irqrestore(&iommu->iommu_lock, flags);
++
++	return 0;
+ }
+ 
+ static const struct iommu_ops sun50i_iommu_ops = {
+@@ -1035,6 +1062,7 @@
+ 	if (!iommu)
+ 		return -ENOMEM;
+ 	spin_lock_init(&iommu->iommu_lock);
++	iommu->bypass = IOMMU_BYPASS_ALL;
+ 	iommu->domain = &sun50i_iommu_identity_domain;
+ 	platform_set_drvdata(pdev, iommu);
+ 	iommu->dev = &pdev->dev;
+-- 
+Armbian
