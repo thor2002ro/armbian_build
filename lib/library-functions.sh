@@ -51,6 +51,15 @@ source "${SRC}"/lib/functions/artifacts/artifact-fake-ubuntu-advantage-tools.sh
 #set -o nounset   ## set -u : exit the script if you try to use an uninitialised variable - one day will be enabled
 set -o errtrace # trace ERR through - enabled
 set -o errexit  ## set -e : exit the script if any statement returns a non-true return value - enabled
+### lib/functions/artifacts/artifact-ffmpeg-v4l2-request.sh
+# shellcheck source=lib/functions/artifacts/artifact-ffmpeg-v4l2-request.sh
+source "${SRC}"/lib/functions/artifacts/artifact-ffmpeg-v4l2-request.sh
+
+# no errors tolerated. invoked before each sourced file to make sure.
+#set -o pipefail  # trace ERR through pipes - will be enabled "soon"
+#set -o nounset   ## set -u : exit the script if you try to use an uninitialised variable - one day will be enabled
+set -o errtrace # trace ERR through - enabled
+set -o errexit  ## set -e : exit the script if any statement returns a non-true return value - enabled
 ### lib/functions/artifacts/artifact-firmware.sh
 # shellcheck source=lib/functions/artifacts/artifact-firmware.sh
 source "${SRC}"/lib/functions/artifacts/artifact-firmware.sh
@@ -423,6 +432,15 @@ set -o errexit  ## set -e : exit the script if any statement returns a non-true 
 ### lib/functions/compilation/packages/fake_ubuntu_advantage_tools-deb.sh
 # shellcheck source=lib/functions/compilation/packages/fake_ubuntu_advantage_tools-deb.sh
 source "${SRC}"/lib/functions/compilation/packages/fake_ubuntu_advantage_tools-deb.sh
+
+# no errors tolerated. invoked before each sourced file to make sure.
+#set -o pipefail  # trace ERR through pipes - will be enabled "soon"
+#set -o nounset   ## set -u : exit the script if you try to use an uninitialised variable - one day will be enabled
+set -o errtrace # trace ERR through - enabled
+set -o errexit  ## set -e : exit the script if any statement returns a non-true return value - enabled
+### lib/functions/compilation/packages/ffmpeg-v4l2-request-deb.sh
+# shellcheck source=lib/functions/compilation/packages/ffmpeg-v4l2-request-deb.sh
+source "${SRC}"/lib/functions/compilation/packages/ffmpeg-v4l2-request-deb.sh
 
 # no errors tolerated. invoked before each sourced file to make sure.
 #set -o pipefail  # trace ERR through pipes - will be enabled "soon"
