@@ -23,6 +23,7 @@ function armbian_register_artifacts() {
 		["armbian-plymouth-theme"]="armbian-plymouth-theme"
 		["armbian-base-files"]="armbian-base-files"
 		["armbian-bsp-cli"]="armbian-bsp-cli"
+		["ffmpeg-v4l2-request"]="ffmpeg-v4l2-request"
 
 		# tar.zst
 		["rootfs"]="rootfs"
