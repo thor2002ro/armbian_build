@@ -23,7 +23,7 @@ cd /build/objects
 	--enable-shared --disable-static --enable-pic --disable-autodetect \
 	--enable-gpl --enable-version3 --enable-libdrm --enable-libudev \
 	--enable-v4l2-request --enable-v4l2-m2m --enable-libx264 --enable-openssl \
-	--enable-encoder=mjpeg_v4l2m2m \
+	--enable-encoder=mjpeg_v4l2m2m,h264_v4l2m2m \
 	--enable-decoder=mjpeg_v4l2m2m,h263p --enable-hwaccel=mjpeg_v4l2request,mpeg1_v4l2request,mpeg2_v4l2request,mpeg4_v4l2request,h263_v4l2request,flv_v4l2request \
 	--enable-zlib --enable-bzlib --enable-lzma --disable-doc --disable-debug --disable-ffplay \
 	--extra-version=armbian-v4l2-request
@@ -33,6 +33,7 @@ grep -qx 'CONFIG_H263_V4L2REQUEST_HWACCEL=yes' ffbuild/config.mak
 grep -qx 'CONFIG_MJPEG_V4L2M2M_ENCODER=yes' ffbuild/config.mak
 grep -qx 'CONFIG_MJPEG_V4L2M2M_DECODER=yes' ffbuild/config.mak
 grep -qx 'CONFIG_MJPEG_V4L2REQUEST_HWACCEL=yes' ffbuild/config.mak
+grep -qx 'CONFIG_H264_V4L2M2M_ENCODER=yes' ffbuild/config.mak
 for codec in MPEG1 MPEG2 MPEG4 H263 FLV; do
 	grep -qx "CONFIG_${codec}_V4L2REQUEST_HWACCEL=yes" ffbuild/config.mak
 done

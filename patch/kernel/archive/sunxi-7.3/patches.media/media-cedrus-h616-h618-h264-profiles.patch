@@ -1,0 +1,146 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: media: cedrus: enable H616/H618 H.264 encoder profiles
+
+Expose Baseline, Main, and High encoder profiles.
+Emit the selected profile and the required High SPS fields.
+Keep the current CAVLC and 4x4 transform settings.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
+@@ -415,6 +415,24 @@
+ 
+ 	if (ctrl->id == V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME)
+ 		atomic_set(&ctx->enc->force_key, 1);
++	if (ctrl->id == V4L2_CID_MPEG_VIDEO_H264_PROFILE) {
++		if (vb2_is_streaming(v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx)) ||
++		    vb2_is_streaming(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)))
++			return -EBUSY;
++		switch (ctrl->val) {
++		case V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE:
++			ctx->enc->profile = CEDRUS_H264_PROFILE_BASELINE;
++			break;
++		case V4L2_MPEG_VIDEO_H264_PROFILE_MAIN:
++			ctx->enc->profile = CEDRUS_H264_PROFILE_MAIN;
++			break;
++		case V4L2_MPEG_VIDEO_H264_PROFILE_HIGH:
++			ctx->enc->profile = CEDRUS_H264_PROFILE_HIGH;
++			break;
++		default:
++			return -EINVAL;
++		}
++	}
+ 	return 0;
+ }
+ 
+@@ -443,6 +461,7 @@
+ 	}
+ 	ctx->encoder = true;
+ 	ctx->enc->timeperframe = (struct v4l2_fract) { 1, 30 };
++	ctx->enc->profile = CEDRUS_H264_PROFILE_BASELINE;
+ 	ctx->dev = dev;
+ 	v4l2_fh_init(&ctx->fh, video_devdata(file));
+ 	v4l2_ctrl_handler_init(&ctx->hdl, 8);
+@@ -454,12 +473,12 @@
+ 					  V4L2_CID_MPEG_VIDEO_GOP_SIZE, 1, 300, 1, 30);
+ 	v4l2_ctrl_new_std(&ctx->hdl, &cedrus_enc_ctrl_ops,
+ 			  V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 0, 0, 0, 0);
+-	ctrl = v4l2_ctrl_new_std_menu(&ctx->hdl, NULL,
++	ctrl = v4l2_ctrl_new_std_menu(&ctx->hdl, &cedrus_enc_ctrl_ops,
+ 				      V4L2_CID_MPEG_VIDEO_H264_PROFILE,
+-				      V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE,
+-				      0, V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE);
+-	if (ctrl)
+-		ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++				      V4L2_MPEG_VIDEO_H264_PROFILE_HIGH,
++				      BIT(V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE) |
++				      BIT(V4L2_MPEG_VIDEO_H264_PROFILE_EXTENDED),
++				      V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE);
+ 	ctrl = v4l2_ctrl_new_std_menu(&ctx->hdl, NULL,
+ 				      V4L2_CID_MPEG_VIDEO_H264_LEVEL,
+ 				      V4L2_MPEG_VIDEO_H264_LEVEL_6_2,
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc.h b/drivers/staging/media/sunxi/cedrus/cedrus_enc.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc.h
+@@ -24,6 +24,7 @@
+ 	struct v4l2_ctrl *level_ctrl;
+ 	struct v4l2_fract timeperframe;
+ 	u32 level;
++	enum cedrus_h264_profile profile;
+ 	atomic_t force_key;
+ 	u32 index;
+ 	u32 frames;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+@@ -92,7 +92,7 @@
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0x08),
+ 		     BIT(27) | DIV_ROUND_UP(width / 16, 48) << 10 | enc->qp);
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0x0c), 0);
+-	/* Baseline preset recovered from H616 vendor initialization. */
++	/* CAVLC and 4x4 transforms for all supported profiles. */
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0x10), CEDRUS_H616_MOTION_PARA);
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0x24), 0);
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0x28), 0);
+@@ -226,7 +226,8 @@
+ 	if (ret)
+ 		return ret;
+ 	if (enc->idr) {
+-		cedrus_h264_sps(&bits, ctx->src_fmt.width, ctx->src_fmt.height,
++		cedrus_h264_sps(&bits, enc->profile,
++				ctx->src_fmt.width, ctx->src_fmt.height,
+ 				enc->level, enc->timeperframe.numerator,
+ 				enc->timeperframe.denominator);
+ 		cedrus_h264_pps(&bits);
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.h b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.h
+@@ -150,6 +150,12 @@
+ 	return 0;
+ }
+ 
++enum cedrus_h264_profile {
++	CEDRUS_H264_PROFILE_BASELINE = 66,
++	CEDRUS_H264_PROFILE_MAIN = 77,
++	CEDRUS_H264_PROFILE_HIGH = 100,
++};
++
+ struct cedrus_h264_bits {
+ 	int (*put)(void *opaque, u32 value, unsigned int count, bool raw);
+ 	void *opaque;
+@@ -204,14 +210,29 @@
+ }
+ 
+ static inline void cedrus_h264_sps(struct cedrus_h264_bits *bits,
++				   enum cedrus_h264_profile profile,
+ 				   u32 width, u32 height, u32 level,
+ 				   u32 numerator, u32 denominator)
+ {
++	if (bits->error)
++		return;
++	if (profile != CEDRUS_H264_PROFILE_BASELINE &&
++	    profile != CEDRUS_H264_PROFILE_MAIN &&
++	    profile != CEDRUS_H264_PROFILE_HIGH) {
++		bits->error = -EINVAL;
++		return;
++	}
+ 	cedrus_h264_nal(bits, 0x67);
+-	cedrus_h264_put(bits, 66, 8);
+-	cedrus_h264_put(bits, 0xc0, 8);
++	cedrus_h264_put(bits, profile, 8);
++	cedrus_h264_put(bits, profile == CEDRUS_H264_PROFILE_BASELINE ? 0xc0 : 0, 8);
+ 	cedrus_h264_put(bits, cedrus_h264_levels[level].idc, 8);
+ 	cedrus_h264_ue(bits, 0); /* SPS id. */
++	if (profile == CEDRUS_H264_PROFILE_HIGH) {
++		cedrus_h264_ue(bits, 1); /* 4:2:0 chroma. */
++		cedrus_h264_ue(bits, 0); /* Eight luma bits. */
++		cedrus_h264_ue(bits, 0); /* Eight chroma bits. */
++		cedrus_h264_put(bits, 0, 2); /* No transform bypass or scaling matrix. */
++	}
+ 	cedrus_h264_ue(bits, 0); /* Four frame_num bits. */
+ 	cedrus_h264_ue(bits, 0); /* POC type 0. */
+ 	cedrus_h264_ue(bits, 0); /* Four POC bits. */
+-- 
+Armbian

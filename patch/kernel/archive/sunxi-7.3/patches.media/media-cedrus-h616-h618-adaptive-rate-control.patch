@@ -1,0 +1,1033 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: media: cedrus: complete vendor adaptive rate control
+
+Match vendor MAD prediction and startup quantizers.
+Add motion-based VBR budgets and optional adaptive skip maps.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc.h b/drivers/staging/media/sunxi/cedrus/cedrus_enc.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc.h
+@@ -6,6 +6,7 @@
+ #include "cedrus.h"
+ #include "cedrus_enc_h264.h"
+ #include "cedrus_enc_controls.h"
++#include "cedrus_enc_motion.h"
+ #include "cedrus_enc_jpeg.h"
+ 
+ struct cedrus_dma {
+@@ -26,12 +27,17 @@
+ 	struct cedrus_dma mbinfo;
+ 	struct cedrus_dma deblock;
+ 	struct cedrus_dma qp_map;
++	struct cedrus_dma motion_bitmap;
++	void *motion_workspace;
++	struct cedrus_h264_motion motion;
++	u32 background_qp, map_qp;
++	bool avbr, auto_map;
+ 	struct cedrus_h264_rc rc;
+ 	u32 min_qp, max_qp;
+ 	struct cedrus_h264_roi roi[CEDRUS_H264_ROI_COUNT];
+ 	struct cedrus_h264_roi active_roi[CEDRUS_H264_ROI_COUNT];
+ 	bool roi_active;
+-	struct v4l2_ctrl *rc_ctrls[6];
++	struct v4l2_ctrl *rc_ctrls[10];
+ 	bool rc_enabled, cbr;
+ 	struct v4l2_ctrl *qp_i;
+ 	struct v4l2_ctrl *qp_p;
+@@ -76,6 +82,8 @@
+ void cedrus_enc_h264_stop(struct cedrus_ctx *ctx);
+ int cedrus_enc_h264_setup(struct cedrus_ctx *ctx, dma_addr_t source,
+ 			  dma_addr_t stream, u32 size);
++void cedrus_enc_h264_rate_prepare(struct cedrus_ctx *ctx);
++void cedrus_enc_h264_rate_feedback(struct cedrus_ctx *ctx);
+ void cedrus_enc_complete(struct cedrus_ctx *ctx, enum vb2_buffer_state state);
+ 
+ #endif
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
+@@ -499,7 +499,9 @@
+ 				     ctx->enc->rc_ctrls[1]->val &&
+ 				     ctrl->val == V4L2_MPEG_VIDEO_BITRATE_MODE_VBR) ||
+ 			    ctx->enc->rc_ctrls[3]->val >
+-				    ctx->enc->rc_ctrls[4]->val)
++				    ctx->enc->rc_ctrls[4]->val ||
++			    (ctx->enc->rc_ctrls[6]->val &&
++			     ctrl->val != V4L2_MPEG_VIDEO_BITRATE_MODE_VBR))
+ 				return -EINVAL;
+ 			ctx->enc->rc_enabled = ctrl->val !=
+ 					       V4L2_MPEG_VIDEO_BITRATE_MODE_CQ;
+@@ -622,6 +624,31 @@
+ 	ctx->enc->rc_ctrls[5] = v4l2_ctrl_new_std(&ctx->hdl, &cedrus_enc_ctrl_ops,
+ 		V4L2_CID_MPEG_VIDEO_H264_CPB_SIZE, 1, 32768, 1, 1024);
+ 	{
++		static const struct v4l2_ctrl_config rate[] = {
++			{ .id = V4L2_CID_CEDRUS_H264_AVBR,
++			  .name = "H264 Adaptive VBR", .type = V4L2_CTRL_TYPE_BOOLEAN,
++			  .min = 0, .max = 1, .step = 1, .def = 0 },
++			{ .id = V4L2_CID_CEDRUS_H264_AVBR_QUALITY,
++			  .name = "H264 Adaptive Quality", .type = V4L2_CTRL_TYPE_INTEGER,
++			  .min = 1, .max = 13, .step = 1, .def = 8 },
++			{ .id = V4L2_CID_CEDRUS_H264_VBR_QUALITY,
++			  .name = "H264 Static Quality", .type = V4L2_CTRL_TYPE_INTEGER,
++			  .min = 1, .max = 10, .step = 1, .def = 5 },
++			{ .id = V4L2_CID_CEDRUS_H264_MOTION_THRESHOLD,
++			  .name = "H264 Motion Threshold", .type = V4L2_CTRL_TYPE_INTEGER,
++			  .min = 1, .max = 31, .step = 1, .def = 20 },
++		};
++		unsigned int i;
++
++		for (i = 0; i < ARRAY_SIZE(rate); i++) {
++			struct v4l2_ctrl_config config = rate[i];
++
++			config.ops = &cedrus_enc_ctrl_ops;
++			ctx->enc->rc_ctrls[6 + i] = v4l2_ctrl_new_custom(&ctx->hdl, &config, NULL);
++		}
++	}
++
++	{
+ 		struct v4l2_ctrl_config roi = {
+ 			.ops = &cedrus_enc_ctrl_ops,
+ 			.id = V4L2_CID_CEDRUS_H264_ROI,
+@@ -740,10 +767,8 @@
+ 	enc->retries = 0;
+ 	enc->qp = enc->idr ? enc->qp_i->val : enc->qp_p->val;
+ 	if (!cedrus_enc_is_jpeg(ctx)) {
+-		if (enc->rc_enabled) {
+-			cedrus_h264_rc_begin(&enc->rc, enc->gop->val, enc->idr);
+-			enc->qp = enc->rc.qp;
+-		}
++		if (enc->rc_enabled)
++			cedrus_enc_h264_rate_prepare(ctx);
+ 		enc->qp = clamp_t(u32, enc->qp, enc->min_qp, enc->max_qp);
+ 	}
+ 	memcpy(enc->active_roi,
+@@ -853,6 +878,7 @@
+ 		if (!cedrus_enc_is_jpeg(ctx) && enc->rc_enabled) {
+ 			enc->rc.qp = enc->qp;
+ 			cedrus_h264_rc_feedback(&enc->rc, encoded_bytes * 8, mad, enc->idr);
++			cedrus_enc_h264_rate_feedback(ctx);
+ 			if (enc->cbr) {
+ 				enc->rc.tokens -= (bytes - encoded_bytes) * 8;
+ 				enc->rc.cbr_debt += (s64)bytes * 8 - enc->rc.target_bits;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_controls.h b/drivers/staging/media/sunxi/cedrus/cedrus_enc_controls.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_controls.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_controls.h
+@@ -11,16 +11,17 @@
+ #include <media/cedrus-enc-ctrls.h>
+ 
+ #define CEDRUS_RC_HISTORY 20
+-#define CEDRUS_RC_MAX_RATE BIT(20)
++#define CEDRUS_RC_MAX_RATE BIT(28)
+ 
+ struct cedrus_h264_sample {
+-	/* MAD uses Q8. Qstep uses four fractional bits. */
++	/* MAD and rate use Q8. Qstep uses four fractional bits. */
+ 	u32 step, rate, mad;
+ };
+ 
+ struct cedrus_h264_model {
+ 	struct cedrus_h264_sample sample[CEDRUS_RC_HISTORY];
+-	u32 count, window, last_mad;
++	u32 count, window, mad_window, last_mad;
++	u32 mad_count, oldest_mad;
+ 	/* Q8 coefficients describe the vendor rate versus quantizer model. */
+ 	s64 x1, x2;
+ 	u32 last_i_bits, last_i_target, last_i_qp;
+@@ -77,35 +78,340 @@
+ 	determinant = n * sxx - sx * sx;
+ 	if (determinant <= 0)
+ 		return;
+-	slope = div64_s64((n * sxy - sx * sy) * 256, determinant);
++	slope = div64_s64(n * sxy - sx * sy, determinant);
+ 	model->x2 = clamp_t(s64, slope, -(1LL << 30), 1LL << 30);
+-	model->x1 = div64_s64(sy * 256 - model->x2 * sx, n);
+-}
+-
+-static inline u32 cedrus_h264_model_mad(const struct cedrus_h264_model *model)
+-{
+-	s64 sx = 0, sy = 0, sxx = 0, sxy = 0, determinant, slope, offset;
+-	u32 i, count = model->count;
+-
+-	if (count < 3)
+-		return model->last_mad;
+-	count = min_t(u32, model->window, count - 1);
++	model->x1 = div64_s64(sy - model->x2 * sx, n);
++}
++
++static inline u32 cedrus_h264_mad_at(const struct cedrus_h264_model *model, u32 index)
++{
++	return index == CEDRUS_RC_HISTORY ? model->oldest_mad : model->sample[index].mad;
++}
++
++#ifdef __SIZEOF_INT128__
++/* MAD operands stay finite and normal. Integer arithmetic preserves vendor binary64 rounding. */
++struct cedrus_mad_fp {
++	s64 fraction;
++	int exponent;
++};
++
++static inline int cedrus_mad_bits(unsigned __int128 value)
++{
++	u64 high = value >> 64;
++
++	return high ? 128 - __builtin_clzll(high) :
++	       value ? 64 - __builtin_clzll((u64)value) : 0;
++}
++
++static inline u64 cedrus_mad_abs(struct cedrus_mad_fp value)
++{
++	return value.fraction < 0 ? -value.fraction : value.fraction;
++}
++
++static inline struct cedrus_mad_fp cedrus_mad_round(bool negative,
++						    unsigned __int128 value, int exponent)
++{
++	unsigned __int128 fraction, remainder, half;
++	int shift;
++
++	if (!value)
++		return (struct cedrus_mad_fp){0};
++	/* Round to nearest, ties to even. */
++	shift = cedrus_mad_bits(value) - 53;
++	if (shift > 0) {
++		fraction = value >> shift;
++		remainder = value & (((unsigned __int128)1 << shift) - 1);
++		half = (unsigned __int128)1 << (shift - 1);
++		fraction += remainder > half || (remainder == half && (fraction & 1));
++	} else {
++		fraction = value << -shift;
++	}
++	if (fraction >> 53) {
++		fraction >>= 1;
++		shift++;
++	}
++	return (struct cedrus_mad_fp) {
++		.fraction = negative ? -(s64)fraction : (s64)fraction,
++		.exponent = exponent + shift,
++	};
++}
++
++static inline unsigned __int128 cedrus_mad_align(unsigned __int128 value, int shift)
++{
++	unsigned __int128 mask;
++
++	if (shift >= 0)
++		return value << shift;
++	if (shift <= -128)
++		return !!value;
++	mask = ((unsigned __int128)1 << -shift) - 1;
++	return (value >> -shift) | !!(value & mask);
++}
++
++static inline struct cedrus_mad_fp cedrus_mad_sum(unsigned __int128 a, int ae, bool an,
++						  unsigned __int128 b, int be, bool bn)
++{
++	int exponent;
++
++	if (!a)
++		return cedrus_mad_round(bn, b, be);
++	if (!b)
++		return cedrus_mad_round(an, a, ae);
++	exponent = max_t(int, ae + cedrus_mad_bits(a), be + cedrus_mad_bits(b)) - 126;
++	a = cedrus_mad_align(a, ae - exponent);
++	b = cedrus_mad_align(b, be - exponent);
++	if (an == bn)
++		return cedrus_mad_round(an, a + b, exponent);
++	return a >= b ? cedrus_mad_round(an, a - b, exponent) :
++		       cedrus_mad_round(bn, b - a, exponent);
++}
++
++static inline struct cedrus_mad_fp cedrus_mad_from(u64 value, int exponent)
++{
++	return cedrus_mad_round(false, value, exponent);
++}
++
++static inline struct cedrus_mad_fp cedrus_mad_neg(struct cedrus_mad_fp value)
++{
++	value.fraction = -value.fraction;
++	return value;
++}
++
++static inline struct cedrus_mad_fp cedrus_mad_add(struct cedrus_mad_fp a,
++						  struct cedrus_mad_fp b)
++{
++	return cedrus_mad_sum(cedrus_mad_abs(a), a.exponent, a.fraction < 0,
++			      cedrus_mad_abs(b), b.exponent, b.fraction < 0);
++}
++
++static inline struct cedrus_mad_fp cedrus_mad_mul(struct cedrus_mad_fp a,
++						  struct cedrus_mad_fp b)
++{
++	return cedrus_mad_round((a.fraction < 0) != (b.fraction < 0),
++		(unsigned __int128)cedrus_mad_abs(a) * cedrus_mad_abs(b),
++		a.exponent + b.exponent);
++}
++
++static inline struct cedrus_mad_fp cedrus_mad_fma(struct cedrus_mad_fp a,
++						  struct cedrus_mad_fp b,
++						  struct cedrus_mad_fp c)
++{
++	return cedrus_mad_sum((unsigned __int128)cedrus_mad_abs(a) * cedrus_mad_abs(b),
++			      a.exponent + b.exponent, (a.fraction < 0) != (b.fraction < 0),
++			      cedrus_mad_abs(c), c.exponent, c.fraction < 0);
++}
++
++static inline struct cedrus_mad_fp cedrus_mad_div(struct cedrus_mad_fp a,
++						  struct cedrus_mad_fp b)
++{
++	u64 remainder = cedrus_mad_abs(a), divisor = cedrus_mad_abs(b), quotient = 1;
++	int i, exponent = a.exponent - b.exponent - 55;
++
++	if (!remainder || !divisor)
++		return (struct cedrus_mad_fp){0};
++	if (remainder < divisor) {
++		remainder <<= 1;
++		exponent--;
++	}
++	remainder -= divisor;
++	for (i = 0; i < 55; i++) {
++		remainder <<= 1;
++		quotient <<= 1;
++		if (remainder >= divisor) {
++			remainder -= divisor;
++			quotient++;
++		}
++	}
++	return cedrus_mad_round((a.fraction < 0) != (b.fraction < 0),
++				quotient | !!remainder, exponent);
++}
++
++static inline bool cedrus_mad_greater(struct cedrus_mad_fp a, struct cedrus_mad_fp b)
++{
++	if (!a.fraction)
++		return false;
++	if (!b.fraction)
++		return true;
++	return a.exponent != b.exponent ? a.exponent > b.exponent :
++					 a.fraction > b.fraction;
++}
++
++static inline void cedrus_h264_mad_fit(const struct cedrus_h264_model *model,
++				       const bool *reject, u32 count,
++				       struct cedrus_mad_fp *slope,
++				       struct cedrus_mad_fp *offset)
++{
++	u64 sx = 0, sy = 0, sxx = 0, sxy = 0, n = 0;
++	struct cedrus_mad_fp denominator, product, sum;
++	s64 determinant, numerator;
++	u32 i, first = 0;
++	bool different = false;
++
++	*slope = (struct cedrus_mad_fp){0};
++	*offset = (struct cedrus_mad_fp){0};
+ 	for (i = 0; i < count; i++) {
+-		s64 x = model->sample[i + 1].mad;
+-		s64 y = model->sample[i].mad;
+-
++		u64 x = cedrus_h264_mad_at(model, i + 1);
++		u64 y = model->sample[i].mad;
++
++		if (reject[i])
++			continue;
++		if (!n)
++			first = y;
++		different |= y != first;
+ 		sx += x;
+ 		sy += y;
+ 		sxx += x * x;
+ 		sxy += x * y;
+-	}
+-	determinant = count * sxx - sx * sx;
+-	if (determinant <= 0)
++		n++;
++	}
++	if (!n)
++		return;
++	determinant = (s64)n * sxx - (s64)sx * sx;
++	if (different && determinant > 0) {
++		denominator = cedrus_mad_from(determinant, -16);
++		numerator = (s64)n * sxy - (s64)sx * sy;
++		product = cedrus_mad_round(numerator < 0,
++					   numerator < 0 ? -numerator : numerator, -16);
++		*slope = cedrus_mad_div(product, denominator);
++		product = cedrus_mad_mul(cedrus_mad_from(sx, -8), cedrus_mad_from(sxy, -16));
++		sum = cedrus_mad_fma(cedrus_mad_from(sxx, -16), cedrus_mad_from(sy, -8),
++				     cedrus_mad_neg(product));
++		*offset = cedrus_mad_div(sum, denominator);
++	} else if (different) {
++		*slope = cedrus_mad_div(cedrus_mad_from(sy, 0), cedrus_mad_from(sx, 0));
++	} else {
++		for (i = 0; i < count; i++) {
++			if (reject[i])
++				continue;
++			denominator = cedrus_mad_from(n * cedrus_h264_mad_at(model, i + 1), 0);
++			product = cedrus_mad_div(cedrus_mad_from(model->sample[i].mad, 0),
++						 denominator);
++			*slope = cedrus_mad_add(*slope, product);
++		}
++	}
++}
++
++static inline u32 cedrus_h264_model_mad(const struct cedrus_h264_model *model)
++{
++	bool reject[CEDRUS_RC_HISTORY] = { false };
++	struct cedrus_mad_fp errors[CEDRUS_RC_HISTORY], total = {0};
++	struct cedrus_mad_fp slope, offset, prediction, threshold = {0};
++	u32 i, count;
++	int shift;
++
++	if (model->count < 2)
+ 		return model->last_mad;
+-	slope = div64_s64((count * sxy - sx * sy) * 256, determinant);
+-	slope = clamp_t(s64, slope, -4096, 4096);
+-	offset = div64_s64(sy * 256 - slope * sx, count);
+-	return clamp_t(s64, div64_s64(slope * model->last_mad + offset, 256), 1, 65535);
++	count = min_t(u32, model->mad_window,
++		      max_t(u32, model->mad_count, model->count) - 1);
++	if (!count)
++		return model->last_mad;
++	cedrus_h264_mad_fit(model, reject, count, &slope, &offset);
++	for (i = 0; i < count; i++) {
++		prediction = cedrus_mad_from(cedrus_h264_mad_at(model, i + 1), -8);
++		prediction = cedrus_mad_fma(slope, prediction, offset);
++		errors[i] = cedrus_mad_from(model->sample[i].mad, -8);
++		errors[i] = cedrus_mad_add(prediction, cedrus_mad_neg(errors[i]));
++		total = cedrus_mad_fma(errors[i], errors[i], total);
++	}
++	if (count != 2)
++		threshold = cedrus_mad_div(total, cedrus_mad_from(count, 0));
++	for (i = 1; i < count; i++)
++		reject[i] = cedrus_mad_greater(cedrus_mad_mul(errors[i], errors[i]), threshold);
++	cedrus_h264_mad_fit(model, reject, count, &slope, &offset);
++	prediction = cedrus_mad_mul(slope, cedrus_mad_from(model->last_mad, -8));
++	prediction = cedrus_mad_add(prediction, offset);
++	if (prediction.fraction <= 0)
++		return 1;
++	if (prediction.exponent >= -44)
++		return 65535;
++	shift = -prediction.exponent - 8;
++	return shift >= 64 ? 1 : max_t(u64, prediction.fraction >> shift, 1);
++}
++
++#else
++static inline void cedrus_h264_mad_fit(const struct cedrus_h264_model *model,
++				       const bool *reject, u32 count,
++				       s64 *slope, s64 *offset)
++{
++	s64 sx = 0, sy = 0, sxx = 0, sxy = 0, ratios = 0, n = 0;
++	s64 determinant;
++	u32 i, first = 0;
++	bool different = false;
++
++	for (i = 0; i < count; i++) {
++		s64 x = model->sample[i + 1].mad;
++		s64 y = model->sample[i].mad;
++
++		if (reject[i])
++			continue;
++		if (!n)
++			first = y;
++		different |= y != first;
++		sx += x;
++		sy += y;
++		sxx += x * x;
++		sxy += x * y;
++		ratios += div64_s64(y * 65536, x);
++		n++;
++	}
++	*slope = div64_s64(ratios, n);
++	*offset = 0;
++	if (!different)
++		return;
++	determinant = n * sxx - sx * sx;
++	if (determinant <= 0) {
++		*slope = div64_s64(sy * 65536, sx);
++		return;
++	}
++	*slope = div64_s64((n * sxy - sx * sy) * 65536, determinant);
++	*offset = div64_s64(sy * 65536 - *slope * sx, n);
++}
++
++static inline u32 cedrus_h264_model_mad(const struct cedrus_h264_model *model)
++{
++	bool reject[CEDRUS_RC_HISTORY] = { false };
++	u64 errors[CEDRUS_RC_HISTORY], total = 0;
++	s64 slope, offset;
++	u32 i, count;
++
++	if (model->count < 2)
++		return model->last_mad;
++	count = min_t(u32, model->mad_window, model->count - 1);
++	if (!count)
++		return model->last_mad;
++	cedrus_h264_mad_fit(model, reject, count, &slope, &offset);
++	for (i = 0; i < count; i++) {
++		s64 error = div64_s64(slope * model->sample[i + 1].mad + offset -
++				    (s64)model->sample[i].mad * 65536, 65536);
++
++		errors[i] = error * error;
++		total += errors[i];
++	}
++	for (i = 1; i < count; i++)
++		reject[i] = errors[i] > (count == 2 ? 0 : div_u64(total, count));
++	cedrus_h264_mad_fit(model, reject, count, &slope, &offset);
++	return clamp_t(s64, div64_s64(slope * model->last_mad + offset, 65536), 1, 65535);
++}
++
++#endif
++
++static inline u32 cedrus_h264_initial_qp(u32 bits, u32 width, u32 height)
++{
++	u64 pixels = (u64)width * height;
++	u32 qp = 35;
++
++	if (!pixels)
++		return qp;
++	if ((u64)bits * 5 > pixels * 3)
++		qp = 10;
++	else if ((u64)bits * 10 > pixels * 3)
++		qp = 20;
++	else if ((u64)bits * 20 > pixels)
++		qp = div_u64(pixels * 37 - (u64)bits * 40, pixels);
++	if (width == 3840 && height == 2160)
++		qp += (u64)bits * 100 > pixels * 21 ? 6 :
++		      (u64)bits * 100 > pixels * 12 ? 5 : 4;
++	return qp;
+ }
+ 
+ static inline void cedrus_h264_model_update(struct cedrus_h264_model *model,
+@@ -121,25 +427,29 @@
+ 		return;
+ 	window = model->last_mad ? div_u64((u64)min_t(u32, mad, model->last_mad) *
+ 		CEDRUS_RC_HISTORY, max_t(u32, mad, model->last_mad)) : 1;
++	model->oldest_mad = model->sample[CEDRUS_RC_HISTORY - 1].mad;
+ 	memmove(model->sample + 1, model->sample,
+ 		sizeof(model->sample[0]) * (CEDRUS_RC_HISTORY - 1));
+ 	model->count = min_t(u32, model->count + 1, CEDRUS_RC_HISTORY);
+ 	model->window = clamp_t(u32, window, 1, min_t(u32, model->window + 1, model->count));
++	model->mad_count = min_t(u32, model->mad_count + 1, CEDRUS_RC_HISTORY + 1);
++	model->mad_window = min_t(u32, model->mad_count - 1,
++				  min_t(u32, max_t(u32, window, 1), model->mad_window + 1));
+ 	model->last_mad = mad;
+ 	model->sample[0] = (struct cedrus_h264_sample) {
+ 		.step = step,
+-		.rate = clamp_t(u64, div_u64((u64)bits * 256, mad), 1, CEDRUS_RC_MAX_RATE),
++		.rate = clamp_t(u64, div_u64((u64)bits << 16, mad), 1, CEDRUS_RC_MAX_RATE),
+ 		.mad = mad,
+ 	};
+ 	if (!model->x1) {
+-		model->x1 = (u64)model->sample[0].rate * step * 256;
++		model->x1 = (u64)model->sample[0].rate * step;
+ 		model->x2 = 0;
+ 	}
+ 	cedrus_h264_model_fit(model, reject, model->window);
+ 	for (i = 0; i < model->window; i++) {
+ 		const struct cedrus_h264_sample *sample = &model->sample[i];
+ 		s64 prediction = div64_s64(model->x1 * sample->step + model->x2 * 65536,
+-					  (u64)sample->step * sample->step * 256);
++					  (u64)sample->step * sample->step);
+ 		s64 error = clamp_t(s64, prediction, 0, CEDRUS_RC_MAX_RATE) - sample->rate;
+ 
+ 		errors[i] = error * error;
+@@ -150,7 +460,7 @@
+ 	cedrus_h264_model_fit(model, reject, model->window);
+ 	if (model->x1 <= 0 || model->x1 > (1LL << 42) ||
+ 	    model->x1 * 10 + model->x2 * 131072 <= 0) {
+-		model->x1 = old_x1 ? old_x1 : (s64)model->sample[0].rate * step * 256;
++		model->x1 = old_x1 ? old_x1 : (s64)model->sample[0].rate * step;
+ 		model->x2 = old_x1 ? old_x2 : 0;
+ 	}
+ }
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_motion.h b/drivers/staging/media/sunxi/cedrus/cedrus_enc_motion.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_motion.h
+@@ -0,0 +1,207 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _CEDRUS_ENC_MOTION_H_
++#define _CEDRUS_ENC_MOTION_H_
++
++#include <linux/bitops.h>
++#include <linux/kernel.h>
++#include <linux/math64.h>
++#include <linux/string.h>
++#include <linux/types.h>
++
++struct cedrus_h264_rect {
++	u32 left, right, top, bottom;
++};
++
++struct cedrus_h264_motion {
++	struct cedrus_h264_rect rect[8];
++	u32 count, moving_count, static_count, level;
++	bool moving;
++};
++
++static inline u32 cedrus_h264_avbr_qp(u32 quality)
++{
++	static const u8 qp[] = { 44, 41, 38, 35, 32, 30, 28, 26, 24, 22, 20, 17, 14 };
++
++	return qp[clamp_t(u32, quality, 1, ARRAY_SIZE(qp)) - 1];
++}
++
++static inline void cedrus_h264_motion_level(struct cedrus_h264_motion *motion,
++					    const u8 *bitmap, u32 blocks)
++{
++	u32 i, active = 0, bits = blocks * 4;
++
++	for (i = 0; i < blocks / 2; i++)
++		active += hweight8(bitmap[i]);
++	if (blocks & 1)
++		active += hweight8(bitmap[blocks / 2] & 15);
++	if ((u64)active * 200 > bits)
++		motion->moving_count = min_t(u32, motion->moving_count + 1, 3);
++	else
++		motion->moving_count = 0;
++	motion->moving = motion->moving_count >= 3;
++	motion->level = !motion->moving ? 0 : active * 10 > bits ? 3 :
++			active * 20 > bits ? 2 : 1;
++}
++
++static inline void cedrus_h264_motion_state(struct cedrus_h264_motion *motion,
++					    u32 coverage, u32 blocks)
++{
++	if ((u64)coverage * 2 > blocks) {
++		motion->static_count = 0;
++		motion->moving_count = min_t(u32, motion->moving_count + 1, 3);
++		if (motion->moving_count >= 3)
++			motion->moving = true;
++	} else {
++		motion->moving_count = 0;
++		motion->static_count = min_t(u32, motion->static_count + 1, 10);
++		if (motion->static_count >= 10)
++			motion->moving = false;
++	}
++}
++
++static inline u32 cedrus_h264_motion_bitrate(const struct cedrus_h264_motion *motion,
++					     u32 bitrate, u32 peak, u32 quality)
++{
++	u32 scale = motion->moving ? motion->level == 3 ? 16 :
++		    motion->level == 2 ? 12 : 10 : quality;
++
++	return clamp_t(u64, div_u64((u64)bitrate * scale, 10), 1, peak);
++}
++
++static inline u32 cedrus_h264_motion_neighbors(const u8 *grid, u32 width, u32 at)
++{
++	u32 count = 0;
++	int x, y;
++
++	for (y = -1; y <= 1; y++)
++		for (x = -1; x <= 1; x++)
++			count += grid[(int)at + y * (int)width + x] != 0;
++	return count;
++}
++
++static inline void cedrus_h264_motion_cluster(struct cedrus_h264_rect *r,
++					      const u8 *grid, u8 *visited, u32 *queue,
++					      u32 width, u32 blocks, u32 seed)
++{
++	u32 head = 0, tail = 0;
++	int dx, dy;
++
++	queue[tail++] = seed;
++	visited[seed] = 1;
++	while (head < tail) {
++		u32 at = queue[head++], x = at % width, y = at / width;
++
++		r->left = min_t(u32, r->left, x);
++		r->right = max_t(u32, r->right, x);
++		r->top = min_t(u32, r->top, y);
++		r->bottom = max_t(u32, r->bottom, y);
++		for (dy = -3; dy <= 3; dy++)
++			for (dx = -3; dx <= 3; dx++) {
++				int next = (int)at + dy * (int)width + dx;
++
++				if (next < 0 || next >= (int)blocks || !grid[next] || visited[next])
++					continue;
++				visited[next] = 1;
++				queue[tail++] = next;
++			}
++	}
++}
++
++static inline u32 cedrus_h264_rect_area(const struct cedrus_h264_rect *r)
++{
++	return (r->right - r->left) * (r->bottom - r->top);
++}
++
++static inline void cedrus_h264_motion_regions(struct cedrus_h264_motion *motion,
++					      const u8 *bitmap, void *workspace,
++					      u32 width, u32 height)
++{
++	struct cedrus_h264_rect rect[32];
++	u32 blocks = width * height;
++	u8 *input = workspace, *filtered = input + blocks;
++	u8 *dilated = filtered + blocks, *output = dilated + blocks;
++	u32 *queue = (u32 *)(output + blocks);
++	u32 i, x, y, count = 0;
++	int dx, dy;
++
++	memset(workspace, 0, blocks * 4);
++	motion->count = 0;
++	for (i = 0; i < blocks; i++)
++		input[i] = !!((bitmap[i / 2] >> ((i & 1) * 4)) & 15);
++	for (y = 1; y + 1 < height; y++)
++		for (x = 1; x + 1 < width; x++) {
++			i = y * width + x;
++			filtered[i] = input[i] &&
++				cedrus_h264_motion_neighbors(input, width, i) > 1;
++		}
++	for (y = 1; y + 1 < height; y++)
++		for (x = 1; x + 1 < width; x++) {
++			i = y * width + x;
++			if (!filtered[i])
++				continue;
++			dilated[i] = 1;
++			if (cedrus_h264_motion_neighbors(filtered, width, i) <= 4)
++				continue;
++			for (dy = -1; dy <= 1; dy++)
++				for (dx = -1; dx <= 1; dx++)
++					dilated[(int)i + dy * (int)width + dx] = 1;
++		}
++	for (y = 1; y + 1 < height; y++)
++		for (x = 1; x + 1 < width; x++) {
++			i = y * width + x;
++			if (!dilated[i])
++				continue;
++			for (dy = -1; dy <= 1; dy++)
++				for (dx = -1; dx <= 1; dx++) {
++					int nx = x + dx, ny = y + dy;
++
++					if (nx > 0 && nx + 1 < (int)width &&
++					    ny > 0 && ny + 1 < (int)height)
++						output[ny * width + nx] = 1;
++				}
++		}
++	/* Reuse the input grid for visits. Use a queue instead of vendor recursion. */
++	memset(input, 0, blocks);
++	for (y = 1; y + 1 < height; y++)
++		for (x = 1; x + 1 < width; x++)
++			input[y * width + x] = dilated[y * width + x];
++	for (y = 3; y + 3 < height && count < ARRAY_SIZE(rect); y++)
++		for (x = 3; x + 3 < width && count < ARRAY_SIZE(rect); x++) {
++			struct cedrus_h264_rect *r = &rect[count];
++
++			i = y * width + x;
++			if (!output[i] || input[i])
++				continue;
++			*r = (struct cedrus_h264_rect){ x, x, y, y };
++			cedrus_h264_motion_cluster(r, output, input, queue, width, blocks, i);
++			r->left = r->left > 2 ? r->left - 2 : 0;
++			r->top = r->top > 2 ? r->top - 2 : 0;
++			r->right = min_t(u32, r->right + 2, width - 1);
++			r->bottom = min_t(u32, r->bottom + 2, height - 1);
++			count++;
++		}
++	if (count > ARRAY_SIZE(motion->rect)) {
++		u32 keep = 0;
++
++		for (i = 0; i < count; i++)
++			if (rect[i].right - rect[i].left > 2 || rect[i].bottom - rect[i].top > 2)
++				rect[keep++] = rect[i];
++		count = keep;
++		for (i = 0; i < min_t(u32, count, ARRAY_SIZE(motion->rect)); i++)
++			for (x = i + 1; x < count; x++) {
++				u32 a = cedrus_h264_rect_area(&rect[i]);
++				u32 b = cedrus_h264_rect_area(&rect[x]);
++
++				if (b > a) {
++					struct cedrus_h264_rect tmp = rect[i];
++
++					rect[i] = rect[x];
++					rect[x] = tmp;
++				}
++			}
++	}
++	motion->count = min_t(u32, count, ARRAY_SIZE(motion->rect));
++	memcpy(motion->rect, rect, motion->count * sizeof(rect[0]));
++}
++
++#endif
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+@@ -9,6 +9,7 @@
+ #include <linux/iosys-map.h>
+ #include <linux/iopoll.h>
+ #include <linux/reset.h>
++#include <linux/slab.h>
+ 
+ #include "cedrus_enc.h"
+ #include "cedrus_hw.h"
+@@ -25,6 +26,33 @@
+ 	return !cedrus_read(dev, 0xf0) && cedrus_read(dev, 0xe4) == 0x12011;
+ }
+ 
++static void cedrus_enc_h264_skip_map(struct cedrus_enc_ctx *enc, u32 width, u32 height)
++{
++	u8 *map = enc->qp_map.cpu;
++	u32 x, y, i;
++
++	for (y = 0; y < height / 16; y++)
++		for (x = 0; x < width / 16; x++) {
++			bool foreground = false;
++
++			for (i = 0; i < enc->motion.count; i++) {
++				const struct cedrus_h264_rect *r = &enc->motion.rect[i];
++
++				foreground |= x >= r->left && x <= r->right &&
++					      y >= r->top && y <= r->bottom;
++			}
++			for (i = 0; i < CEDRUS_H264_ROI_COUNT; i++) {
++				const struct cedrus_h264_roi *r = &enc->active_roi[i];
++
++				foreground |= (r->flags & CEDRUS_ROI_ENABLE) &&
++					x >= r->left / 16 && x < (r->left + r->width) / 16 &&
++					y >= r->top / 16 && y < (r->top + r->height) / 16;
++			}
++			if (!foreground)
++				map[y * (width / 16) + x] |= BIT(6);
++		}
++}
++
+ static int cedrus_enc_h264_registers(struct cedrus_ctx *ctx, dma_addr_t source,
+ 				     dma_addr_t stream, u32 size)
+ {
+@@ -32,8 +60,8 @@
+ 	struct cedrus_enc_ctx *enc = ctx->enc;
+ 	u32 width = ctx->src_fmt.width, height = ctx->src_fmt.height;
+ 	u32 index = enc->index, reference = enc->idr ? index : index ^ 1;
+-	u32 start, end, recon, ref, sub, subref, info, deblock = 0, qp_map = 0;
+-	u32 parameter;
++	u32 start, end, recon, ref, sub, subref, info, deblock = 0, qp_map = 0, motion = 0;
++	u32 parameter, smart = 0, map_qp = enc->qp;
+ 	int ret;
+ 
+ 	if (!cedrus_enc_h264_supported(dev))
+@@ -69,12 +97,32 @@
+ 			return ret;
+ 	}
+ 
+-	if (enc->roi_active) {
++	if (enc->motion_bitmap.cpu) {
++		if (!enc->idr) {
++			ret = cedrus_h264_dma(enc->motion_bitmap.dma, enc->motion_bitmap.size,
++					      &motion);
++			if (ret)
++				return ret;
++			memset(enc->motion_bitmap.cpu, 0, enc->motion_bitmap.size);
++			dma_wmb();
++		}
++		smart = enc->avbr ? 9 | (2 << 9) : enc->rc_ctrls[9]->val;
++		if (enc->auto_map)
++			smart |= BIT(8);
++	}
++
++	if (enc->roi_active || enc->auto_map) {
++		if (enc->auto_map) {
++			map_qp = max_t(u32, enc->qp, cedrus_h264_avbr_qp(enc->rc_ctrls[7]->val));
++			map_qp = clamp_t(u32, map_qp, enc->min_qp, enc->max_qp);
++		}
+ 		ret = cedrus_h264_roi_map(enc->qp_map.cpu, enc->qp_map.size,
+-					  width, height, enc->qp, enc->min_qp,
++					  width, height, map_qp, enc->min_qp,
+ 					  enc->max_qp, enc->active_roi);
+ 		if (ret)
+ 			return ret;
++		if (enc->auto_map)
++			cedrus_enc_h264_skip_map(enc, width, height);
+ 		ret = cedrus_h264_dma(enc->qp_map.dma, enc->qp_map.size,
+ 				      &qp_map);
+ 		if (ret)
+@@ -119,12 +167,15 @@
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0x10), CEDRUS_H616_MOTION_PARA);
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0x24), 0);
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0x28), 0);
+-	cedrus_write(dev, CEDRUS_ENC_REG(0x2c), 0);
++	/* Keep hardware rate control disabled. Software selects each picture QP. */
++	cedrus_write(dev, CEDRUS_ENC_REG(0x2c), enc->motion_bitmap.cpu ?
++		     0x1900 | (motion ? BIT(25) : 0) : 0);
++	cedrus_write(dev, CEDRUS_ENC_REG(0xf8), motion);
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0x30), 0);
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0x34), 0);
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0x38), 0);
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0x3c), 0);
+-	cedrus_write(dev, CEDRUS_ENC_REG(0x40), 0);
++	cedrus_write(dev, CEDRUS_ENC_REG(0x40), smart);
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0x44), 0);
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0x48), 0);
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0x4c), 0);
+@@ -133,10 +184,11 @@
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0x58), 0);
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0x5c), 0);
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0x60), 0);
+-	if (enc->roi_active) {
++	if (enc->roi_active || enc->auto_map) {
+ 		cedrus_write(dev, CEDRUS_ENC_REG(0xfc), qp_map);
+-		cedrus_write(dev, CEDRUS_ENC_REG(0x40), BIT(25));
+-	}
++		cedrus_write(dev, CEDRUS_ENC_REG(0x40), smart | BIT(25));
++	}
++	enc->map_qp = map_qp;
+ 	enc->stream_size = size;
+ 	return 0;
+ }
+@@ -182,7 +234,7 @@
+ 	struct cedrus_dma *buffers[] = {
+ 		&enc->recon[0],	 &enc->recon[1], &enc->subpix[0],
+ 		&enc->subpix[1], &enc->mbinfo,	 &enc->deblock,
+-		&enc->qp_map,
++		&enc->qp_map, &enc->motion_bitmap,
+ 	};
+ 	unsigned int i;
+ 
+@@ -195,6 +247,9 @@
+ 			buffer->cpu = NULL;
+ 		}
+ 	}
++	kvfree(enc->motion_workspace);
++	enc->motion_workspace = NULL;
++	enc->auto_map = false;
+ }
+ 
+ int cedrus_enc_h264_start(struct cedrus_ctx *ctx)
+@@ -215,6 +270,9 @@
+ 		return ret;
+ 	enc->min_qp = enc->rc_ctrls[3]->val;
+ 	enc->max_qp = enc->rc_ctrls[4]->val;
++	enc->avbr = enc->rc_ctrls[6]->val;
++	enc->motion = (struct cedrus_h264_motion){0};
++	enc->auto_map = false;
+ 	if (enc->rc_enabled) {
+ 		ret = cedrus_h264_rc_init(
+ 			&enc->rc, enc->rc_ctrls[1]->val,
+@@ -227,6 +285,16 @@
+ 		ret = cedrus_h264_rc_configure(&enc->rc, enc->rc_ctrls[5]->val);
+ 		if (ret)
+ 			return ret;
++		enc->rc.qp = cedrus_h264_initial_qp(enc->rc.target_bits, ctx->src_fmt.width,
++						    ctx->src_fmt.height);
++		enc->rc.qp = clamp_t(u32, enc->rc.qp, enc->min_qp, enc->max_qp);
++		if (enc->avbr) {
++			u32 qp = cedrus_h264_avbr_qp(enc->rc_ctrls[7]->val);
++
++			enc->rc.qp = clamp_t(u32, qp < 30 ? qp + 4 : qp,
++					     enc->min_qp, enc->max_qp);
++		}
++		enc->background_qp = enc->rc.qp;
+ 	}
+ 	if (enc->rc_enabled) {
+ 		/* Use conservative Main profile bitrate limits for all profiles. */
+@@ -260,6 +328,21 @@
+ 					   (ctx->src_fmt.height / 16));
+ 	if (ret)
+ 		goto error;
++	if (enc->rc_enabled && !enc->cbr) {
++		u32 blocks = (ctx->src_fmt.width / 16) * (ctx->src_fmt.height / 16);
++
++		ret = cedrus_enc_dma_alloc(ctx, &enc->motion_bitmap, DIV_ROUND_UP(blocks, 2));
++		if (ret)
++			goto error;
++		if (enc->avbr) {
++			enc->motion_workspace = kvzalloc((size_t)blocks * 8, GFP_KERNEL);
++			if (!enc->motion_workspace) {
++				ret = -ENOMEM;
++				goto error;
++			}
++		}
++	}
++
+ 	enc->frames = 0;
+ 	enc->index = 0;
+ 	atomic_set(&enc->force_key, 1);
+@@ -267,6 +350,71 @@
+ error:
+ 	cedrus_enc_h264_stop(ctx);
+ 	return ret;
++}
++
++void cedrus_enc_h264_rate_prepare(struct cedrus_ctx *ctx)
++{
++	struct cedrus_enc_ctx *enc = ctx->enc;
++	u32 bitrate = enc->rc_ctrls[1]->val;
++
++	if (!enc->cbr && !enc->avbr) {
++		u32 target;
++		u64 bits;
++
++		bitrate = cedrus_h264_motion_bitrate(&enc->motion, bitrate,
++						     enc->rc_ctrls[2]->val, enc->rc_ctrls[8]->val);
++		bits = (u64)bitrate * enc->timeperframe.numerator;
++		target = max_t(u64, 1, div_u64(bits, enc->timeperframe.denominator));
++		if (target != enc->rc.target_bits) {
++			enc->rc.target_bits = target;
++			enc->rc.gop_left = 0;
++			enc->rc.debt = 0;
++			if (!enc->frames) {
++				enc->rc.qp = cedrus_h264_initial_qp(target, ctx->src_fmt.width,
++								    ctx->src_fmt.height);
++				enc->rc.qp = clamp_t(u32, enc->rc.qp, enc->min_qp, enc->max_qp);
++			}
++		}
++	}
++	cedrus_h264_rc_begin(&enc->rc, enc->gop->val, enc->idr);
++	enc->qp = enc->rc.qp;
++	enc->auto_map = enc->avbr && enc->frames >= 2 && !enc->idr && !enc->motion.moving;
++	if (enc->avbr) {
++		if (enc->idr || enc->frames < 2) {
++			u32 qp = cedrus_h264_avbr_qp(enc->rc_ctrls[7]->val);
++
++			enc->qp = qp < 30 ? qp + 4 : qp;
++		} else if (enc->motion.moving) {
++			enc->qp = max_t(u32, enc->qp,
++					enc->background_qp > 3 ? enc->background_qp - 3 : 0);
++		}
++	}
++}
++
++void cedrus_enc_h264_rate_feedback(struct cedrus_ctx *ctx)
++{
++	struct cedrus_enc_ctx *enc = ctx->enc;
++	u32 width = ctx->src_fmt.width / 16, height = ctx->src_fmt.height / 16;
++	u32 i, coverage = 0;
++
++	if (enc->avbr)
++		enc->background_qp = enc->auto_map ? enc->map_qp : enc->qp;
++	if (!enc->motion_bitmap.cpu || enc->idr)
++		return;
++	dma_rmb();
++	if (!enc->avbr) {
++		cedrus_h264_motion_level(&enc->motion, enc->motion_bitmap.cpu, width * height);
++		return;
++	}
++	cedrus_h264_motion_regions(&enc->motion, enc->motion_bitmap.cpu,
++				   enc->motion_workspace, width, height);
++	for (i = 0; i < enc->motion.count; i++) {
++		const struct cedrus_h264_rect *r = &enc->motion.rect[i];
++
++		coverage += (r->right - r->left + 1) * (r->bottom - r->top + 1);
++	}
++	if (enc->frames >= 2)
++		cedrus_h264_motion_state(&enc->motion, coverage, width * height);
+ }
+ 
+ int cedrus_enc_h264_setup(struct cedrus_ctx *ctx, dma_addr_t source,
+diff --git a/include/media/cedrus-enc-ctrls.h b/include/media/cedrus-enc-ctrls.h
+--- a/include/media/cedrus-enc-ctrls.h
++++ b/include/media/cedrus-enc-ctrls.h
+@@ -4,6 +4,10 @@
+ #include <linux/types.h>
+ #include <linux/v4l2-controls.h>
+ #define V4L2_CID_CEDRUS_H264_ROI (V4L2_CID_CODEC_BASE + 0x2000)
++#define V4L2_CID_CEDRUS_H264_AVBR (V4L2_CID_CODEC_BASE + 0x2001)
++#define V4L2_CID_CEDRUS_H264_AVBR_QUALITY (V4L2_CID_CODEC_BASE + 0x2002)
++#define V4L2_CID_CEDRUS_H264_VBR_QUALITY (V4L2_CID_CODEC_BASE + 0x2003)
++#define V4L2_CID_CEDRUS_H264_MOTION_THRESHOLD (V4L2_CID_CODEC_BASE + 0x2004)
+ #define CEDRUS_H264_ROI_COUNT 8
+ #define CEDRUS_ROI_ENABLE (1U << 0)
+ #define CEDRUS_ROI_ABSOLUTE_QP (1U << 1)

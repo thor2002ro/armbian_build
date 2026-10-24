@@ -1,0 +1,45 @@
+Subject: [PATCH] Local: media: cedrus: split H264 header writes
+
+Several H.264 header fields are shorter than the original write helper assumed. Wide writes can disturb neighboring timing bits.
+
+Write each field with its real width. Existing NAL start codes remain unchanged.
+---
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+@@ -201,17 +201,24 @@
+ 	u32 status, parameter;
+ 	int ret;
+ 
+-	ret = readl_poll_timeout_atomic(dev->base + CEDRUS_ENC_REG(0x1c),
+-					status, status & BIT(9), 1, 1000);
+-	if (ret)
+-		return ret;
+-	if (cedrus_read(dev, CEDRUS_ENC_REG(0x90)) + count + 32 >=
+-	    ctx->enc->stream_size * 8)
+-		return -ENOSPC;
+-	parameter = cedrus_read(dev, CEDRUS_ENC_REG(0x04)) & ~BIT(31);
+-	cedrus_write(dev, CEDRUS_ENC_REG(0x04), parameter | (raw ? BIT(31) : 0));
+-	cedrus_write(dev, CEDRUS_ENC_REG(0x20), value);
+-	cedrus_write(dev, CEDRUS_ENC_REG(0x18), count << 8 | 1);
++	if (count > 32)
++		return -EINVAL;
++	while (count) {
++		unsigned int chunk = min(count, 16U);
++
++		ret = readl_poll_timeout_atomic(dev->base + CEDRUS_ENC_REG(0x1c),
++						status, status & BIT(9), 1, 1000);
++		if (ret)
++			return ret;
++		if (cedrus_read(dev, CEDRUS_ENC_REG(0x90)) + count + 32 >=
++		    ctx->enc->stream_size * 8)
++			return -ENOSPC;
++		parameter = cedrus_read(dev, CEDRUS_ENC_REG(0x04)) & ~BIT(31);
++		cedrus_write(dev, CEDRUS_ENC_REG(0x04), parameter | (raw ? BIT(31) : 0));
++		cedrus_write(dev, CEDRUS_ENC_REG(0x20), value >> (count - chunk));
++		cedrus_write(dev, CEDRUS_ENC_REG(0x18), chunk << 8 | 1);
++		count -= chunk;
++	}
+ 	return 0;
+ }
+ 

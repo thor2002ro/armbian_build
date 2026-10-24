@@ -1,0 +1,127 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: avcodec: expose Cedrus adaptive VBR
+
+Expose Cedrus adaptive VBR and motion controls.
+Keep default controls compatible with older kernels.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/libavcodec/v4l2_m2m.h b/libavcodec/v4l2_m2m.h
+--- a/libavcodec/v4l2_m2m.h
++++ b/libavcodec/v4l2_m2m.h
+@@ -83,6 +83,7 @@
+     int num_capture_buffers;
+     enum AVPixelFormat pix_fmt;
+     int cedrus_h264;
++    int cedrus_avbr, cedrus_avbr_quality, cedrus_static_quality, cedrus_motion_threshold;
+     int jpeg_quality;
+     int jpeg_rc_quality;
+     int jpeg_pending;
+diff --git a/libavcodec/v4l2_cedrus_enc.h b/libavcodec/v4l2_cedrus_enc.h
+--- a/libavcodec/v4l2_cedrus_enc.h
++++ b/libavcodec/v4l2_cedrus_enc.h
+@@ -5,6 +5,10 @@
+ #include "libavutil/mathematics.h"
+ 
+ #define V4L2_CID_CEDRUS_H264_ROI (V4L2_CID_CODEC_BASE + 0x2000)
++#define V4L2_CID_CEDRUS_H264_AVBR (V4L2_CID_CODEC_BASE + 0x2001)
++#define V4L2_CID_CEDRUS_H264_AVBR_QUALITY (V4L2_CID_CODEC_BASE + 0x2002)
++#define V4L2_CID_CEDRUS_H264_VBR_QUALITY (V4L2_CID_CODEC_BASE + 0x2003)
++#define V4L2_CID_CEDRUS_H264_MOTION_THRESHOLD (V4L2_CID_CODEC_BASE + 0x2004)
+ #define CEDRUS_H264_ROI_COUNT 8
+ #define CEDRUS_ROI_ENABLE (1U << 0)
+ #define CEDRUS_ROI_ABSOLUTE_QP (1U << 1)
+@@ -30,18 +34,23 @@
+ static int v4l2_cedrus_rate(V4L2m2mContext *s)
+ {
+     const AVCodecContext *a = s->avctx;
++    const V4L2m2mPriv *priv = a->priv_data;
+     int cq = !!(a->flags & AV_CODEC_FLAG_QSCALE) || !a->bit_rate;
+     int cbr = !cq && a->rc_min_rate == a->bit_rate && a->rc_max_rate == a->bit_rate;
+     int qmin = a->qmin < 0 ? 0 : a->qmin;
+     int qmax = a->qmax < 0 ? 51 : a->qmax;
+     int qp = a->flags & AV_CODEC_FLAG_QSCALE ? a->global_quality / FF_QP2LAMBDA : 26;
+     int64_t peak;
+-    struct v4l2_ext_control ctrl[6] = {
++    struct v4l2_ext_control ctrl[10] = {
+         {.id = V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
+          .value = cq ? V4L2_MPEG_VIDEO_BITRATE_MODE_CQ :
+                   cbr ? V4L2_MPEG_VIDEO_BITRATE_MODE_CBR : V4L2_MPEG_VIDEO_BITRATE_MODE_VBR},
+         [5] = { .id = V4L2_CID_MPEG_VIDEO_H264_CPB_SIZE,
+           .value = a->rc_buffer_size ? ((int64_t)a->rc_buffer_size + 8191) / 8192 : 1024 },
++        [6] = {.id = V4L2_CID_CEDRUS_H264_AVBR, .value = priv->cedrus_avbr},
++        [7] = {.id = V4L2_CID_CEDRUS_H264_AVBR_QUALITY, .value = priv->cedrus_avbr_quality},
++        [8] = {.id = V4L2_CID_CEDRUS_H264_VBR_QUALITY, .value = priv->cedrus_static_quality},
++        [9] = {.id = V4L2_CID_CEDRUS_H264_MOTION_THRESHOLD, .value = priv->cedrus_motion_threshold},
+     };
+     struct v4l2_ext_controls ctrls = {
+         .ctrl_class = V4L2_CTRL_CLASS_CODEC,
+@@ -49,6 +58,24 @@
+         .controls = ctrl,
+     };
+ 
++    if (priv->cedrus_avbr && (cq || cbr))
++        return AVERROR(EINVAL);
++    for (int i = 6; i < FF_ARRAY_ELEMS(ctrl); i++) {
++        struct v4l2_query_ext_ctrl query = {.id = ctrl[i].id};
++
++        if (ioctl(s->fd, VIDIOC_QUERY_EXT_CTRL, &query) < 0) {
++            if (errno != EINVAL && errno != ENOTTY)
++                return AVERROR(errno);
++            if (priv->cedrus_avbr || priv->cedrus_avbr_quality != 8 ||
++                priv->cedrus_static_quality != 5 || priv->cedrus_motion_threshold != 20)
++                return AVERROR(ENOSYS);
++            ctrls.count = 6;
++            break;
++        }
++        if ((query.type != (i == 6 ? V4L2_CTRL_TYPE_BOOLEAN : V4L2_CTRL_TYPE_INTEGER)) ||
++            ctrl[i].value < query.minimum || ctrl[i].value > query.maximum)
++            return AVERROR(EINVAL);
++    }
+     if (a->rc_min_rate < 0 || (!cq && a->rc_min_rate && !cbr) ||
+         a->bit_rate < 0 || a->bit_rate > 100000000 || a->rc_buffer_size < 0 ||
+         ctrl[5].value < 1 || ctrl[5].value > 32768)
+diff --git a/libavcodec/v4l2_m2m_enc.c b/libavcodec/v4l2_m2m_enc.c
+--- a/libavcodec/v4l2_m2m_enc.c
++++ b/libavcodec/v4l2_m2m_enc.c
+@@ -289,6 +289,11 @@
+                 return ret;
+         }
+     }
++
++    if (!priv->cedrus_h264 && (priv->cedrus_avbr || priv->cedrus_avbr_quality != 8 ||
++        priv->cedrus_static_quality != 5 || priv->cedrus_motion_threshold != 20) &&
++        avctx->codec_id == AV_CODEC_ID_H264)
++        return AVERROR(ENOSYS);
+ 
+     /* set ext ctrls */
+     v4l2_set_ext_ctrl(s, MPEG_CID(HEADER_MODE), MPEG_VIDEO(HEADER_MODE_SEPARATE), "header mode", 0);
+@@ -568,6 +573,19 @@
+     { NULL },
+ };
+ 
++static const AVOption h264_options[] = {
++    V4L_M2M_CAPTURE_OPTS,
++    { "cedrus_avbr", "Use Cedrus adaptive VBR", OFFSET(cedrus_avbr),
++      AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
++    { "cedrus_avbr_quality", "Set Cedrus adaptive quality", OFFSET(cedrus_avbr_quality),
++      AV_OPT_TYPE_INT, { .i64 = 8 }, 1, 13, FLAGS },
++    { "cedrus_static_quality", "Set Cedrus static bitrate scale in tenths", OFFSET(cedrus_static_quality),
++      AV_OPT_TYPE_INT, { .i64 = 5 }, 1, 10, FLAGS },
++    { "cedrus_motion_threshold", "Set Cedrus VBR motion threshold", OFFSET(cedrus_motion_threshold),
++      AV_OPT_TYPE_INT, { .i64 = 20 }, 1, 31, FLAGS },
++    { NULL },
++};
++
+ static const AVOption options[] = {
+     V4L_M2M_CAPTURE_OPTS,
+     { NULL },
+@@ -634,7 +652,7 @@
+ 
+ M2MENC(mpeg4,"MPEG4", mpeg4_options, AV_CODEC_ID_MPEG4, AVCOL_RANGE_MPEG);
+ M2MENC(h263, "H.263", options,       AV_CODEC_ID_H263, AVCOL_RANGE_MPEG);
+-M2MENC(h264, "H.264", options,       AV_CODEC_ID_H264, AVCOL_RANGE_MPEG);
++M2MENC(h264, "H.264", h264_options,       AV_CODEC_ID_H264, AVCOL_RANGE_MPEG);
+ M2MENC(hevc, "HEVC",  options,       AV_CODEC_ID_HEVC, AVCOL_RANGE_MPEG);
+ M2MENC(vp8,  "VP8",   options,       AV_CODEC_ID_VP8, AVCOL_RANGE_MPEG);
+ M2MENC(mjpeg,"MJPEG", mjpeg_options, AV_CODEC_ID_MJPEG, AVCOL_RANGE_JPEG);

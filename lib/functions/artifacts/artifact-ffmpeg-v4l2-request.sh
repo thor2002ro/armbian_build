@@ -27,7 +27,9 @@ function artifact_ffmpeg-v4l2-request_prepare_version() {
 		"${SRC}/patch/misc/ffmpeg-mpeg4-v4l2-request.patch" \
 		"${SRC}/patch/misc/ffmpeg-cavs2-fields-v4l2-request.patch" \
 		"${SRC}/patch/misc/ffmpeg-cedrus-mpeg1-sorenson.patch" \
-		"${SRC}/patch/misc/ffmpeg-h263-annex-v4l2-request.patch"
+		"${SRC}/patch/misc/ffmpeg-cedrus-encoder-rate-roi.patch" \
+		"${SRC}/patch/misc/ffmpeg-h263-annex-v4l2-request.patch" \
+		"${SRC}/patch/misc/ffmpeg-cedrus-adaptive-vbr.patch"
 	artifact_version="1-S${FFMPEG_V4L2_REQUEST_COMMIT:0:12}-B${hash_files:0:12}"
 	artifact_version_reason="FFmpeg ${FFMPEG_V4L2_REQUEST_COMMIT}; recipe and patches ${hash_files}"
 	artifact_name="ffmpeg-v4l2-request-${RELEASE}-${ARCH}"
