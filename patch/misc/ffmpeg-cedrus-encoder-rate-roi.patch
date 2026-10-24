@@ -1,0 +1,227 @@
+Subject: Local: avcodec: control Cedrus H264 bitrate and ROI
+
+FFmpeg could open the Cedrus encoder but could not select its bitrate, quantizer, or ROI controls.
+
+Map those options to V4L2 controls. Drivers without the controls keep standard V4L2 behavior.
+---
+diff --git a/libavcodec/v4l2_cedrus_enc.h b/libavcodec/v4l2_cedrus_enc.h
+new file mode 100644
+--- /dev/null
++++ b/libavcodec/v4l2_cedrus_enc.h
+@@ -0,0 +1,138 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#ifndef AVCODEC_V4L2_CEDRUS_ENC_H
++#define AVCODEC_V4L2_CEDRUS_ENC_H
++
++#include "libavutil/mathematics.h"
++
++#define V4L2_CID_CEDRUS_H264_ROI (V4L2_CID_CODEC_BASE + 0x2000)
++#define CEDRUS_H264_ROI_COUNT 8
++#define CEDRUS_ROI_ENABLE (1U << 0)
++#define CEDRUS_ROI_ABSOLUTE_QP (1U << 1)
++
++struct cedrus_h264_roi {
++    __u32 left, top, width, height;
++    __s32 qp;
++    __u32 flags;
++};
++
++static int v4l2_cedrus_probe(V4L2m2mContext *s)
++{
++    struct v4l2_query_ext_ctrl q = {.id = V4L2_CID_CEDRUS_H264_ROI};
++
++    if (ioctl(s->fd, VIDIOC_QUERY_EXT_CTRL, &q) < 0)
++        return errno == EINVAL || errno == ENOTTY ? 0 : AVERROR(errno);
++    if (q.type != V4L2_CTRL_TYPE_U8 || q.elem_size != 1 ||
++        q.elems != CEDRUS_H264_ROI_COUNT * sizeof(struct cedrus_h264_roi))
++        return AVERROR(ENOSYS);
++    return 1;
++}
++
++static int v4l2_cedrus_rate(V4L2m2mContext *s)
++{
++    const AVCodecContext *a = s->avctx;
++    int cq = !!(a->flags & AV_CODEC_FLAG_QSCALE) || !a->bit_rate;
++    int cbr = !cq && a->rc_min_rate == a->bit_rate && a->rc_max_rate == a->bit_rate;
++    int qmin = a->qmin < 0 ? 0 : a->qmin;
++    int qmax = a->qmax < 0 ? 51 : a->qmax;
++    int qp = a->flags & AV_CODEC_FLAG_QSCALE ? a->global_quality / FF_QP2LAMBDA : 26;
++    int64_t peak;
++    struct v4l2_ext_control ctrl[6] = {
++        {.id = V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
++         .value = cq ? V4L2_MPEG_VIDEO_BITRATE_MODE_CQ :
++                  cbr ? V4L2_MPEG_VIDEO_BITRATE_MODE_CBR : V4L2_MPEG_VIDEO_BITRATE_MODE_VBR},
++        [5] = { .id = V4L2_CID_MPEG_VIDEO_H264_CPB_SIZE,
++          .value = a->rc_buffer_size ? ((int64_t)a->rc_buffer_size + 8191) / 8192 : 1024 },
++    };
++    struct v4l2_ext_controls ctrls = {
++        .ctrl_class = V4L2_CTRL_CLASS_CODEC,
++        .count = FF_ARRAY_ELEMS(ctrl),
++        .controls = ctrl,
++    };
++
++    if (a->rc_min_rate < 0 || (!cq && a->rc_min_rate && !cbr) ||
++        a->bit_rate < 0 || a->bit_rate > 100000000 || a->rc_buffer_size < 0 ||
++        ctrl[5].value < 1 || ctrl[5].value > 32768)
++        return AVERROR(EINVAL);
++    peak = a->rc_max_rate ? a->rc_max_rate : FFMIN(a->bit_rate * 2, 100000000);
++    if ((!cq && (a->bit_rate < 1 || peak < a->bit_rate || peak > 100000000)) || qmin > qmax ||
++        qmax > 51 || qp < 0 || qp > 51)
++        return AVERROR(EINVAL);
++    ctrl[1] = (struct v4l2_ext_control){
++        .id = V4L2_CID_MPEG_VIDEO_H264_MIN_QP,
++        .value = qmin,
++    };
++    ctrl[2] = (struct v4l2_ext_control){
++        .id = V4L2_CID_MPEG_VIDEO_H264_MAX_QP,
++        .value = qmax,
++    };
++    if (cq) {
++        ctrl[3] = (struct v4l2_ext_control){
++            .id = V4L2_CID_MPEG_VIDEO_H264_I_FRAME_QP,
++            .value = qp,
++        };
++        ctrl[4] = (struct v4l2_ext_control){
++            .id = V4L2_CID_MPEG_VIDEO_H264_P_FRAME_QP,
++            .value = qp,
++        };
++    } else {
++        ctrl[3] = ctrl[1];
++        ctrl[4] = ctrl[2];
++        ctrl[1] = (struct v4l2_ext_control){
++            .id = V4L2_CID_MPEG_VIDEO_BITRATE,
++            .value = a->bit_rate,
++        };
++        ctrl[2] = (struct v4l2_ext_control){
++            .id = V4L2_CID_MPEG_VIDEO_BITRATE_PEAK,
++            .value = peak,
++        };
++    }
++    return ioctl(s->fd, VIDIOC_S_EXT_CTRLS, &ctrls) < 0 ? AVERROR(errno) : 0;
++}
++
++static int v4l2_cedrus_roi(V4L2m2mContext *s, const AVFrame *frame)
++{
++    const AVFrameSideData *sd = av_frame_get_side_data(frame, AV_FRAME_DATA_REGIONS_OF_INTEREST);
++    struct cedrus_h264_roi roi[CEDRUS_H264_ROI_COUNT] = {0};
++    struct v4l2_ext_control ctrl = {
++        .id = V4L2_CID_CEDRUS_H264_ROI,
++        .size = sizeof(roi),
++        .ptr = roi,
++    };
++    struct v4l2_ext_controls ctrls = {
++        .ctrl_class = V4L2_CTRL_CLASS_CODEC,
++        .count = 1,
++        .controls = &ctrl,
++    };
++    size_t offset = 0;
++    unsigned int n = 0;
++
++    while (sd && offset < sd->size) {
++        AVRegionOfInterest in;
++        int left, top, right, bottom;
++
++        if (n == CEDRUS_H264_ROI_COUNT || sd->size - offset < sizeof(in))
++            return AVERROR(EINVAL);
++        memcpy(&in, sd->data + offset, sizeof(in));
++        if (in.self_size < sizeof(in) || in.self_size > sd->size - offset || in.left < 0 ||
++            in.top < 0 || in.right <= in.left || in.bottom <= in.top ||
++            in.right > s->avctx->width || in.bottom > s->avctx->height || in.right > INT_MAX - 15 ||
++            in.bottom > INT_MAX - 15 || in.qoffset.den <= 0 ||
++            (int64_t)in.qoffset.num < -(int64_t)in.qoffset.den || in.qoffset.num > in.qoffset.den)
++            return AVERROR(EINVAL);
++        left = in.left & ~15;
++        top = in.top & ~15;
++        right = FFALIGN(in.right, 16);
++        bottom = FFALIGN(in.bottom, 16);
++        roi[n++] = (struct cedrus_h264_roi){
++            .left = left,
++            .top = top,
++            .width = right - left,
++            .height = bottom - top,
++            .qp = av_rescale_rnd(in.qoffset.num, 51, in.qoffset.den, AV_ROUND_NEAR_INF),
++            .flags = CEDRUS_ROI_ENABLE,
++        };
++        offset += in.self_size;
++    }
++    return ioctl(s->fd, VIDIOC_S_EXT_CTRLS, &ctrls) < 0 ? AVERROR(errno) : 0;
++}
++#endif
+diff --git a/libavcodec/v4l2_m2m.h b/libavcodec/v4l2_m2m.h
+--- a/libavcodec/v4l2_m2m.h
++++ b/libavcodec/v4l2_m2m.h
+@@ -82,6 +82,7 @@
+     int num_output_buffers;
+     int num_capture_buffers;
+     enum AVPixelFormat pix_fmt;
++    int cedrus_h264;
+     int jpeg_quality;
+     int jpeg_rc_quality;
+     int jpeg_pending;
+diff --git a/libavcodec/v4l2_m2m_enc.c b/libavcodec/v4l2_m2m_enc.c
+--- a/libavcodec/v4l2_m2m_enc.c
++++ b/libavcodec/v4l2_m2m_enc.c
+@@ -34,6 +34,7 @@
+ #include "v4l2_context.h"
+ #include "v4l2_m2m.h"
+ #include "v4l2_fmt.h"
++#include "v4l2_cedrus_enc.h"
+ 
+ #define MPEG_CID(x) V4L2_CID_MPEG_VIDEO_##x
+ #define MPEG_VIDEO(x) V4L2_MPEG_VIDEO_##x
+@@ -259,6 +260,7 @@
+ {
+     AVCodecContext *avctx = s->avctx;
+     int qmin_cid, qmax_cid, qmin, qmax;
++    V4L2m2mPriv *priv = avctx->priv_data;
+     int ret, val;
+ 
+     /**
+@@ -276,10 +278,24 @@
+     if (ret)
+         return ret;
+ 
++    if (avctx->codec_id == AV_CODEC_ID_H264) {
++        ret = v4l2_cedrus_probe(s);
++        if (ret < 0)
++            return ret;
++        priv->cedrus_h264 = ret;
++        if (ret) {
++            ret = v4l2_cedrus_rate(s);
++            if (ret < 0)
++                return ret;
++        }
++    }
++
+     /* set ext ctrls */
+     v4l2_set_ext_ctrl(s, MPEG_CID(HEADER_MODE), MPEG_VIDEO(HEADER_MODE_SEPARATE), "header mode", 0);
++    if (!priv->cedrus_h264) {
+     v4l2_set_ext_ctrl(s, MPEG_CID(BITRATE) , avctx->bit_rate, "bit rate", 1);
+     v4l2_set_ext_ctrl(s, MPEG_CID(FRAME_RC_ENABLE), 1, "frame level rate control", 0);
++    }
+     v4l2_set_ext_ctrl(s, MPEG_CID(GOP_SIZE), avctx->gop_size,"gop size", 1);
+ 
+     av_log(avctx, AV_LOG_DEBUG,
+@@ -347,6 +363,9 @@
+         qmax = avctx->qmax >= 0 ? avctx->qmax : qmax;
+     }
+ 
++    if (priv->cedrus_h264)
++        return 0;
++
+     v4l2_set_ext_ctrl(s, qmin_cid, qmin, "minimum video quantizer scale",
+                       avctx->qmin >= 0);
+     v4l2_set_ext_ctrl(s, qmax_cid, qmax, "maximum video quantizer scale",
+@@ -365,6 +384,12 @@
+     if (frame && avctx->codec_id == AV_CODEC_ID_MJPEG && priv->jpeg_target_bits) {
+         ret = v4l2_set_ext_ctrl(s, V4L2_CID_JPEG_COMPRESSION_QUALITY,
+                                  priv->jpeg_rc_quality, "JPEG quality", 1);
++        if (ret < 0)
++            return ret;
++    }
++
++    if (frame && priv->cedrus_h264) {
++        ret = v4l2_cedrus_roi(s, frame);
+         if (ret < 0)
+             return ret;
+     }

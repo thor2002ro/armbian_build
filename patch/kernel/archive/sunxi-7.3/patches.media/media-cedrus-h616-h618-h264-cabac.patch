@@ -1,0 +1,196 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: media: cedrus: add H616/H618 H.264 CABAC encoding
+
+Allow CABAC for Main and High profiles through the entropy control.
+Keep Baseline on CAVLC and retain H616/H618 4x4 transforms.
+Match CABAC flags and slice initialization to vendor 243f2cbe84a8.
+Validate profile and entropy settings as one control cluster.
+Hardware encoding requires board testing.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
+@@ -412,6 +412,8 @@
+ static int cedrus_enc_s_ctrl(struct v4l2_ctrl *ctrl)
+ {
+ 	struct cedrus_ctx *ctx = container_of(ctrl->handler, struct cedrus_ctx, hdl);
++	enum cedrus_h264_profile profile;
++	bool cabac;
+ 
+ 	if (ctrl->id == V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME)
+ 		atomic_set(&ctx->enc->force_key, 1);
+@@ -419,19 +421,25 @@
+ 		if (vb2_is_streaming(v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx)) ||
+ 		    vb2_is_streaming(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)))
+ 			return -EBUSY;
++		cabac = ctx->enc->h264_ctrls[1]->val ==
++			V4L2_MPEG_VIDEO_H264_ENTROPY_MODE_CABAC;
+ 		switch (ctrl->val) {
+ 		case V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE:
+-			ctx->enc->profile = CEDRUS_H264_PROFILE_BASELINE;
++			if (cabac)
++				return -EINVAL;
++			profile = CEDRUS_H264_PROFILE_BASELINE;
+ 			break;
+ 		case V4L2_MPEG_VIDEO_H264_PROFILE_MAIN:
+-			ctx->enc->profile = CEDRUS_H264_PROFILE_MAIN;
++			profile = CEDRUS_H264_PROFILE_MAIN;
+ 			break;
+ 		case V4L2_MPEG_VIDEO_H264_PROFILE_HIGH:
+-			ctx->enc->profile = CEDRUS_H264_PROFILE_HIGH;
++			profile = CEDRUS_H264_PROFILE_HIGH;
+ 			break;
+ 		default:
+ 			return -EINVAL;
+ 		}
++		ctx->enc->profile = profile;
++		ctx->enc->cabac = cabac;
+ 	}
+ 	return 0;
+ }
+@@ -473,12 +481,16 @@
+ 					  V4L2_CID_MPEG_VIDEO_GOP_SIZE, 1, 300, 1, 30);
+ 	v4l2_ctrl_new_std(&ctx->hdl, &cedrus_enc_ctrl_ops,
+ 			  V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 0, 0, 0, 0);
+-	ctrl = v4l2_ctrl_new_std_menu(&ctx->hdl, &cedrus_enc_ctrl_ops,
++	ctx->enc->h264_ctrls[0] = v4l2_ctrl_new_std_menu(&ctx->hdl, &cedrus_enc_ctrl_ops,
+ 				      V4L2_CID_MPEG_VIDEO_H264_PROFILE,
+ 				      V4L2_MPEG_VIDEO_H264_PROFILE_HIGH,
+ 				      BIT(V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE) |
+ 				      BIT(V4L2_MPEG_VIDEO_H264_PROFILE_EXTENDED),
+ 				      V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE);
++	ctx->enc->h264_ctrls[1] = v4l2_ctrl_new_std_menu(&ctx->hdl, &cedrus_enc_ctrl_ops,
++				      V4L2_CID_MPEG_VIDEO_H264_ENTROPY_MODE,
++				      V4L2_MPEG_VIDEO_H264_ENTROPY_MODE_CABAC, 0,
++				      V4L2_MPEG_VIDEO_H264_ENTROPY_MODE_CAVLC);
+ 	ctrl = v4l2_ctrl_new_std_menu(&ctx->hdl, NULL,
+ 				      V4L2_CID_MPEG_VIDEO_H264_LEVEL,
+ 				      V4L2_MPEG_VIDEO_H264_LEVEL_6_2,
+@@ -490,6 +502,7 @@
+ 	ret = ctx->hdl.error;
+ 	if (ret)
+ 		goto free_fh;
++	v4l2_ctrl_cluster(ARRAY_SIZE(ctx->enc->h264_ctrls), ctx->enc->h264_ctrls);
+ 	ctx->fh.ctrl_handler = &ctx->hdl;
+ 	ctx->fh.m2m_ctx = v4l2_m2m_ctx_init(dev->m2m_dev, ctx, cedrus_enc_queue_init);
+ 	if (IS_ERR(ctx->fh.m2m_ctx)) {
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc.h b/drivers/staging/media/sunxi/cedrus/cedrus_enc.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc.h
+@@ -22,6 +22,7 @@
+ 	struct v4l2_ctrl *qp_p;
+ 	struct v4l2_ctrl *gop;
+ 	struct v4l2_ctrl *level_ctrl;
++	struct v4l2_ctrl *h264_ctrls[2];
+ 	struct v4l2_fract timeperframe;
+ 	u32 level;
+ 	enum cedrus_h264_profile profile;
+@@ -35,6 +36,7 @@
+ 	u32 sequence_out;
+ 	u32 sequence_cap;
+ 	bool idr;
++	bool cabac;
+ };
+ 
+ int cedrus_enc_register(struct cedrus_dev *dev);
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+@@ -15,6 +15,8 @@
+ #define CEDRUS_ENC_BASE 0xb00
+ #define CEDRUS_ENC_REG(n) (CEDRUS_ENC_BASE + (n))
+ #define CEDRUS_H616_MOTION_PARA (BIT(27) | BIT(16) | BIT(12) | BIT(9))
++#define CEDRUS_H616_CABAC BIT(8)
++#define CEDRUS_H616_CABAC_INIT(idc) ((idc) << 10)
+ 
+ static bool cedrus_enc_h264_supported(struct cedrus_dev *dev)
+ {
+@@ -29,6 +31,7 @@
+ 	u32 width = ctx->src_fmt.width, height = ctx->src_fmt.height;
+ 	u32 index = enc->index, reference = enc->idr ? index : index ^ 1;
+ 	u32 start, end, recon, ref, sub, subref, info, deblock = 0;
++	u32 parameter;
+ 	int ret;
+ 
+ 	if (!cedrus_enc_h264_supported(dev))
+@@ -88,11 +91,17 @@
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0xbc), sub);
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0xc0), info);
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0xc4), deblock);
+-	cedrus_write(dev, CEDRUS_ENC_REG(0x04), enc->idr ? 0 : BIT(4));
++	parameter = enc->idr ? 0 : BIT(4);
++	if (enc->cabac) {
++		parameter |= CEDRUS_H616_CABAC;
++		if (!enc->idr)
++			parameter |= CEDRUS_H616_CABAC_INIT(CEDRUS_H264_CABAC_INIT_IDC);
++	}
++	cedrus_write(dev, CEDRUS_ENC_REG(0x04), parameter);
++	/* H616 keeps 8x8 transforms disabled. */
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0x08),
+ 		     BIT(27) | DIV_ROUND_UP(width / 16, 48) << 10 | enc->qp);
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0x0c), 0);
+-	/* CAVLC and 4x4 transforms for all supported profiles. */
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0x10), CEDRUS_H616_MOTION_PARA);
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0x24), 0);
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0x28), 0);
+@@ -230,9 +239,10 @@
+ 				ctx->src_fmt.width, ctx->src_fmt.height,
+ 				enc->level, enc->timeperframe.numerator,
+ 				enc->timeperframe.denominator);
+-		cedrus_h264_pps(&bits);
+-	}
+-	cedrus_h264_slice(&bits, enc->idr, enc->frame_num, enc->poc, 0, enc->qp);
++		cedrus_h264_pps(&bits, enc->cabac);
++	}
++	cedrus_h264_slice(&bits, enc->idr, enc->cabac,
++			  enc->frame_num, enc->poc, 0, enc->qp);
+ 	if (bits.error)
+ 		return bits.error;
+ 	/* Complete the final header write before starting the slice. */
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.h b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.h
+@@ -5,6 +5,8 @@
+ #include <linux/types.h>
+ #include <linux/errno.h>
+ #include <linux/kernel.h>
++
++#define CEDRUS_H264_CABAC_INIT_IDC 1
+ 
+ struct cedrus_h264_layout {
+ 	u32 luma;
+@@ -261,12 +263,13 @@
+ 	cedrus_h264_trailing(bits);
+ }
+ 
+-static inline void cedrus_h264_pps(struct cedrus_h264_bits *bits)
++static inline void cedrus_h264_pps(struct cedrus_h264_bits *bits, bool cabac)
+ {
+ 	cedrus_h264_nal(bits, 0x68);
+ 	cedrus_h264_ue(bits, 0);
+ 	cedrus_h264_ue(bits, 0);
+-	cedrus_h264_put(bits, 0, 2);
++	cedrus_h264_put(bits, cabac, 1);
++	cedrus_h264_put(bits, 0, 1);
+ 	cedrus_h264_ue(bits, 0);
+ 	cedrus_h264_ue(bits, 0);
+ 	cedrus_h264_ue(bits, 0);
+@@ -280,6 +283,7 @@
+ }
+ 
+ static inline void cedrus_h264_slice(struct cedrus_h264_bits *bits, bool idr,
++				     bool cabac,
+ 				     u32 frame_num, u32 poc, u32 idr_id, u32 qp)
+ {
+ 	cedrus_h264_nal(bits, idr ? 0x65 : 0x41);
+@@ -291,6 +295,8 @@
+ 		cedrus_h264_ue(bits, idr_id);
+ 	cedrus_h264_put(bits, poc & 15, 4);
+ 	cedrus_h264_put(bits, 0, idr ? 2 : 3);
++	if (cabac && !idr)
++		cedrus_h264_ue(bits, CEDRUS_H264_CABAC_INIT_IDC);
+ 	cedrus_h264_se(bits, (int)qp - 26);
+ 	cedrus_h264_ue(bits, 0);
+ 	cedrus_h264_se(bits, 0);
