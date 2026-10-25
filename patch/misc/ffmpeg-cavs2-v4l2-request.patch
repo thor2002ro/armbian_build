@@ -1,0 +1,1159 @@
+Subject: Local: avcodec: add experimental CAVS2 V4L2 requests
+
+AVS2 needs syntax and field state that the existing CAVS path cannot carry.
+
+Add the missing request state and reject syntax that the controls cannot represent.
+---
+diff --git a/configure b/configure
+--- a/configure
++++ b/configure
+@@ -3374,6 +3374,9 @@
+ av1_dxva2_hwaccel_select="av1_decoder"
+ av1_nvdec_hwaccel_deps="nvdec CUVIDAV1PICPARAMS"
+ av1_nvdec_hwaccel_select="av1_decoder"
++cavs2_v4l2request_decoder_deps="v4l2_request"
++cavs2_v4l2request_decoder_select="avs2_parser cavs2_v4l2request_hwaccel"
++cavs2_v4l2request_hwaccel_deps="v4l2_request"
+ av1_v4l2request_hwaccel_deps="v4l2_request av1_v4l2_request"
+ av1_v4l2request_hwaccel_select="av1_decoder"
+ av1_nvdec_cuarray_hwaccel_deps="nvdec ffnvcodec_cuarray CUVIDAV1PICPARAMS"
+diff --git a/libavcodec/Makefile b/libavcodec/Makefile
+--- a/libavcodec/Makefile
++++ b/libavcodec/Makefile
+@@ -1270,6 +1270,7 @@
+ OBJS-$(CONFIG_AMR_PARSER)              += amr_parser.o
+ OBJS-$(CONFIG_APV_PARSER)              += apv_parser.o
+ OBJS-$(CONFIG_AV1_PARSER)              += av1_parser.o av1_parse.o
++OBJS-$(CONFIG_CAVS2_V4L2REQUEST_DECODER) += cavs2_request.o cavs2_request_parser.o avs2.o
+ OBJS-$(CONFIG_AVS2_PARSER)             += avs2.o avs2_parser.o
+ OBJS-$(CONFIG_AVS3_PARSER)             += avs3_parser.o
+ OBJS-$(CONFIG_BMP_PARSER)              += bmp_parser.o
+diff --git a/libavcodec/allcodecs.c b/libavcodec/allcodecs.c
+--- a/libavcodec/allcodecs.c
++++ b/libavcodec/allcodecs.c
+@@ -783,6 +783,7 @@
+ extern const FFCodec ff_libcodec2_encoder;
+ extern const FFCodec ff_libcodec2_decoder;
+ extern const FFCodec ff_libdav1d_decoder;
++extern const FFCodec ff_cavs2_v4l2request_decoder;
+ extern const FFCodec ff_libdavs2_decoder;
+ extern const FFCodec ff_libfdk_aac_encoder;
+ extern const FFCodec ff_libfdk_aac_decoder;
+diff --git a/libavcodec/hwaccels.h b/libavcodec/hwaccels.h
+--- a/libavcodec/hwaccels.h
++++ b/libavcodec/hwaccels.h
+@@ -19,6 +19,7 @@
+ #ifndef AVCODEC_HWACCELS_H
+ #define AVCODEC_HWACCELS_H
+ 
++extern const struct FFHWAccel ff_cavs2_v4l2request_hwaccel;
+ extern const struct FFHWAccel ff_apv_vulkan_hwaccel;
+ extern const struct FFHWAccel ff_av1_d3d11va_hwaccel;
+ extern const struct FFHWAccel ff_av1_d3d11va2_hwaccel;
+diff --git a/libavcodec/v4l2_request.c b/libavcodec/v4l2_request.c
+--- a/libavcodec/v4l2_request.c
++++ b/libavcodec/v4l2_request.c
+@@ -131,7 +131,9 @@
+                                      struct v4l2_buffer *buffer)
+ {
+     struct v4l2_plane planes[V4L2_PLANES_MAX] = {};
+-
++    struct v4l2_buffer queued = *buffer;
++
++    buffer = &queued;
+     if (V4L2_TYPE_IS_MULTIPLANAR(buffer->type)) {
+         planes[0].bytesused = buffer->bytesused;
+         buffer->bytesused = 0;
+@@ -139,6 +141,12 @@
+         buffer->m.planes = planes;
+     }
+ 
++    if (!V4L2_TYPE_IS_OUTPUT(buffer->type)) {
++        if (buffer->index >= 64)
++            return AVERROR(EINVAL);
++        ctx->errored_capture &= ~(UINT64_C(1) << buffer->index);
++    }
++
+     // Queue the buffer
+     if (ioctl(ctx->fctxi->video_fd, VIDIOC_QBUF, buffer) < 0)
+         return AVERROR(errno);
+@@ -147,7 +155,7 @@
+     if (V4L2_TYPE_IS_OUTPUT(buffer->type))
+         ctx->queued_output |= 1 << buffer->index;
+     else
+-        ctx->queued_capture |= 1 << buffer->index;
++        ctx->queued_capture |= UINT64_C(1) << buffer->index;
+ 
+     return 0;
+ }
+@@ -200,8 +208,13 @@
+     // Mark the buffer as dequeued
+     if (V4L2_TYPE_IS_OUTPUT(buffer.type))
+         ctx->queued_output &= ~(1 << buffer.index);
+-    else
+-        ctx->queued_capture &= ~(1 << buffer.index);
++    else {
++        if (buffer.index >= 64)
++            return AVERROR(EINVAL);
++        ctx->queued_capture &= ~(UINT64_C(1) << buffer.index);
++        if (buffer.flags & V4L2_BUF_FLAG_ERROR)
++            ctx->errored_capture |= UINT64_C(1) << buffer.index;
++    }
+ 
+     return 0;
+ }
+@@ -233,7 +246,10 @@
+         v4l2_request_dequeue_completed_buffers(ctx, type);
+ 
+     // Wait on the specific CAPTURE buffer
+-    while (ctx->queued_capture & (1 << index)) {
++    if (index >= 64)
++        goto fail;
++
++    while (ctx->queued_capture & (UINT64_C(1) << index)) {
+         int ret = poll(&pollfd, 1, 2000);
+         if (ret <= 0)
+             goto fail;
+@@ -241,6 +257,11 @@
+         ret = v4l2_request_dequeue_buffer(ctx, type);
+         if (ret < 0 && ret != AVERROR(EAGAIN))
+             goto fail;
++    }
++
++    if (ctx->errored_capture & (UINT64_C(1) << index)) {
++        ctx->errored_capture &= ~(UINT64_C(1) << index);
++        goto fail;
+     }
+ 
+     ff_mutex_unlock(&ctx->mutex);
+@@ -490,6 +511,12 @@
+     return v4l2_request_queue_decode(avctx, pic, control, count, true, true);
+ }
+ 
++int ff_v4l2_request_wait_frame(AVCodecContext *avctx, AVFrame *frame)
++{
++    return v4l2_request_wait_on_capture(v4l2_request_context(avctx),
++                                        v4l2_request_frameindex(frame));
++}
++
+ static int v4l2_request_post_process(void *logctx, AVFrame *frame)
+ {
+     uint32_t index = v4l2_request_frameindex(frame);
+diff --git a/libavcodec/v4l2_request.h b/libavcodec/v4l2_request.h
+--- a/libavcodec/v4l2_request.h
++++ b/libavcodec/v4l2_request.h
+@@ -50,6 +50,7 @@
+     uint32_t queued_output;
+     uint32_t queued_request;
+     uint64_t queued_capture;
++    uint64_t errored_capture;
+     struct v4l2_ext_control *init_controls;
+     int nb_init_controls;
+ } V4L2RequestContext;
+@@ -89,6 +90,8 @@
+ int ff_v4l2_request_start_frame(AVCodecContext *avctx,
+                                 V4L2RequestPictureContext *pic, AVFrame *frame);
+ 
++int ff_v4l2_request_wait_frame(AVCodecContext *avctx, AVFrame *frame);
++
+ void ff_v4l2_request_flush(AVCodecContext *avctx);
+ 
+ int ff_v4l2_request_frame_params(AVCodecContext *avctx,
+diff --git a/libavcodec/cavs2_request.c b/libavcodec/cavs2_request.c
+new file mode 100644
+--- /dev/null
++++ b/libavcodec/cavs2_request.c
+@@ -0,0 +1,463 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/* Experimental CAVS2 frame decoding through V4L2 requests. */
++#include <limits.h>
++#include "libavutil/hwcontext.h"
++#include "libavutil/pixdesc.h"
++#include "avs2.h"
++#include "cavs2_request_parser.h"
++#include "avcodec.h"
++#include "codec_internal.h"
++#include "decode.h"
++#include "hwaccel_internal.h"
++#include "hwconfig.h"
++#include "internal.h"
++#include "v4l2_request.h"
++
++#define CAVS2_DPB_SIZE 64
++
++typedef struct CAVS2RequestFrame {
++    AVFrame *frame;
++    int coding_order;
++    int picture_order;
++    int reference;
++    int output;
++    int background;
++} CAVS2RequestFrame;
++
++typedef struct CAVS2RequestContext {
++    CAVS2RequestSequence sequence;
++    CAVS2RequestPicture picture;
++    CAVS2RequestFrame dpb[CAVS2_DPB_SIZE];
++    AVPacket *packet;
++    int previous_coi;
++    int coi_epoch;
++    int initialized;
++    int draining;
++    int force_output;
++    int need_intra;
++    int failed;
++    CAVS2RequestSequence pending_sequence;
++    int reconfigure;
++} CAVS2RequestContext;
++
++static int cavs2_request_hw_init(AVCodecContext *avctx)
++{
++    CAVS2RequestContext *s = avctx->priv_data;
++    struct v4l2_ctrl_cavs2_frame initial = s->sequence.frame;
++    struct v4l2_ext_control control = {
++        .id = V4L2_CID_STATELESS_CAVS2_FRAME,
++        .ptr = &initial,
++        .size = sizeof(initial),
++    };
++    memset(initial.quant_4x4, 64, sizeof(initial.quant_4x4));
++    memset(initial.quant_8x8, 64, sizeof(initial.quant_8x8));
++    return ff_v4l2_request_init(avctx, &control, 1, NULL);
++}
++
++static int cavs2_request_frame_params(AVCodecContext *avctx, AVBufferRef *frames_ref)
++{
++    CAVS2RequestContext *s = avctx->priv_data;
++    AVHWFramesContext *frames = (AVHWFramesContext *)frames_ref->data;
++    int ret = ff_v4l2_request_frame_params(avctx, frames_ref, V4L2_PIX_FMT_CAVS2_FRAME,
++                                           s->sequence.frame.bit_depth);
++    if (ret < 0)
++        return ret;
++    frames->initial_pool_size += s->sequence.reorder_delay + V4L2_CAVS2_MAX_REFS +
++                                 !!(s->sequence.frame.sequence_flags & V4L2_CAVS2_SEQ_BACKGROUND);
++    return 0;
++}
++
++const FFHWAccel ff_cavs2_v4l2request_hwaccel = {
++    .p.name = "cavs2_v4l2request",
++    .p.type = AVMEDIA_TYPE_VIDEO,
++    .p.id = AV_CODEC_ID_AVS2,
++    .p.pix_fmt = AV_PIX_FMT_DRM_PRIME,
++    .init = cavs2_request_hw_init,
++    .uninit = ff_v4l2_request_uninit,
++    .flush = ff_v4l2_request_flush,
++    .priv_data_size = sizeof(V4L2RequestContext),
++    .frame_params = cavs2_request_frame_params,
++    .caps_internal = HWACCEL_CAP_ASYNC_SAFE,
++};
++
++static void cavs2_request_release(CAVS2RequestFrame *f)
++{
++    if (f->frame && !f->reference && !f->output && !f->background)
++        av_frame_free(&f->frame);
++}
++
++static int cavs2_request_output(CAVS2RequestContext *s, AVFrame *frame)
++{
++    CAVS2RequestFrame *next = NULL;
++    unsigned i, count = 0;
++    int ret;
++    for (i = 0; i < CAVS2_DPB_SIZE; i++) {
++        CAVS2RequestFrame *f = &s->dpb[i];
++        if (!f->frame || !f->output)
++            continue;
++        count++;
++        if (!next || f->picture_order < next->picture_order)
++            next = f;
++    }
++    if (!next || (!s->draining && !s->force_output && count <= s->sequence.reorder_delay))
++        return AVERROR(EAGAIN);
++    ret = av_frame_ref(frame, next->frame);
++    if (ret < 0)
++        return ret;
++    next->output = 0;
++    cavs2_request_release(next);
++    return 0;
++}
++
++static CAVS2RequestFrame *cavs2_request_reference(CAVS2RequestContext *s, int coding_order)
++{
++    unsigned i;
++    for (i = 0; i < CAVS2_DPB_SIZE; i++)
++        if (s->dpb[i].frame && s->dpb[i].reference &&
++            s->dpb[i].coding_order == coding_order)
++            return &s->dpb[i];
++    return NULL;
++}
++
++static int cavs2_request_configure(AVCodecContext *avctx)
++{
++    static const enum AVPixelFormat formats[] = { AV_PIX_FMT_DRM_PRIME, AV_PIX_FMT_NONE };
++    CAVS2RequestContext *s = avctx->priv_data;
++    int ret;
++    if (s->initialized)
++        return 0;
++    ret = ff_set_dimensions(avctx, s->sequence.frame.width, s->sequence.frame.height);
++    if (ret < 0)
++        return ret;
++    avctx->sw_pix_fmt = s->sequence.frame.bit_depth == 10 ? AV_PIX_FMT_YUV420P10 : AV_PIX_FMT_YUV420P;
++    avctx->profile = s->sequence.frame.profile;
++    avctx->has_b_frames = s->sequence.reorder_delay;
++    avctx->framerate = ff_avs2_frame_rate_tab[s->sequence.frame_rate_code];
++    ret = ff_get_format(avctx, formats);
++    if (ret < 0)
++        return ret;
++    if (ret != AV_PIX_FMT_DRM_PRIME || !avctx->hwaccel)
++        return AVERROR(ENOSYS);
++    avctx->pix_fmt = ret;
++    s->initialized = 1;
++    return 0;
++}
++
++static void cavs2_request_sequence_end(CAVS2RequestContext *s)
++{
++    unsigned i;
++    for (i = 0; i < CAVS2_DPB_SIZE; i++) {
++        s->dpb[i].reference = s->dpb[i].background = 0;
++        cavs2_request_release(&s->dpb[i]);
++    }
++    s->force_output = 1;
++    s->previous_coi = -1;
++    s->coi_epoch = 0;
++    s->need_intra = 1;
++}
++
++static int cavs2_request_submit(AVCodecContext *avctx, AVPacket *packet,
++                               unsigned slice_offset, int sequence_end)
++{
++    CAVS2RequestContext *s = avctx->priv_data;
++    CAVS2RequestPicture *p = &s->picture;
++    CAVS2RequestFrame *dst = NULL;
++    V4L2RequestPictureContext request = { 0 };
++    struct v4l2_ext_control control = {
++        .id = V4L2_CID_STATELESS_CAVS2_FRAME,
++        .ptr = &p->frame,
++        .size = sizeof(p->frame),
++    };
++    FrameDecodeData *fdd;
++    int coding_order, ret;
++    unsigned i;
++    if (s->need_intra && p->frame.picture_type)
++        return 0;
++    ret = cavs2_request_configure(avctx);
++    if (ret < 0)
++        return ret;
++    if (s->previous_coi >= 0 && p->coding_order < s->previous_coi) {
++        if (s->coi_epoch > INT_MAX - 256)
++            return AVERROR_INVALIDDATA;
++        s->coi_epoch += 256;
++    }
++    coding_order = s->coi_epoch + p->coding_order;
++    if (coding_order > INT_MAX - p->output_delay)
++        return AVERROR_INVALIDDATA;
++    p->frame.picture_order_count = coding_order + p->output_delay -
++                                   (s->sequence.low_delay ? 0 : s->sequence.reorder_delay);
++    p->frame.bitstream_offset = slice_offset;
++    p->frame.bitstream_size = packet->size - slice_offset;
++    p->frame.num_refs = p->rps.num_refs;
++    if ((p->frame.flags & V4L2_CAVS2_FRAME_BACKGROUND_REFERENCE) && !p->frame.num_refs)
++        return AVERROR_INVALIDDATA;
++    for (i = 0; i < p->frame.num_refs -
++                    !!(p->frame.flags & V4L2_CAVS2_FRAME_BACKGROUND_REFERENCE); i++) {
++        CAVS2RequestFrame *ref = cavs2_request_reference(s, coding_order - p->rps.refs[i]);
++        if (!ref)
++            return AVERROR_INVALIDDATA;
++        p->frame.reference_ts[i] = ff_v4l2_request_get_capture_timestamp(ref->frame);
++    }
++    if (p->frame.flags & V4L2_CAVS2_FRAME_BACKGROUND_REFERENCE) {
++        CAVS2RequestFrame *background = NULL;
++        for (i = 0; i < CAVS2_DPB_SIZE; i++)
++            if (s->dpb[i].frame && s->dpb[i].background)
++                background = &s->dpb[i];
++        if (!background || !p->frame.num_refs || p->frame.num_refs > V4L2_CAVS2_MAX_REFS)
++            return AVERROR_INVALIDDATA;
++        p->frame.reference_ts[p->frame.num_refs - 1] =
++            ff_v4l2_request_get_capture_timestamp(background->frame);
++    }
++    if (p->frame.picture_type == 2) {
++        CAVS2RequestFrame *forward, *backward;
++        if (p->rps.num_refs != 2)
++            return AVERROR_INVALIDDATA;
++        forward = cavs2_request_reference(s, coding_order - p->rps.refs[0]);
++        backward = cavs2_request_reference(s, coding_order - p->rps.refs[1]);
++        if (forward->picture_order <= p->frame.picture_order_count ||
++            backward->picture_order >= p->frame.picture_order_count)
++            return AVERROR_INVALIDDATA;
++    }
++    for (i = 0; i < CAVS2_DPB_SIZE; i++) {
++        if (!s->dpb[i].frame) {
++            dst = &s->dpb[i];
++            break;
++        }
++    }
++    if (!dst)
++        return AVERROR(ENOMEM);
++    dst->frame = av_frame_alloc();
++    if (!dst->frame)
++        return AVERROR(ENOMEM);
++    ret = ff_get_buffer(avctx, dst->frame, 0);
++    if (ret < 0)
++        goto fail;
++    dst->frame->pts = packet->pts;
++    dst->frame->pkt_dts = packet->dts;
++    dst->frame->duration = packet->duration;
++    dst->frame->time_base = avctx->pkt_timebase;
++    dst->frame->sample_aspect_ratio = avctx->sample_aspect_ratio;
++    dst->frame->color_range = avctx->color_range;
++    dst->frame->colorspace = avctx->colorspace;
++    dst->frame->color_primaries = avctx->color_primaries;
++    dst->frame->color_trc = avctx->color_trc;
++    dst->frame->pict_type = !p->frame.picture_type ? AV_PICTURE_TYPE_I :
++                          p->frame.picture_type == 2 ? AV_PICTURE_TYPE_B : AV_PICTURE_TYPE_P;
++    if (p->frame.flags & V4L2_CAVS2_FRAME_INTERLACED)
++        dst->frame->flags |= AV_FRAME_FLAG_INTERLACED;
++    if (p->frame.flags & V4L2_CAVS2_FRAME_TOP_FIELD_FIRST)
++        dst->frame->flags |= AV_FRAME_FLAG_TOP_FIELD_FIRST;
++    dst->frame->repeat_pict = !!(p->frame.flags & V4L2_CAVS2_FRAME_REPEAT_FIRST_FIELD);
++    if (!p->frame.picture_type)
++        dst->frame->flags |= AV_FRAME_FLAG_KEY;
++    ret = ff_v4l2_request_start_frame(avctx, &request, dst->frame);
++    if (ret < 0)
++        goto fail;
++    ret = ff_v4l2_request_append_output(avctx, &request, packet->data, packet->size);
++    if (ret < 0)
++        goto fail;
++    ret = ff_v4l2_request_decode_frame(avctx, &request, &control, 1);
++    if (ret < 0)
++        goto fail;
++    /* Complete reference reads before returning any reference surface to its pool. */
++    ret = ff_v4l2_request_wait_frame(avctx, dst->frame);
++    if (ret < 0)
++        goto fail;
++    fdd = dst->frame->private_ref;
++    if (fdd)
++        fdd->post_process = NULL;
++    dst->coding_order = coding_order;
++    dst->picture_order = p->frame.picture_order_count;
++    dst->reference = p->rps.reference;
++    dst->output = p->output;
++    dst->background = p->background;
++    if (p->background)
++        for (i = 0; i < CAVS2_DPB_SIZE; i++) {
++            if (&s->dpb[i] != dst && s->dpb[i].background) {
++                s->dpb[i].background = 0;
++                cavs2_request_release(&s->dpb[i]);
++            }
++        }
++    s->previous_coi = p->coding_order;
++    s->need_intra = 0;
++    for (i = 0; i < p->rps.num_remove; i++) {
++        CAVS2RequestFrame *ref = cavs2_request_reference(s, coding_order - p->rps.remove[i]);
++        if (ref) {
++            ref->reference = 0;
++            cavs2_request_release(ref);
++        }
++    }
++    if (sequence_end)
++        cavs2_request_sequence_end(s);
++    return 0;
++fail:
++    /* Stop DMA before releasing a surface used by a failed request. */
++    ff_hwaccel_uninit(avctx);
++    s->initialized = 0;
++    s->failed = ret;
++    av_frame_free(&dst->frame);
++    return ret;
++}
++
++static int cavs2_request_start_code(const uint8_t *data, int size, int start)
++{
++    int i;
++    for (i = start; i <= size - 4; i++)
++        if (!data[i] && !data[i + 1] && data[i + 2] == 1)
++            return i;
++    return size;
++}
++
++static int cavs2_request_packet(AVCodecContext *avctx, AVPacket *packet)
++{
++    CAVS2RequestContext *s = avctx->priv_data;
++    int start = cavs2_request_start_code(packet->data, packet->size, 0);
++    int picture = 0, slice = -1, end = 0, ret;
++    while (start < packet->size) {
++        int next = cavs2_request_start_code(packet->data, packet->size, start + 4);
++        const uint8_t *data = packet->data + start + 4;
++        int size = next - start - 4;
++        unsigned code = packet->data[start + 3];
++        if (code == AVS2_SEQ_START_CODE) {
++            CAVS2RequestSequence sequence;
++            if (picture)
++                return AVERROR_INVALIDDATA;
++            ret = ff_cavs2_request_sequence(&sequence, data, size);
++            if (ret < 0)
++                return ret;
++            if (s->initialized &&
++                (sequence.frame.width != s->sequence.frame.width ||
++                 sequence.frame.height != s->sequence.frame.height ||
++                 sequence.frame.bit_depth != s->sequence.frame.bit_depth ||
++                 sequence.reorder_delay > s->sequence.reorder_delay ||
++                 ((sequence.frame.sequence_flags ^ s->sequence.frame.sequence_flags) &
++                  V4L2_CAVS2_SEQ_BACKGROUND))) {
++                s->pending_sequence = sequence;
++                s->reconfigure = 1;
++                cavs2_request_sequence_end(s);
++                return AVERROR(EAGAIN);
++            }
++            s->sequence = sequence;
++        } else if (code == AVS2_INTRA_PIC_START_CODE || code == AVS2_INTER_PIC_START_CODE) {
++            if (picture)
++                return AVERROR_INVALIDDATA;
++            ret = ff_cavs2_request_picture(&s->sequence, &s->picture, data, size, code);
++            if (ret < 0)
++                return ret;
++            picture = 1;
++        } else if (code <= 0xaf && picture && slice < 0) {
++            slice = start;
++        } else if (code == AVS2_SEQ_END_CODE || code == 0xb7) {
++            end = 1;
++        }
++        start = next;
++    }
++    if (!picture) {
++        if (end)
++            cavs2_request_sequence_end(s);
++        return 0;
++    }
++    if (slice < 0)
++        return AVERROR_INVALIDDATA;
++    return cavs2_request_submit(avctx, packet, slice, end);
++}
++
++static int cavs2_request_receive_frame(AVCodecContext *avctx, AVFrame *frame)
++{
++    CAVS2RequestContext *s = avctx->priv_data;
++    int ret;
++    if (s->failed)
++        return s->failed;
++    for (;;) {
++        ret = cavs2_request_output(s, frame);
++        if (ret != AVERROR(EAGAIN))
++            return ret;
++        if (s->draining)
++            return AVERROR_EOF;
++        if (s->force_output)
++            s->force_output = 0;
++        if (s->reconfigure) {
++            ff_hwaccel_uninit(avctx);
++            s->initialized = 0;
++            s->sequence = s->pending_sequence;
++            s->reconfigure = 0;
++        } else {
++            ret = ff_decode_get_packet(avctx, s->packet);
++            if (ret == AVERROR_EOF) {
++                s->draining = 1;
++                continue;
++            }
++            if (ret < 0)
++                return ret;
++        }
++        ret = cavs2_request_packet(avctx, s->packet);
++        if (ret == AVERROR(EAGAIN) && s->reconfigure)
++            continue;
++        av_packet_unref(s->packet);
++        if (ret < 0) {
++            av_log(avctx, AV_LOG_ERROR, "CAVS2 request decode failed: %s\n", av_err2str(ret));
++            return ret;
++        }
++    }
++}
++
++static void cavs2_request_flush(AVCodecContext *avctx)
++{
++    CAVS2RequestContext *s = avctx->priv_data;
++    unsigned i;
++    if (s->initialized)
++        ff_v4l2_request_flush(avctx);
++    for (i = 0; i < CAVS2_DPB_SIZE; i++) {
++        av_frame_free(&s->dpb[i].frame);
++        s->dpb[i].reference = s->dpb[i].output = s->dpb[i].background = 0;
++    }
++    if (s->packet)
++        av_packet_unref(s->packet);
++    s->previous_coi = -1;
++    s->coi_epoch = s->draining = s->force_output = s->reconfigure = 0;
++    s->need_intra = 1;
++    s->failed = 0;
++}
++
++static av_cold int cavs2_request_init(AVCodecContext *avctx)
++{
++    CAVS2RequestContext *s = avctx->priv_data;
++    s->packet = av_packet_alloc();
++    if (!s->packet)
++        return AVERROR(ENOMEM);
++    s->previous_coi = -1;
++    s->need_intra = 1;
++    if (avctx->extradata_size > 0) {
++        AVPacket packet = { .data = avctx->extradata, .size = avctx->extradata_size };
++        return cavs2_request_packet(avctx, &packet);
++    }
++    return 0;
++}
++
++static av_cold int cavs2_request_close(AVCodecContext *avctx)
++{
++    CAVS2RequestContext *s = avctx->priv_data;
++    cavs2_request_flush(avctx);
++    av_packet_free(&s->packet);
++    return 0;
++}
++
++const FFCodec ff_cavs2_v4l2request_decoder = {
++    .p.name = "cavs2_v4l2request",
++    CODEC_LONG_NAME("CAVS2 V4L2 request decoder"),
++    .p.type = AVMEDIA_TYPE_VIDEO,
++    .p.id = AV_CODEC_ID_AVS2,
++    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY |
++                      AV_CODEC_CAP_HARDWARE,
++    .p.wrapper_name = "v4l2request",
++    .priv_data_size = sizeof(CAVS2RequestContext),
++    .init = cavs2_request_init,
++    .close = cavs2_request_close,
++    .flush = cavs2_request_flush,
++    FF_CODEC_RECEIVE_FRAME_CB(cavs2_request_receive_frame),
++    .caps_internal = FF_CODEC_CAP_INIT_CLEANUP | FF_CODEC_CAP_SETS_FRAME_PROPS,
++    CODEC_PIXFMTS(AV_PIX_FMT_DRM_PRIME),
++    .hw_configs = (const AVCodecHWConfigInternal *const []) {
++        HWACCEL_V4L2REQUEST(cavs2), NULL,
++    },
++};
+diff --git a/libavcodec/cavs2_request_parser.c b/libavcodec/cavs2_request_parser.c
+new file mode 100644
+--- /dev/null
++++ b/libavcodec/cavs2_request_parser.c
+@@ -0,0 +1,415 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/* CAVS2 header parsing for the experimental V4L2 request decoder. */
++#include <errno.h>
++#include <limits.h>
++#include <string.h>
++#include "cavs2_request_parser.h"
++
++static const uint8_t default_4x4[16] = {
++    64, 64, 64, 68, 64, 64, 68, 72, 64, 68, 76, 80, 72, 76, 84, 96,
++};
++
++static const uint8_t default_8x8[64] = {
++    64, 64, 64, 64, 68, 68, 72, 76, 64, 64, 64, 68, 72, 76, 84, 92,
++    64, 64, 68, 72, 76, 80, 88, 100, 64, 68, 72, 80, 84, 92, 100, 28,
++    68, 72, 80, 84, 92, 104, 112, 128, 76, 80, 84, 92, 104, 116, 132, 152,
++    96, 100, 104, 116, 124, 140, 164, 188, 104, 108, 116, 128, 152, 172, 192, 216,
++};
++
++static const uint8_t quant_model_8[256] = {
++    0, 0, 0, 4, 4, 4, 5, 5, 0, 0, 3, 3, 3, 3, 5, 5,
++    0, 3, 2, 2, 1, 1, 5, 5, 4, 3, 2, 2, 1, 5, 5, 5,
++    4, 3, 1, 1, 5, 5, 5, 5, 4, 3, 1, 5, 5, 5, 5, 5,
++    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
++    0, 0, 0, 4, 4, 4, 5, 5, 0, 0, 4, 4, 4, 4, 5, 5,
++    0, 3, 2, 2, 2, 1, 5, 5, 3, 3, 2, 2, 1, 5, 5, 5,
++    3, 3, 2, 1, 5, 5, 5, 5, 3, 3, 1, 5, 5, 5, 5, 5,
++    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
++    0, 0, 0, 4, 4, 3, 5, 5, 0, 0, 4, 4, 3, 2, 5, 5,
++    0, 4, 4, 3, 2, 1, 5, 5, 4, 4, 3, 2, 1, 5, 5, 5,
++    4, 3, 2, 1, 5, 5, 5, 5, 3, 2, 1, 5, 5, 5, 5, 5,
++    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
++    0, 0, 0, 3, 2, 1, 5, 5, 0, 0, 4, 3, 2, 1, 5, 5,
++    0, 4, 4, 3, 2, 1, 5, 5, 3, 3, 3, 3, 2, 5, 5, 5,
++    2, 2, 2, 2, 5, 5, 5, 5, 1, 1, 1, 5, 5, 5, 5, 5,
++    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
++};
++
++static const uint8_t quant_model_4[64] = {
++    0, 4, 3, 5, 4, 2, 1, 5, 3, 1, 1, 5, 5, 5, 5, 5,
++    0, 4, 4, 5, 3, 2, 2, 5, 3, 2, 1, 5, 5, 5, 5, 5,
++    0, 4, 3, 5, 4, 3, 2, 5, 3, 2, 1, 5, 5, 5, 5, 5,
++    0, 3, 1, 5, 3, 4, 2, 5, 1, 2, 2, 5, 5, 5, 5, 5,
++};
++
++static const int quant_params[12] = {
++    67, 71, 71, 80, 80, 106, 64, 49, 53, 58, 58, 64,
++};
++
++typedef struct CAVS2Bits {
++    const uint8_t *data;
++    size_t bits;
++    size_t position;
++    int error;
++} CAVS2Bits;
++
++static uint32_t cavs2_bits(CAVS2Bits *b, unsigned n)
++{
++    uint32_t value = 0;
++    if (b->error || n > 32 || b->position > b->bits || n > b->bits - b->position) {
++        b->error = -EINVAL;
++        return 0;
++    }
++    while (n--) {
++        value = (value << 1) | ((b->data[b->position / 8] >> (7 - b->position % 8)) & 1);
++        b->position++;
++    }
++    return value;
++}
++
++static uint32_t cavs2_ue(CAVS2Bits *b)
++{
++    unsigned zeros = 0;
++    while (!cavs2_bits(b, 1) && !b->error) {
++        if (++zeros > 30) {
++            b->error = -EINVAL;
++            return 0;
++        }
++    }
++    if (b->error)
++        return 0;
++    return ((1U << zeros) - 1) + cavs2_bits(b, zeros);
++}
++
++static int cavs2_se(CAVS2Bits *b)
++{
++    uint32_t value = cavs2_ue(b);
++    return value & 1 ? (int)((value + 1) / 2) : -(int)(value / 2);
++}
++
++static int cavs2_marker(CAVS2Bits *b)
++{
++    if (cavs2_bits(b, 1) != 1)
++        b->error = -EINVAL;
++    return b->error;
++}
++
++static int cavs2_rps(CAVS2Bits *b, struct CAVS2RequestRPS *r)
++{
++    unsigned i;
++    memset(r, 0, sizeof(*r));
++    r->reference = cavs2_bits(b, 1);
++    r->num_refs = cavs2_bits(b, 3);
++    for (i = 0; i < r->num_refs; i++) {
++        r->refs[i] = cavs2_bits(b, 6);
++        if (!r->refs[i])
++            b->error = -EINVAL;
++    }
++    r->num_remove = cavs2_bits(b, 3);
++    for (i = 0; i < r->num_remove; i++)
++        r->remove[i] = cavs2_bits(b, 6);
++    return cavs2_marker(b);
++}
++
++int ff_cavs2_request_sequence(CAVS2RequestSequence *seq, const uint8_t *data, size_t size)
++{
++    CAVS2RequestSequence next = { 0 };
++    struct v4l2_ctrl_cavs2_frame *f = &next.frame;
++    CAVS2Bits b = { .data = data, .bits = size * 8 };
++    unsigned i, precision, encoding = 1;
++    if (!data || size < 12 || size > 16384)
++        return -EINVAL;
++    f->profile = cavs2_bits(&b, 8);
++    cavs2_bits(&b, 8); /* Level. */
++    if (f->profile != 0x20 && f->profile != 0x22)
++        return -ENOSYS;
++    if (cavs2_bits(&b, 1))
++        f->sequence_flags = V4L2_CAVS2_SEQ_PROGRESSIVE;
++    if (cavs2_bits(&b, 1))
++        return -ENOSYS;
++    f->width = cavs2_bits(&b, 14);
++    f->height = cavs2_bits(&b, 14);
++    if (f->width < 64 || f->width > 16352 || f->height < 64 || f->height > 16352)
++        return -EINVAL;
++    if (cavs2_bits(&b, 2) != 1)
++        return -ENOSYS;
++    precision = cavs2_bits(&b, 3);
++    if (f->profile == 0x22)
++        encoding = cavs2_bits(&b, 3);
++    if (precision < 1 || precision > 2 || encoding < 1 || encoding > 2)
++        return -ENOSYS;
++    f->bit_depth = 6 + encoding * 2;
++    if (f->bit_depth == 10 && f->width > 16256)
++        return -EINVAL;
++    cavs2_bits(&b, 4); /* Aspect ratio. */
++    next.frame_rate_code = cavs2_bits(&b, 4);
++    if (!next.frame_rate_code || next.frame_rate_code > 13)
++        return -EINVAL;
++    cavs2_bits(&b, 18);
++    cavs2_marker(&b);
++    cavs2_bits(&b, 12);
++    next.low_delay = cavs2_bits(&b, 1);
++    cavs2_marker(&b);
++    next.temporal_id = cavs2_bits(&b, 1);
++    cavs2_bits(&b, 18);
++    f->log2_lcu_size = cavs2_bits(&b, 3);
++    if (f->log2_lcu_size < 4 || f->log2_lcu_size > 6)
++        return -EINVAL;
++    memcpy(f->quant_4x4, default_4x4, 16);
++    memcpy(f->quant_8x8, default_8x8, 64);
++    next.weighted_quant = cavs2_bits(&b, 1);
++    if (next.weighted_quant && cavs2_bits(&b, 1)) {
++        for (i = 0; i < 80; i++) {
++            uint32_t value = cavs2_ue(&b);
++            if (!value || value > 255)
++                return -EINVAL;
++            if (i < 16)
++                f->quant_4x4[i] = value;
++            else
++                f->quant_8x8[i - 16] = value;
++        }
++    }
++    if (!cavs2_bits(&b, 1))
++        f->sequence_flags |= V4L2_CAVS2_SEQ_BACKGROUND;
++    for (i = 0; i < 10; i++)
++        f->sequence_flags |= cavs2_bits(&b, 1) << i;
++    cavs2_marker(&b);
++    next.num_rps = cavs2_bits(&b, 6);
++    if (next.num_rps > CAVS2_REQUEST_MAX_RPS)
++        return -EINVAL;
++    for (i = 0; i < next.num_rps; i++)
++        cavs2_rps(&b, &next.rps[i]);
++    if (!next.low_delay)
++        next.reorder_delay = cavs2_bits(&b, 5);
++    f->sequence_flags |= cavs2_bits(&b, 1) << 10;
++    cavs2_bits(&b, 2);
++    if (b.error)
++        return b.error;
++    f->num_luma_filters = 1;
++    next.valid = 1;
++    *seq = next;
++    return 0;
++}
++
++static int cavs2_quant(CAVS2Bits *b, const CAVS2RequestSequence *seq,
++                     struct v4l2_ctrl_cavs2_frame *f)
++{
++    int params[6];
++    unsigned i, index, model, parameter_index;
++    memset(f->quant_4x4, 64, 16);
++    memset(f->quant_8x8, 64, 64);
++    if (!seq->weighted_quant || !cavs2_bits(b, 1))
++        return b->error;
++    index = cavs2_bits(b, 2);
++    if (!index) {
++        memcpy(f->quant_4x4, seq->frame.quant_4x4, 16);
++        memcpy(f->quant_8x8, seq->frame.quant_8x8, 64);
++    } else if (index == 1) {
++        cavs2_bits(b, 1);
++        parameter_index = cavs2_bits(b, 2);
++        model = cavs2_bits(b, 2);
++        if (parameter_index > 2)
++            return -EINVAL;
++        for (i = 0; i < 6; i++) {
++            params[i] = quant_params[(parameter_index == 1 ? 0 : 6) + i];
++            if (parameter_index)
++                params[i] += cavs2_se(b);
++            if (params[i] < 1 || params[i] > 255)
++                return -EINVAL;
++        }
++        for (i = 0; i < 16; i++)
++            f->quant_4x4[i] = params[quant_model_4[model * 16 + i]];
++        for (i = 0; i < 64; i++)
++            f->quant_8x8[i] = params[quant_model_8[model * 64 + i]];
++    } else if (index == 2) {
++        for (i = 0; i < 80; i++) {
++            uint32_t value = cavs2_ue(b);
++            if (!value || value > 255)
++                return -EINVAL;
++            if (i < 16)
++                f->quant_4x4[i] = value;
++            else
++                f->quant_8x8[i - 16] = value;
++        }
++    } else {
++        return -EINVAL;
++    }
++    return b->error;
++}
++
++static int cavs2_alf(CAVS2Bits *b, struct v4l2_ctrl_cavs2_frame *f)
++{
++    unsigned channel, filter, coefficient, region = 0;
++    if (!(f->sequence_flags & V4L2_CAVS2_SEQ_ALF))
++        return 0;
++    for (channel = 0; channel < 3; channel++)
++        f->alf_flags |= cavs2_bits(b, 1) << channel;
++    for (channel = 0; channel < 3; channel++) {
++        unsigned count = 1;
++        if (!(f->alf_flags & (1U << channel)))
++            continue;
++        if (!channel) {
++            count = cavs2_ue(b) + 1;
++            if (count > 16)
++                return -EINVAL;
++            f->num_luma_filters = count;
++        }
++        for (filter = 0; filter < count; filter++) {
++            unsigned slot = channel ? 15 + channel : filter;
++            if (!channel && filter) {
++                unsigned distance = count == 16 ? 1 : cavs2_ue(b);
++                if (!distance || distance > 15 - region)
++                    return -EINVAL;
++                region += distance;
++            }
++            if (!channel)
++                memset(f->alf_region_index + region, filter, 16 - region);
++            for (coefficient = 0; coefficient < 9; coefficient++) {
++                int value = cavs2_se(b);
++                if (value < -128 || value > 127)
++                    return -EINVAL;
++                f->alf_coefficients[slot][coefficient] = value;
++            }
++        }
++    }
++    return b->error;
++}
++
++static int cavs2_picture_rbsp(uint8_t *out, size_t *bits,
++                            const uint8_t *data, size_t size)
++{
++    unsigned zeros = 0;
++    size_t i, position = 0;
++    if (!data || size > 16384)
++        return -EINVAL;
++    memset(out, 0, size);
++    for (i = 0; i < size; i++) {
++        unsigned count = zeros == 2 && data[i] == 2 ? 6 : 8;
++        unsigned value = count == 6 ? data[i] >> 2 : data[i];
++        unsigned n;
++        zeros = data[i] ? 0 : zeros + 1;
++        for (n = count; n; n--) {
++            out[position / 8] |= ((value >> (n - 1)) & 1) << (7 - position % 8);
++            position++;
++        }
++    }
++    *bits = position;
++    return 0;
++}
++
++int ff_cavs2_request_picture(const CAVS2RequestSequence *seq, CAVS2RequestPicture *pic,
++                            const uint8_t *data, size_t size, int start_code)
++{
++    uint8_t rbsp[16384];
++    CAVS2RequestPicture next = { 0 };
++    struct v4l2_ctrl_cavs2_frame *f = &next.frame;
++    CAVS2Bits b = { .data = rbsp };
++    int ret, progressive, inter = start_code == 0xb6;
++    unsigned coding_type = 0, index;
++    if (!seq || !seq->valid || (start_code != 0xb3 && !inter))
++        return -EINVAL;
++    ret = cavs2_picture_rbsp(rbsp, &b.bits, data, size);
++    if (ret)
++        return ret;
++    *f = seq->frame;
++    f->flags = 0;
++    next.output = 1;
++    f->num_luma_filters = 1;
++    f->alf_flags = 0;
++    memset(f->alf_region_index, 0, sizeof(f->alf_region_index));
++    memset(f->alf_coefficients, 0, sizeof(f->alf_coefficients));
++    cavs2_bits(&b, 32);
++    if (inter) {
++        coding_type = cavs2_bits(&b, 2);
++        if (!coding_type)
++            return -EINVAL;
++        f->picture_type = coding_type;
++        if ((f->sequence_flags & V4L2_CAVS2_SEQ_BACKGROUND) && (coding_type & 1)) {
++            int predicted = coding_type == 1 ? cavs2_bits(&b, 1) : 0;
++            if (!predicted && cavs2_bits(&b, 1)) {
++                f->flags |= V4L2_CAVS2_FRAME_BACKGROUND_REFERENCE;
++                if (coding_type == 1)
++                    f->picture_type = 4;
++            }
++        }
++    } else if (cavs2_bits(&b, 1)) {
++        cavs2_bits(&b, 24);
++    }
++    if (!inter && (f->sequence_flags & V4L2_CAVS2_SEQ_BACKGROUND)) {
++        next.background = cavs2_bits(&b, 1);
++        if (next.background)
++            next.output = cavs2_bits(&b, 1);
++    }
++    next.coding_order = cavs2_bits(&b, 8);
++    if (seq->temporal_id)
++        cavs2_bits(&b, 3);
++    if (!seq->low_delay) {
++        uint32_t delay = cavs2_ue(&b);
++        if (delay > 63)
++            return -EINVAL;
++        next.output_delay = delay;
++    }
++    if (cavs2_bits(&b, 1)) {
++        index = cavs2_bits(&b, 5);
++        if (index >= seq->num_rps)
++            return -EINVAL;
++        next.rps = seq->rps[index];
++    } else {
++        cavs2_rps(&b, &next.rps);
++    }
++    if (seq->low_delay)
++        cavs2_ue(&b);
++    progressive = cavs2_bits(&b, 1);
++    if (!progressive) {
++        if ((f->sequence_flags & V4L2_CAVS2_SEQ_PROGRESSIVE) || cavs2_bits(&b, 1))
++            return -ENOSYS;
++        f->flags |= V4L2_CAVS2_FRAME_INTERLACED;
++    }
++    if (cavs2_bits(&b, 1))
++        f->flags |= V4L2_CAVS2_FRAME_TOP_FIELD_FIRST;
++    if (cavs2_bits(&b, 1))
++        f->flags |= V4L2_CAVS2_FRAME_REPEAT_FIRST_FIELD;
++    if (cavs2_bits(&b, 1))
++        f->flags |= V4L2_CAVS2_FRAME_FIXED_QP;
++    f->picture_qp = cavs2_bits(&b, 7);
++    if (f->picture_qp > 63 + (f->bit_depth - 8) * 8)
++        return -EINVAL;
++    if (inter) {
++        if (coding_type != 2)
++            cavs2_bits(&b, 1);
++        next.random_access = cavs2_bits(&b, 1);
++    }
++    if (cavs2_bits(&b, 1)) {
++        f->flags |= V4L2_CAVS2_FRAME_LOOP_FILTER_DISABLED;
++    } else if (cavs2_bits(&b, 1)) {
++        int alpha = cavs2_se(&b), beta = cavs2_se(&b);
++        if (alpha < -16 || alpha > 15 || beta < -16 || beta > 15)
++            return -EINVAL;
++        f->alpha_offset = alpha;
++        f->beta_offset = beta;
++    }
++    if (!cavs2_bits(&b, 1)) {
++        int cb = cavs2_se(&b), cr = cavs2_se(&b);
++        if (cb < -32 || cb > 31 || cr < -32 || cr > 31)
++            return -EINVAL;
++        f->chroma_qp_delta_cb = cb;
++        f->chroma_qp_delta_cr = cr;
++    }
++    ret = cavs2_quant(&b, seq, f);
++    if (ret)
++        return ret;
++    ret = cavs2_alf(&b, f);
++    if (ret)
++        return ret;
++    f->num_refs = next.rps.num_refs;
++    if ((f->picture_type && !f->num_refs) ||
++        (f->picture_type == 4 && f->num_refs != 1) ||
++        (f->picture_type == 2 && f->num_refs != 2))
++        return -EINVAL;
++    if (next.rps.reference)
++        f->flags |= V4L2_CAVS2_FRAME_REFERENCE;
++    if (b.error)
++        return b.error;
++    *pic = next;
++    return 0;
++}
+diff --git a/libavcodec/cavs2_request_parser.h b/libavcodec/cavs2_request_parser.h
+new file mode 100644
+--- /dev/null
++++ b/libavcodec/cavs2_request_parser.h
+@@ -0,0 +1,39 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#ifndef AVCODEC_CAVS2_REQUEST_PARSER_H
++#define AVCODEC_CAVS2_REQUEST_PARSER_H
++#include <stddef.h>
++#include <stdint.h>
++#include "v4l2_request_cavs2.h"
++
++#define CAVS2_REQUEST_MAX_RPS 32
++struct CAVS2RequestRPS {
++    uint8_t reference;
++    uint8_t num_refs;
++    uint8_t num_remove;
++    uint8_t refs[7];
++    uint8_t remove[7];
++};
++typedef struct CAVS2RequestSequence {
++    struct v4l2_ctrl_cavs2_frame frame;
++    struct CAVS2RequestRPS rps[CAVS2_REQUEST_MAX_RPS];
++    uint8_t valid;
++    uint8_t low_delay;
++    uint8_t temporal_id;
++    uint8_t weighted_quant;
++    uint8_t num_rps;
++    uint8_t reorder_delay;
++    uint8_t frame_rate_code;
++} CAVS2RequestSequence;
++typedef struct CAVS2RequestPicture {
++    struct v4l2_ctrl_cavs2_frame frame;
++    struct CAVS2RequestRPS rps;
++    uint8_t coding_order;
++    uint8_t output_delay;
++    uint8_t random_access;
++    uint8_t background;
++    uint8_t output;
++} CAVS2RequestPicture;
++int ff_cavs2_request_sequence(CAVS2RequestSequence *seq, const uint8_t *data, size_t size);
++int ff_cavs2_request_picture(const CAVS2RequestSequence *seq, CAVS2RequestPicture *pic,
++                            const uint8_t *data, size_t size, int start_code);
++#endif
+diff --git a/libavcodec/v4l2_request_cavs2.h b/libavcodec/v4l2_request_cavs2.h
+new file mode 100644
+--- /dev/null
++++ b/libavcodec/v4l2_request_cavs2.h
+@@ -0,0 +1,61 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef _CAVS2_CTRLS_H_
++#define _CAVS2_CTRLS_H_
++
++#include <linux/types.h>
++#include <linux/v4l2-controls.h>
++#include <linux/videodev2.h>
++
++/* Experimental frame control; keep the kernel and userspace definitions identical. */
++#define V4L2_PIX_FMT_CAVS2_FRAME v4l2_fourcc('C', 'A', 'V', '2')
++#define V4L2_CID_STATELESS_CAVS2_FRAME (V4L2_CID_CODEC_STATELESS_BASE + 600)
++#define V4L2_CAVS2_MAX_REFS 7
++#define V4L2_CAVS2_SEQ_MHP_SKIP (1U << 0)
++#define V4L2_CAVS2_SEQ_DHP (1U << 1)
++#define V4L2_CAVS2_SEQ_WSM (1U << 2)
++#define V4L2_CAVS2_SEQ_AMP (1U << 3)
++#define V4L2_CAVS2_SEQ_NSQT (1U << 4)
++#define V4L2_CAVS2_SEQ_SDIP (1U << 5)
++#define V4L2_CAVS2_SEQ_SECOND_TRANSFORM (1U << 6)
++#define V4L2_CAVS2_SEQ_SAO (1U << 7)
++#define V4L2_CAVS2_SEQ_ALF (1U << 8)
++#define V4L2_CAVS2_SEQ_PMVR (1U << 9)
++#define V4L2_CAVS2_SEQ_CROSS_LOOP_FILTER (1U << 10)
++#define V4L2_CAVS2_SEQ_PROGRESSIVE (1U << 11)
++#define V4L2_CAVS2_SEQ_BACKGROUND (1U << 12)
++#define V4L2_CAVS2_FRAME_BACKGROUND_REFERENCE (1U << 3)
++#define V4L2_CAVS2_FRAME_INTERLACED (1U << 4)
++#define V4L2_CAVS2_FRAME_TOP_FIELD_FIRST (1U << 5)
++#define V4L2_CAVS2_FRAME_REPEAT_FIRST_FIELD (1U << 6)
++#define V4L2_CAVS2_FRAME_FIXED_QP (1U << 0)
++#define V4L2_CAVS2_FRAME_LOOP_FILTER_DISABLED (1U << 1)
++#define V4L2_CAVS2_FRAME_REFERENCE (1U << 2)
++
++struct v4l2_ctrl_cavs2_frame {
++	__u64 reference_ts[V4L2_CAVS2_MAX_REFS];
++	__s32 picture_order_count;
++	__u32 sequence_flags;
++	__u32 bitstream_offset;
++	__u32 bitstream_size;
++	__u32 flags;
++	__u16 width;
++	__u16 height;
++	__u8 profile;
++	__u8 bit_depth;
++	__u8 log2_lcu_size;
++	__u8 picture_type; /* I=0, P=1, B=2, F=3, P_BG=4. */
++	__u8 picture_qp;
++	__u8 num_refs;
++	__u8 alf_flags;
++	__u8 num_luma_filters;
++	__s8 chroma_qp_delta_cb;
++	__s8 chroma_qp_delta_cr;
++	__s8 alpha_offset;
++	__s8 beta_offset;
++	__u8 alf_region_index[16];
++	__u8 quant_4x4[16];
++	__u8 quant_8x8[64];
++	__s16 alf_coefficients[18][9]; /* Sixteen luma filters, Cb, Cr. */
++};
++
++#endif

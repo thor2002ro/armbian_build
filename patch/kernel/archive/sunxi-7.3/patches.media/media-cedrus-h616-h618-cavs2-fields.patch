@@ -1,0 +1,150 @@
+Subject: Local: media: cedrus: add CAVS2 fields and completion fence
+
+AVS2 needs syntax and field state that the existing CAVS path cannot carry.
+
+Add the missing request state and reject syntax that the controls cannot represent.
+---
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.c b/drivers/staging/media/sunxi/cedrus/cedrus.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.c
+@@ -122,6 +122,10 @@
+ 		if (vb2_is_busy(q)) {
+-			if (ctx->bit_depth != frame->bit_depth)
++			if (ctx->bit_depth != frame->bit_depth ||
++			    ctx->cavs2_field_coded !=
++			    !!(frame->sequence_flags & V4L2_CAVS2_SEQ_FIELD_CODED))
+ 				return -EINVAL;
+-		} else if (ctx->bit_depth != frame->bit_depth) {
++		} else {
+ 			ctx->bit_depth = frame->bit_depth;
++			ctx->cavs2_field_coded =
++				!!(frame->sequence_flags & V4L2_CAVS2_SEQ_FIELD_CODED);
+ 			cedrus_reset_cap_format(ctx);
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.h b/drivers/staging/media/sunxi/cedrus/cedrus.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -186,2 +186,3 @@
+ 	unsigned int			bit_depth;
++	bool				cavs2_field_coded;
+ 
+@@ -234,2 +235,3 @@
+ 			struct cedrus_buffer *dst;
++			bool wait_idle;
+ 		} cavs2;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_video.c b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_video.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+@@ -444,2 +444,4 @@
+ 	pix_fmt->height = ctx->src_fmt.height;
++	if (ctx->src_fmt.pixelformat == V4L2_PIX_FMT_CAVS2_FRAME && ctx->cavs2_field_coded)
++		pix_fmt->height *= 2;
+ 	cedrus_prepare_format(ctx, pix_fmt, ctx->src_fmt.pixelformat);
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_cavs2.c b/drivers/staging/media/sunxi/cedrus/cedrus_cavs2.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_cavs2.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_cavs2.c
+@@ -3,2 +3,5 @@
+ #include <linux/dma-mapping.h>
++#include <linux/iopoll.h>
++#include <linux/of.h>
++#include <linux/reset.h>
+ #include <linux/unaligned.h>
+@@ -34,5 +37,13 @@
+ 	    f->log2_lcu_size < 4 || f->log2_lcu_size > 6 ||
+-	    (f->sequence_flags & ~0x1fffU) || (f->flags & ~127U) ||
++	    (f->sequence_flags & ~0x3fffU) || (f->flags & ~511U) ||
+ 	    (f->flags & V4L2_CAVS2_FRAME_INTERLACED &&
+-	     f->sequence_flags & V4L2_CAVS2_SEQ_PROGRESSIVE) ||
++	     f->sequence_flags & V4L2_CAVS2_SEQ_PROGRESSIVE &&
++	     !(f->sequence_flags & V4L2_CAVS2_SEQ_FIELD_CODED)) ||
++	    ((f->sequence_flags & V4L2_CAVS2_SEQ_FIELD_CODED) &&
++	     ((f->height & 1) || f->height > 16352 / 2)) ||
++	    ((f->flags & V4L2_CAVS2_FRAME_TOP_FIELD) &&
++	     !(f->sequence_flags & V4L2_CAVS2_SEQ_FIELD_CODED)) ||
++	    ((f->flags & V4L2_CAVS2_FRAME_BACKGROUND_TOP_FIELD) &&
++	     (!(f->sequence_flags & V4L2_CAVS2_SEQ_FIELD_CODED) ||
++	      !(f->flags & V4L2_CAVS2_FRAME_BACKGROUND_REFERENCE))) ||
+ 	    f->picture_type > 4 || f->num_refs > V4L2_CAVS2_MAX_REFS ||
+@@ -75,2 +86,3 @@
+ 	       (f->bit_depth & 7) << 3 |
++	       !!(flags & V4L2_CAVS2_SEQ_FIELD_CODED) << 7 |
+ 	       !!(flags & V4L2_CAVS2_SEQ_WSM) << 16 |
+@@ -123,2 +135,4 @@
+ 	u64 history = 0;
++	u32 parity = (f->sequence_flags & V4L2_CAVS2_SEQ_FIELD_CODED) &&
++		     !(f->flags & V4L2_CAVS2_FRAME_TOP_FIELD) ? BIT(16) : 0;
+ 	unsigned int i, j;
+@@ -146,7 +160,13 @@
+ 		u8 *entry = table + 0x100 + i * 16;
+-
++		u32 poi = refs[i].poi;
++
++		if ((f->flags & V4L2_CAVS2_FRAME_BACKGROUND_REFERENCE) &&
++		    i == f->num_refs - 1) {
++			poi = f->picture_order_count;
++			if (f->sequence_flags & V4L2_CAVS2_SEQ_FIELD_CODED)
++				poi -= !!(f->flags & V4L2_CAVS2_FRAME_TOP_FIELD) !=
++				       !!(f->flags & V4L2_CAVS2_FRAME_BACKGROUND_TOP_FIELD);
++		}
+ 		put_unaligned_le32(refs[i].luma >> 5, entry);
+-		put_unaligned_le32(((f->flags & V4L2_CAVS2_FRAME_BACKGROUND_REFERENCE) &&
+-				    i == f->num_refs - 1 ? f->picture_order_count :
+-				    refs[i].poi) & 511, entry + 4);
++		put_unaligned_le32((poi & 511) | parity, entry + 4);
+ 		put_unaligned_le32(refs[i].chroma >> 5, entry + 8);
+@@ -161,3 +181,3 @@
+ 	put_unaligned_le32(refs[7].luma >> 5, table + 0x170);
+-	put_unaligned_le32(refs[7].poi & 511, table + 0x174);
++	put_unaligned_le32((refs[7].poi & 511) | parity, table + 0x174);
+ 	put_unaligned_le32(refs[7].chroma >> 5, table + 0x178);
+@@ -168,3 +188,5 @@
+ {
+-	u32 status = cedrus_read(ctx->dev, CAVS2_REG(0x38)) & CAVS2_IRQ_MASK;
++	struct cedrus_dev *dev = ctx->dev;
++	u32 status = cedrus_read(dev, CAVS2_REG(0x38)) & CAVS2_IRQ_MASK;
++	u32 idle;
+ 
+@@ -172,3 +194,18 @@
+ 		return CEDRUS_IRQ_NONE;
+-	return status & 6 ? CEDRUS_IRQ_ERROR : CEDRUS_IRQ_OK;
++	if (status & 6)
++		goto reset;
++	if (ctx->codec.cavs2.wait_idle &&
++	    readl_poll_timeout_atomic(dev->base + VE_STATUS, idle,
++				      (idle & VE_STATUS_VE_IDLE) &&
++				      (cedrus_read(dev, VE_STATUS) & VE_STATUS_VE_IDLE),
++				      1, 1000))
++		goto reset;
++	return CEDRUS_IRQ_OK;
++
++reset:
++	if (ctx->codec.cavs2.dst)
++		ctx->codec.cavs2.dst->codec.cavs2.valid = false;
++	ctx->codec.cavs2.dst = NULL;
++	reset_control_reset(dev->rstc);
++	return CEDRUS_IRQ_ERROR;
+ }
+@@ -213,3 +250,6 @@
+ 	if (f->width != ctx->src_fmt.width || f->height != ctx->src_fmt.height ||
+-	    f->bit_depth != ctx->bit_depth || !f->bitstream_size ||
++	    f->bit_depth != ctx->bit_depth ||
++	    ctx->cavs2_field_coded !=
++	    !!(f->sequence_flags & V4L2_CAVS2_SEQ_FIELD_CODED) ||
++	    !f->bitstream_size ||
+ 	    f->bitstream_offset > payload ||
+@@ -316,2 +356,4 @@
+ 
++	ctx->codec.cavs2.wait_idle = of_device_is_compatible(dev->dev->of_node,
++							 "allwinner,sun50i-h616-video-engine");
+ 	ctx->codec.cavs2.entry = dma_alloc_coherent(dev->dev, CAVS2_ENTRY_SIZE,
+diff --git a/include/media/cavs2-ctrls.h b/include/media/cavs2-ctrls.h
+--- a/include/media/cavs2-ctrls.h
++++ b/include/media/cavs2-ctrls.h
+@@ -25,2 +25,3 @@
+ #define V4L2_CAVS2_SEQ_BACKGROUND (1U << 12)
++#define V4L2_CAVS2_SEQ_FIELD_CODED (1U << 13)
+ #define V4L2_CAVS2_FRAME_BACKGROUND_REFERENCE (1U << 3)
+@@ -29,2 +30,4 @@
+ #define V4L2_CAVS2_FRAME_REPEAT_FIRST_FIELD (1U << 6)
++#define V4L2_CAVS2_FRAME_TOP_FIELD (1U << 7)
++#define V4L2_CAVS2_FRAME_BACKGROUND_TOP_FIELD (1U << 8)
+ #define V4L2_CAVS2_FRAME_FIXED_QP (1U << 0)
