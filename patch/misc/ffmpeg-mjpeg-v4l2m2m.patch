@@ -1,0 +1,607 @@
+Subject: [PATCH] Local: avcodec: add MJPEG V4L2 M2M encoding
+
+JPEG hardware support existed, but the media path could not reach it safely.
+
+Add the required formats, controls, and bounds while keeping unsupported JPEG modes rejected.
+---
+diff --git a/configure b/configure
+--- a/configure
++++ b/configure
+@@ -3673,6 +3673,7 @@
+ hevc_v4l2m2m_decoder_select="hevc_mp4toannexb_bsf"
+ hevc_v4l2m2m_encoder_deps="v4l2_m2m hevc_v4l2_m2m"
+ mjpeg_cuvid_decoder_deps="cuvid"
++mjpeg_v4l2m2m_encoder_deps="v4l2_m2m mjpeg_v4l2_m2m"
+ mjpeg_qsv_decoder_select="qsvdec"
+ mjpeg_qsv_encoder_deps="libmfx"
+ mjpeg_qsv_encoder_select="qsvenc"
+@@ -7578,6 +7579,7 @@
+     check_cc hevc_v4l2_m2m linux/videodev2.h "int i = V4L2_PIX_FMT_HEVC;"
+     check_cc h263_v4l2_m2m linux/videodev2.h "int i = V4L2_PIX_FMT_H263;"
+     check_cc h264_v4l2_m2m linux/videodev2.h "int i = V4L2_PIX_FMT_H264;"
++    check_cc mjpeg_v4l2_m2m linux/videodev2.h "int i = V4L2_PIX_FMT_MJPEG; int q = V4L2_CID_JPEG_COMPRESSION_QUALITY;"
+     check_cc vp8_v4l2_m2m linux/videodev2.h "int i = V4L2_PIX_FMT_VP8;"
+     check_cc vp9_v4l2_m2m linux/videodev2.h "int i = V4L2_PIX_FMT_VP9;"
+ fi
+diff --git a/libavcodec/Makefile b/libavcodec/Makefile
+--- a/libavcodec/Makefile
++++ b/libavcodec/Makefile
+@@ -540,6 +540,7 @@
+ OBJS-$(CONFIG_MJPEG_QSV_DECODER)       += qsvdec.o
+ OBJS-$(CONFIG_MJPEG_ENCODER)           += mjpegenc.o mjpegenc_common.o \
+                                           mjpegenc_huffman.o gain_map.o
++OBJS-$(CONFIG_MJPEG_V4L2M2M_ENCODER)   += v4l2_m2m_enc.o
+ OBJS-$(CONFIG_MJPEGB_DECODER)          += mjpegbdec.o
+ OBJS-$(CONFIG_MJPEG_CUVID_DECODER)     += cuviddec.o
+ OBJS-$(CONFIG_MJPEG_QSV_ENCODER)       += qsvenc_jpeg.o
+diff --git a/libavcodec/allcodecs.c b/libavcodec/allcodecs.c
+--- a/libavcodec/allcodecs.c
++++ b/libavcodec/allcodecs.c
+@@ -901,6 +901,7 @@
+ extern const FFCodec ff_hevc_vulkan_encoder;
+ extern const FFCodec ff_libkvazaar_encoder;
+ extern const FFCodec ff_mjpeg_cuvid_decoder;
++extern const FFCodec ff_mjpeg_v4l2m2m_encoder;
+ extern const FFCodec ff_mjpeg_qsv_encoder;
+ extern const FFCodec ff_mjpeg_qsv_decoder;
+ extern const FFCodec ff_mjpeg_vaapi_encoder;
+diff --git a/libavcodec/v4l2_buffers.c b/libavcodec/v4l2_buffers.c
+--- a/libavcodec/v4l2_buffers.c
++++ b/libavcodec/v4l2_buffers.c
+@@ -31,6 +31,7 @@
+ #include "libavcodec/avcodec.h"
+ #include "libavutil/attributes.h"
+ #include "libavutil/hwcontext.h"
++#include "libavutil/imgutils.h"
+ #include "libavutil/pixdesc.h"
+ #include "libavutil/refstruct.h"
+ #include "v4l2_context.h"
+@@ -498,66 +499,74 @@
+ 
+ static int v4l2_buffer_swframe_to_buf(const AVFrame *frame, V4L2Buffer *out)
+ {
+-    int i, ret;
+-    struct v4l2_format fmt = out->context->format;
+-    int pixel_format = V4L2_TYPE_IS_MULTIPLANAR(fmt.type) ?
+-                       fmt.fmt.pix_mp.pixelformat : fmt.fmt.pix.pixelformat;
+-    int height       = V4L2_TYPE_IS_MULTIPLANAR(fmt.type) ?
+-                       fmt.fmt.pix_mp.height : fmt.fmt.pix.height;
+-    int is_planar_format = 0;
+-
+-    switch (pixel_format) {
+-    case V4L2_PIX_FMT_YUV420M:
+-    case V4L2_PIX_FMT_YVU420M:
+-#ifdef V4L2_PIX_FMT_YUV422M
+-    case V4L2_PIX_FMT_YUV422M:
+-#endif
+-#ifdef V4L2_PIX_FMT_YVU422M
+-    case V4L2_PIX_FMT_YVU422M:
+-#endif
+-#ifdef V4L2_PIX_FMT_YUV444M
+-    case V4L2_PIX_FMT_YUV444M:
+-#endif
+-#ifdef V4L2_PIX_FMT_YVU444M
+-    case V4L2_PIX_FMT_YVU444M:
+-#endif
+-    case V4L2_PIX_FMT_NV12M:
+-    case V4L2_PIX_FMT_NV21M:
+-    case V4L2_PIX_FMT_NV12MT_16X16:
+-    case V4L2_PIX_FMT_NV12MT:
+-    case V4L2_PIX_FMT_NV16M:
+-    case V4L2_PIX_FMT_NV61M:
+-        is_planar_format = 1;
+-    }
+-
+-    if (!is_planar_format) {
+-        const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(frame->format);
+-        int planes_nb = 0;
+-        int offset = 0;
+-
+-        for (i = 0; i < desc->nb_components; i++)
+-            planes_nb = FFMAX(planes_nb, desc->comp[i].plane + 1);
+-
+-        for (i = 0; i < planes_nb; i++) {
+-            int size, h = height;
+-            if (i == 1 || i == 2) {
+-                h = AV_CEIL_RSHIFT(h, desc->log2_chroma_h);
+-            }
+-            size = frame->linesize[i] * h;
+-            ret = v4l2_bufref_to_buf(out, 0, frame->data[i], size, offset);
+-            if (ret)
+-                return ret;
+-            offset += size;
++    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(frame->format);
++    const struct v4l2_format *fmt = &out->context->format;
++    const int multi = V4L2_TYPE_IS_MULTIPLANAR(fmt->type);
++    const int width = multi ? fmt->fmt.pix_mp.width : fmt->fmt.pix.width;
++    const int height = multi ? fmt->fmt.pix_mp.height : fmt->fmt.pix.height;
++    const uint32_t fourcc = multi ? fmt->fmt.pix_mp.pixelformat : fmt->fmt.pix.pixelformat;
++    int row_bytes[4], planes, rows[4], ret;
++    ptrdiff_t strides[4] = { 0 };
++    size_t sizes[4], offsets[4] = { 0 }, total = 0;
++
++    if (!desc || width <= 0 || height <= 0 ||
++        frame->width != width || frame->height != height ||
++        (desc->flags & (AV_PIX_FMT_FLAG_PAL | AV_PIX_FMT_FLAG_HWACCEL)) ||
++        fourcc == V4L2_PIX_FMT_NV12MT || fourcc == V4L2_PIX_FMT_NV12MT_16X16)
++        return AVERROR(EINVAL);
++    planes = av_pix_fmt_count_planes(frame->format);
++    if (planes <= 0 || planes > 4 ||
++        (out->num_planes != 1 && out->num_planes != planes))
++        return AVERROR(EINVAL);
++    ret = av_image_fill_linesizes(row_bytes, frame->format, width);
++    if (ret < 0)
++        return ret;
++    for (int i = 0; i < planes; i++) {
++        int physical = out->num_planes == 1 ? 0 : i;
++        int64_t source_stride = frame->linesize[i];
++
++        strides[i] = out->plane_info[physical].bytesperline;
++        if (out->num_planes == 1 && i && planes == 3)
++            strides[i] = AV_CEIL_RSHIFT(strides[i], desc->log2_chroma_w);
++        if (!frame->data[i] || !out->plane_info[physical].mm_addr ||
++            strides[i] < row_bytes[i] ||
++            (source_stride < 0 ? -source_stride : source_stride) < row_bytes[i])
++            return AVERROR(EINVAL);
++    }
++    ret = av_image_fill_plane_sizes(sizes, frame->format, height, strides);
++    if (ret < 0)
++        return ret;
++    for (int i = 0; i < planes; i++) {
++        int physical = out->num_planes == 1 ? 0 : i;
++        size_t length = out->plane_info[physical].length;
++
++        offsets[i] = out->num_planes == 1 ? total : 0;
++        if (offsets[i] > length || sizes[i] > length - offsets[i])
++            return AVERROR(EINVAL);
++        rows[i] = sizes[i] / strides[i];
++        total += sizes[i];
++    }
++    for (int i = 0; i < planes; i++) {
++        int physical = out->num_planes == 1 ? 0 : i;
++        uint8_t *dst = (uint8_t *)out->plane_info[physical].mm_addr + offsets[i];
++
++        memset(dst, 0, sizes[i]);
++        av_image_copy_plane(dst, strides[i], frame->data[i], frame->linesize[i],
++                            row_bytes[i], rows[i]);
++        if (out->num_planes > 1) {
++            out->planes[i].bytesused = sizes[i];
++            out->planes[i].length = out->plane_info[i].length;
+         }
+-        return 0;
+-    }
+-
+-    for (i = 0; i < out->num_planes; i++) {
+-        ret = v4l2_bufref_to_buf(out, i, frame->buf[i]->data, frame->buf[i]->size, 0);
+-        if (ret)
+-            return ret;
+-    }
+-
++    }
++    if (out->num_planes == 1) {
++        if (multi) {
++            out->planes[0].bytesused = total;
++            out->planes[0].length = out->plane_info[0].length;
++        } else {
++            out->buf.bytesused = total;
++            out->buf.length = out->plane_info[0].length;
++        }
++    }
+     return 0;
+ }
+ 
+diff --git a/libavcodec/v4l2_context.c b/libavcodec/v4l2_context.c
+--- a/libavcodec/v4l2_context.c
++++ b/libavcodec/v4l2_context.c
+@@ -310,9 +310,12 @@
+     if (V4L2_TYPE_IS_OUTPUT(ctx->type))
+         pfd.events =  POLLOUT | POLLWRNORM;
+     else {
+-        /* no need to listen to requests for more input while draining */
+-        if (ctx_to_m2mctx(ctx)->draining)
+-            pfd.events =  POLLIN | POLLRDNORM | POLLPRI;
++        V4L2m2mContext *s = ctx_to_m2mctx(ctx);
++        V4L2m2mPriv *priv = s->priv;
++
++        if (s->draining || (s->avctx && s->avctx->codec_id == AV_CODEC_ID_MJPEG &&
++                            priv && priv->jpeg_pending))
++            pfd.events = POLLIN | POLLRDNORM | POLLPRI;
+     }
+ 
+     for (;;) {
+diff --git a/libavcodec/v4l2_m2m.c b/libavcodec/v4l2_m2m.c
+--- a/libavcodec/v4l2_m2m.c
++++ b/libavcodec/v4l2_m2m.c
+@@ -160,6 +160,13 @@
+                                                cfmt.fmt.pix.pixelformat),
+                                  av_get_pix_fmt_name(s->capture.av_pix_fmt) ?: "none");
+ 
++    if (s->avctx && av_codec_is_encoder(s->avctx->codec) &&
++        s->avctx->codec_id == AV_CODEC_ID_MJPEG) {
++        ret = ff_v4l2_context_set_format(&s->capture);
++        if (ret)
++            goto error;
++    }
++
+     ret = ff_v4l2_context_set_format(&s->output);
+     if (ret) {
+         av_log(log_ctx, AV_LOG_ERROR, "can't set v4l2 output format\n");
+@@ -170,6 +177,23 @@
+     if (ret) {
+         av_log(log_ctx, AV_LOG_ERROR, "can't to set v4l2 capture format\n");
+         goto error;
++    }
++
++    if (s->avctx && av_codec_is_encoder(s->avctx->codec)) {
++        V4L2Context *contexts[] = { &s->output, &s->capture };
++
++        for (int i = 0; i < FF_ARRAY_ELEMS(contexts); i++) {
++            const struct v4l2_format *fmt = &contexts[i]->format;
++            int multi = V4L2_TYPE_IS_MULTIPLANAR(fmt->type);
++            unsigned width = multi ? fmt->fmt.pix_mp.width : fmt->fmt.pix.width;
++            unsigned height = multi ? fmt->fmt.pix_mp.height : fmt->fmt.pix.height;
++
++            if (width != s->avctx->width || height != s->avctx->height) {
++                av_log(log_ctx, AV_LOG_ERROR, "Encoder changed frame dimensions\n");
++                ret = AVERROR(EINVAL);
++                goto error;
++            }
++        }
+     }
+ 
+     ret = ff_v4l2_context_init(&s->output);
+diff --git a/libavcodec/v4l2_m2m.h b/libavcodec/v4l2_m2m.h
+--- a/libavcodec/v4l2_m2m.h
++++ b/libavcodec/v4l2_m2m.h
+@@ -82,6 +82,13 @@
+     int num_output_buffers;
+     int num_capture_buffers;
+     enum AVPixelFormat pix_fmt;
++    int jpeg_quality;
++    int jpeg_rc_quality;
++    int jpeg_pending;
++    int64_t jpeg_target_bits;
++    int64_t jpeg_min_bits;
++    int64_t jpeg_max_bits;
++    int64_t jpeg_tolerance_bits;
+ } V4L2m2mPriv;
+ 
+ /**
+diff --git a/libavcodec/v4l2_m2m_enc.c b/libavcodec/v4l2_m2m_enc.c
+--- a/libavcodec/v4l2_m2m_enc.c
++++ b/libavcodec/v4l2_m2m_enc.c
+@@ -50,13 +50,14 @@
+         av_log(s->avctx, AV_LOG_WARNING, "Failed to set timeperframe");
+ }
+ 
+-static inline void v4l2_set_ext_ctrl(V4L2m2mContext *s, unsigned int id, signed int value, const char *name, int log_warning)
++static inline int v4l2_set_ext_ctrl(V4L2m2mContext *s, unsigned int id, signed int value, const char *name, int log_warning)
+ {
+     struct v4l2_ext_controls ctrls = { { 0 } };
+     struct v4l2_ext_control ctrl = { 0 };
++    int ret;
+ 
+     /* set ctrls */
+-    ctrls.ctrl_class = V4L2_CTRL_CLASS_MPEG;
++    ctrls.ctrl_class = V4L2_CTRL_ID2CLASS(id);
+     ctrls.controls = &ctrl;
+     ctrls.count = 1;
+ 
+@@ -64,11 +65,15 @@
+     ctrl.value = value;
+     ctrl.id = id;
+ 
+-    if (ioctl(s->fd, VIDIOC_S_EXT_CTRLS, &ctrls) < 0)
+-        av_log(s->avctx, log_warning || errno != EINVAL ? AV_LOG_WARNING : AV_LOG_DEBUG,
+-               "Failed to set %s: %s\n", name, strerror(errno));
+-    else
+-        av_log(s->avctx, AV_LOG_DEBUG, "Encoder: %s = %d\n", name, value);
++    if (ioctl(s->fd, VIDIOC_S_EXT_CTRLS, &ctrls) < 0) {
++        ret = AVERROR(errno);
++        av_log(s->avctx, log_warning || ret != AVERROR(EINVAL) ? AV_LOG_WARNING : AV_LOG_DEBUG,
++               "Failed to set %s: %s\n", name, av_err2str(ret));
++        return ret;
++    }
++
++    av_log(s->avctx, AV_LOG_DEBUG, "Encoder: %s = %d\n", name, value);
++    return 0;
+ }
+ 
+ static inline int v4l2_get_ext_ctrl(V4L2m2mContext *s, unsigned int id, signed int *value, const char *name, int log_warning)
+@@ -171,6 +176,85 @@
+                "the v4l2 driver does not support end of stream VIDIOC_SUBSCRIBE_EVENT\n");
+ }
+ 
++static int v4l2_mjpeg_rc_init(AVCodecContext *avctx)
++{
++    V4L2m2mPriv *priv = avctx->priv_data;
++    AVRational fps = avctx->framerate;
++    int64_t min_rate = avctx->rc_min_rate, max_rate = avctx->rc_max_rate;
++
++    priv->jpeg_rc_quality = priv->jpeg_quality;
++    priv->jpeg_pending = 0;
++    priv->jpeg_target_bits = 0;
++    if (!avctx->bit_rate && !min_rate && !max_rate)
++        return 0;
++    if (avctx->bit_rate <= 0)
++        return AVERROR(EINVAL);
++    if (fps.num <= 0 || fps.den <= 0)
++        fps = av_inv_q(avctx->time_base);
++    if (fps.num <= 0 || fps.den <= 0)
++        return AVERROR(EINVAL);
++    if (!min_rate && !max_rate)
++        min_rate = max_rate = avctx->bit_rate;
++    if ((min_rate != avctx->bit_rate || max_rate != avctx->bit_rate) &&
++        (min_rate < 0 || min_rate >= avctx->bit_rate || max_rate <= avctx->bit_rate))
++        return AVERROR(EINVAL);
++    priv->jpeg_target_bits = av_rescale_rnd(avctx->bit_rate, fps.den, fps.num, AV_ROUND_ZERO);
++    priv->jpeg_min_bits = av_rescale_rnd(min_rate, fps.den, fps.num, AV_ROUND_ZERO);
++    priv->jpeg_max_bits = av_rescale_rnd(max_rate, fps.den, fps.num, AV_ROUND_ZERO);
++    if (priv->jpeg_target_bits <= 0 || priv->jpeg_max_bits > INT_MAX ||
++        priv->jpeg_max_bits < 0 || priv->jpeg_min_bits < 0)
++        return AVERROR(EINVAL);
++    priv->jpeg_tolerance_bits = priv->jpeg_target_bits * 0.05;
++    return 0;
++}
++
++static int v4l2_mjpeg_rc_quality(const V4L2m2mPriv *priv, int64_t bits)
++{
++    int quality = priv->jpeg_rc_quality;
++
++    if (!bits)
++        return quality;
++    if (priv->jpeg_min_bits == priv->jpeg_target_bits &&
++        priv->jpeg_max_bits == priv->jpeg_target_bits) {
++        int step = quality > 85 ? 1 : 2;
++        int64_t delta = priv->jpeg_target_bits - bits;
++
++        if (delta > priv->jpeg_tolerance_bits)
++            quality += step;
++        else if (delta < -priv->jpeg_tolerance_bits)
++            quality -= step;
++    } else if (bits > priv->jpeg_max_bits) {
++        quality -= 2;
++    } else if (bits < priv->jpeg_min_bits) {
++        quality += 2;
++    }
++    return av_clip(quality, 10, 100);
++}
++
++static int v4l2_prepare_mjpeg_encoder(V4L2m2mContext *s)
++{
++    AVCodecContext *avctx = s->avctx;
++    V4L2m2mPriv *priv = avctx->priv_data;
++    int ret;
++
++    if (avctx->max_b_frames) {
++        av_log(avctx, AV_LOG_ERROR, "MJPEG does not support B-frames\n");
++        return AVERROR(EINVAL);
++    }
++    if (avctx->flags & AV_CODEC_FLAG_QSCALE) {
++        av_log(avctx, AV_LOG_ERROR, "Use -quality (1-100) for JPEG quality\n");
++        return AVERROR(EINVAL);
++    }
++
++    ret = v4l2_mjpeg_rc_init(avctx);
++    if (ret < 0) {
++        av_log(avctx, AV_LOG_ERROR, "Invalid MJPEG bitrate or frame rate\n");
++        return ret;
++    }
++    return v4l2_set_ext_ctrl(s, V4L2_CID_JPEG_COMPRESSION_QUALITY,
++                             priv->jpeg_quality, "JPEG quality", 1);
++}
++
+ static int v4l2_prepare_encoder(V4L2m2mContext *s)
+ {
+     AVCodecContext *avctx = s->avctx;
+@@ -182,15 +266,15 @@
+      */
+     v4l2_subscribe_eos_event(s);
+ 
++    if (avctx->framerate.num || avctx->framerate.den)
++        v4l2_set_timeperframe(s, avctx->framerate.den, avctx->framerate.num);
++
++    if (avctx->codec_id == AV_CODEC_ID_MJPEG)
++        return v4l2_prepare_mjpeg_encoder(s);
++
+     ret = v4l2_check_b_frame_support(s);
+     if (ret)
+         return ret;
+-
+-    /**
+-     * settings
+-     */
+-    if (avctx->framerate.num || avctx->framerate.den)
+-        v4l2_set_timeperframe(s, avctx->framerate.den, avctx->framerate.num);
+ 
+     /* set ext ctrls */
+     v4l2_set_ext_ctrl(s, MPEG_CID(HEADER_MODE), MPEG_VIDEO(HEADER_MODE_SEPARATE), "header mode", 0);
+@@ -273,26 +357,41 @@
+ 
+ static int v4l2_send_frame(AVCodecContext *avctx, const AVFrame *frame)
+ {
+-    V4L2m2mContext *s = ((V4L2m2mPriv*)avctx->priv_data)->context;
++    V4L2m2mPriv *priv = avctx->priv_data;
++    V4L2m2mContext *s = priv->context;
+     V4L2Context *const output = &s->output;
++    int ret;
++
++    if (frame && avctx->codec_id == AV_CODEC_ID_MJPEG && priv->jpeg_target_bits) {
++        ret = v4l2_set_ext_ctrl(s, V4L2_CID_JPEG_COMPRESSION_QUALITY,
++                                 priv->jpeg_rc_quality, "JPEG quality", 1);
++        if (ret < 0)
++            return ret;
++    }
+ 
+ #ifdef V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME
+-    if (frame && frame->pict_type == AV_PICTURE_TYPE_I)
++    if (avctx->codec_id != AV_CODEC_ID_MJPEG &&
++        frame && frame->pict_type == AV_PICTURE_TYPE_I)
+         v4l2_set_ext_ctrl(s, MPEG_CID(FORCE_KEY_FRAME), 0, "force key frame", 1);
+ #endif
+ 
+-    return ff_v4l2_context_enqueue_frame(output, frame);
++    ret = ff_v4l2_context_enqueue_frame(output, frame);
++    if (ret == 0 && frame && avctx->codec_id == AV_CODEC_ID_MJPEG && priv->jpeg_target_bits)
++        priv->jpeg_pending = 1;
++    return ret;
+ }
+ 
+ static int v4l2_receive_packet(AVCodecContext *avctx, AVPacket *avpkt)
+ {
+-    V4L2m2mContext *s = ((V4L2m2mPriv*)avctx->priv_data)->context;
++    V4L2m2mPriv *priv = avctx->priv_data;
++    V4L2m2mContext *s = priv->context;
+     V4L2Context *const capture = &s->capture;
+     V4L2Context *const output = &s->output;
+     AVFrame *frame = s->frame;
+     int ret;
+ 
+-    if (s->draining)
++    if (s->draining ||
++        (avctx->codec_id == AV_CODEC_ID_MJPEG && priv->jpeg_pending))
+         goto dequeue;
+ 
+     if (!frame->buf[0]) {
+@@ -328,7 +427,14 @@
+     }
+ 
+ dequeue:
+-    return ff_v4l2_context_dequeue_packet(capture, avpkt);
++    ret = ff_v4l2_context_dequeue_packet(capture, avpkt);
++    if (ret >= 0 && avctx->codec_id == AV_CODEC_ID_MJPEG) {
++        avpkt->flags |= AV_PKT_FLAG_KEY;
++        priv->jpeg_pending = 0;
++        if (priv->jpeg_target_bits && !(avpkt->flags & AV_PKT_FLAG_CORRUPT))
++            priv->jpeg_rc_quality = v4l2_mjpeg_rc_quality(priv, (int64_t)avpkt->size * 8);
++    }
++    return ret;
+ }
+ 
+ static av_cold int v4l2_encode_init(AVCodecContext *avctx)
+@@ -340,6 +446,19 @@
+     uint32_t v4l2_fmt_output;
+     int ret;
+ 
++    if (avctx->codec_id == AV_CODEC_ID_MJPEG) {
++        if (avctx->color_range == AVCOL_RANGE_UNSPECIFIED)
++            avctx->color_range = AVCOL_RANGE_JPEG;
++        if (avctx->colorspace == AVCOL_SPC_UNSPECIFIED)
++            avctx->colorspace = AVCOL_SPC_BT470BG;
++        if (avctx->color_range != AVCOL_RANGE_JPEG ||
++            (avctx->colorspace != AVCOL_SPC_BT470BG &&
++             avctx->colorspace != AVCOL_SPC_SMPTE170M)) {
++            av_log(avctx, AV_LOG_ERROR, "MJPEG requires full-range BT.601 input\n");
++            return AVERROR(EINVAL);
++        }
++    }
++
+     ret = ff_v4l2_m2m_create_context(priv, &s);
+     if (ret < 0)
+         return ret;
+@@ -371,10 +490,24 @@
+     else
+         v4l2_fmt_output = output->format.fmt.pix.pixelformat;
+ 
++    if ((V4L2_TYPE_IS_MULTIPLANAR(output->type) ?
++         output->format.fmt.pix_mp.width != avctx->width ||
++         output->format.fmt.pix_mp.height != avctx->height :
++         output->format.fmt.pix.width != avctx->width ||
++         output->format.fmt.pix.height != avctx->height) ||
++        (V4L2_TYPE_IS_MULTIPLANAR(capture->type) ?
++         capture->format.fmt.pix_mp.width != avctx->width ||
++         capture->format.fmt.pix_mp.height != avctx->height :
++         capture->format.fmt.pix.width != avctx->width ||
++         capture->format.fmt.pix.height != avctx->height)) {
++        av_log(avctx, AV_LOG_ERROR, "Encoder changed frame dimensions; use supported dimensions\n");
++        return AVERROR(EINVAL);
++    }
++
+     pix_fmt_output = ff_v4l2_format_v4l2_to_avfmt(v4l2_fmt_output, AV_CODEC_ID_RAWVIDEO);
+     if (pix_fmt_output != avctx->pix_fmt) {
+         const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(pix_fmt_output);
+-        av_log(avctx, AV_LOG_ERROR, "Encoder requires %s pixel format.\n", desc->name);
++        av_log(avctx, AV_LOG_ERROR, "Encoder requires %s pixel format.\n", desc ? desc->name : "unknown");
+         return AVERROR(EINVAL);
+     }
+ 
+@@ -400,10 +533,44 @@
+     { NULL },
+ };
+ 
++static const AVOption mjpeg_options[] = {
++    { "num_output_buffers", "Number of buffers in the output context",
++      OFFSET(num_output_buffers), AV_OPT_TYPE_INT, { .i64 = 2 }, 1, INT_MAX, FLAGS },
++    { "num_capture_buffers", "Number of buffers in the capture context",
++      OFFSET(num_capture_buffers), AV_OPT_TYPE_INT, { .i64 = 2 }, 1, INT_MAX, FLAGS },
++    { "quality", "JPEG quality", OFFSET(jpeg_quality), AV_OPT_TYPE_INT,
++      { .i64 = 95 }, 1, 100, FLAGS },
++    { NULL },
++};
++
+ static const AVOption options[] = {
+     V4L_M2M_CAPTURE_OPTS,
+     { NULL },
+ };
++
++static const FFCodecDefault v4l2_mjpeg_defaults[] = {
++    { "b", "0" },
++    { "qmin", "-1" },
++    { "qmax", "-1" },
++    { NULL },
++};
++
++static int v4l2_mjpeg_get_supported_config(const AVCodecContext *avctx, const AVCodec *codec,
++                                           enum AVCodecConfig config, unsigned flags,
++                                           const void **out_configs, int *out_num_configs)
++{
++    static const enum AVColorSpace spaces[] = {
++        AVCOL_SPC_BT470BG, AVCOL_SPC_SMPTE170M, AVCOL_SPC_UNSPECIFIED,
++    };
++
++    if (config == AV_CODEC_CONFIG_COLOR_SPACE) {
++        *out_configs = spaces;
++        *out_num_configs = 2;
++        return 0;
++    }
++    return ff_default_get_supported_config(avctx, codec, config, flags,
++                                           out_configs, out_num_configs);
++}
+ 
+ static const FFCodecDefault v4l2_m2m_defaults[] = {
+     { "qmin", "-1" },
+@@ -419,7 +586,7 @@
+         .version    = LIBAVUTIL_VERSION_INT, \
+     };
+ 
+-#define M2MENC(NAME, LONGNAME, OPTIONS_NAME, CODEC) \
++#define M2MENC(NAME, LONGNAME, OPTIONS_NAME, CODEC, RANGE) \
+     M2MENC_CLASS(NAME, OPTIONS_NAME) \
+     const FFCodec ff_ ## NAME ## _v4l2m2m_encoder = { \
+         .p.name         = #NAME "_v4l2m2m" , \
+@@ -431,16 +598,18 @@
+         .init           = v4l2_encode_init, \
+         FF_CODEC_RECEIVE_PACKET_CB(v4l2_receive_packet), \
+         .close          = v4l2_encode_close, \
+-        .defaults       = v4l2_m2m_defaults, \
++        .defaults       = CODEC == AV_CODEC_ID_MJPEG ? v4l2_mjpeg_defaults : v4l2_m2m_defaults, \
++        .get_supported_config = CODEC == AV_CODEC_ID_MJPEG ? v4l2_mjpeg_get_supported_config : NULL, \
+         .p.capabilities = AV_CODEC_CAP_HARDWARE | AV_CODEC_CAP_DELAY, \
+-        .color_ranges   = AVCOL_RANGE_MPEG, \
++        .color_ranges   = RANGE, \
+         .caps_internal  = FF_CODEC_CAP_NOT_INIT_THREADSAFE | \
+                           FF_CODEC_CAP_INIT_CLEANUP, \
+         .p.wrapper_name = "v4l2m2m", \
+     }
+ 
+-M2MENC(mpeg4,"MPEG4", mpeg4_options, AV_CODEC_ID_MPEG4);
+-M2MENC(h263, "H.263", options,       AV_CODEC_ID_H263);
+-M2MENC(h264, "H.264", options,       AV_CODEC_ID_H264);
+-M2MENC(hevc, "HEVC",  options,       AV_CODEC_ID_HEVC);
+-M2MENC(vp8,  "VP8",   options,       AV_CODEC_ID_VP8);
++M2MENC(mpeg4,"MPEG4", mpeg4_options, AV_CODEC_ID_MPEG4, AVCOL_RANGE_MPEG);
++M2MENC(h263, "H.263", options,       AV_CODEC_ID_H263, AVCOL_RANGE_MPEG);
++M2MENC(h264, "H.264", options,       AV_CODEC_ID_H264, AVCOL_RANGE_MPEG);
++M2MENC(hevc, "HEVC",  options,       AV_CODEC_ID_HEVC, AVCOL_RANGE_MPEG);
++M2MENC(vp8,  "VP8",   options,       AV_CODEC_ID_VP8, AVCOL_RANGE_MPEG);
++M2MENC(mjpeg,"MJPEG", mjpeg_options, AV_CODEC_ID_MJPEG, AVCOL_RANGE_JPEG);
