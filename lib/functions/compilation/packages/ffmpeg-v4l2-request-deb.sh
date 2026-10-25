@@ -24,7 +24,7 @@ function compile_ffmpeg-v4l2-request() {
 		--output="${tmp_dir}/source.tar" "${FFMPEG_V4L2_REQUEST_COMMIT}"
 	run_host_command_logged_raw tar -xf "${tmp_dir}/source.tar" -C "${rootfs}/build/src"
 	declare codec_patch
-	for codec_patch in ffmpeg-v4l2-request.patch ffmpeg-mjpeg-v4l2m2m.patch ffmpeg-jpeg-v4l2-decode.patch; do
+	for codec_patch in ffmpeg-v4l2-request.patch ffmpeg-mjpeg-v4l2m2m.patch ffmpeg-cavs-v4l2-request.patch ffmpeg-cavs-legacy-v4l2-request.patch ffmpeg-jpeg-v4l2-decode.patch; do
 		run_host_command_logged_raw env GIT_CEILING_DIRECTORIES="${rootfs}/build" \
 			git -C "${rootfs}/build/src" apply "${SRC}/patch/misc/${codec_patch}"
 	done

@@ -1,0 +1,89 @@
+Subject: [PATCH] Local: media: cedrus: add optional CAVS input probe
+
+Report VE versions and two hardware input reads before the first request.
+Reset the decoder after probing. Keep probing disabled by default.
+---
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_cavs.c b/drivers/staging/media/sunxi/cedrus/cedrus_cavs.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_cavs.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_cavs.c
+@@ -1,5 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0
+ #include <linux/dma-mapping.h>
++#include <linux/iopoll.h>
++#include <linux/moduleparam.h>
+ #include <linux/reset.h>
+ #include <linux/string.h>
+ #include <media/cavs-ctrls.h>
+@@ -13,6 +15,10 @@
+ #define CAVS_REG(n) (VE_ENGINE_DEC_H264 + (n))
+ #define CAVS_MB_INFO_SIZE 0xc000
+ #define CAVS_IRQ_MASK 7
++
++static bool cavs_vld_probe;
++module_param(cavs_vld_probe, bool, 0644);
++MODULE_PARM_DESC(cavs_vld_probe, "Probe CAVS input reads before the first request");
+ 
+ int cedrus_cavs_validate(const struct v4l2_ctrl_cavs_frame *f)
+ {
+@@ -193,6 +199,52 @@
+ 			 f->reference_distance[i]);
+ }
+ 
++static void cedrus_cavs_probe_input(struct cedrus_ctx *ctx, struct vb2_buffer *src,
++				   const struct v4l2_ctrl_cavs_frame *f)
++{
++	struct cedrus_dev *dev = ctx->dev;
++	dma_addr_t source = vb2_dma_contig_plane_dma_addr(src, 0);
++	u32 status, word;
++	unsigned int i;
++	int ret;
++
++	ret = reset_control_reset(dev->rstc);
++	if (ret)
++		goto failed;
++	ret = cedrus_engine_enable(ctx);
++	if (ret)
++		goto failed;
++
++	dev_dbg(dev->dev,
++		 "CAVS probe: dec_ip=%08x enc_ip=%08x version=%08x mode=%08x\n",
++		 cedrus_read(dev, 0xe0), cedrus_read(dev, 0xe4),
++		 cedrus_read(dev, 0xf0), cedrus_read(dev, VE_MODE));
++	cedrus_write(dev, CAVS_REG(0x20), 0x10000000);
++	cedrus_write(dev, CAVS_REG(0x34), f->bitstream_offset * 8);
++	cedrus_write(dev, CAVS_REG(0x38), f->bitstream_size * 8);
++	cedrus_write(dev, CAVS_REG(0x3c), source + vb2_plane_size(src, 0) - 1);
++	/* Publish the input address after its bounds. */
++	cedrus_write(dev, CAVS_REG(0x30),
++		     (source & 0xffffff0) | (source >> 28) | 0x70000000);
++	cedrus_write(dev, CAVS_REG(0x24), 0x17);
++	for (i = 0; i < 2 && (i + 1) * 4 <= f->bitstream_size; i++) {
++		cedrus_write(dev, CAVS_REG(0x24), (32 << 8) | 2);
++		ret = readl_poll_timeout_atomic(dev->base + CAVS_REG(0x28), status,
++					       !(status & BIT(8)) || (status & BIT(2)),
++					       1, 5000);
++		word = cedrus_read(dev, CAVS_REG(0xdc));
++		dev_dbg(dev->dev,
++			 "CAVS probe: word[%u]=%08x status=%08x offset=%u ret=%d\n",
++			 i, word, status, cedrus_read(dev, CAVS_REG(0x34)), ret);
++		if (ret || (status & BIT(2)))
++			break;
++	}
++	return;
++
++failed:
++	dev_dbg(dev->dev, "CAVS probe: initialization fails: %d\n", ret);
++}
++
+ static int cedrus_cavs_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ {
+ 	const struct v4l2_ctrl_cavs_frame *f = run->cavs.frame;
+@@ -258,6 +310,8 @@
+ 				 "CAVS payload: CPU mapping unavailable\n");
+ 		}
+ 	}
++	if (trace && cavs_vld_probe)
++		cedrus_cavs_probe_input(ctx, src, f);
+ 	ret = reset_control_reset(dev->rstc);
+ 	if (ret) {
+ 		if (trace)
