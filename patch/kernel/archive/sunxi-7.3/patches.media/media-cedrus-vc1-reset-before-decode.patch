@@ -1,0 +1,45 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: media: cedrus: reset Simple and Main VC-1 pictures
+
+Match the vendor reset sequence for Simple and Main pictures.
+Restore output configuration after reset and propagate reset failures.
+Test whether stale engine state causes skipped-block corruption.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c b/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include <linux/delay.h>
++#include <linux/reset.h>
+ #include <linux/types.h>
+ 
+ #include <media/videobuf2-dma-contig.h>
+@@ -241,7 +242,7 @@
+ 	u32 reg, condover, pq, skip;
+ 	struct vb2_queue *vq;
+ 	size_t buf_size;
+-	int brfd, flag;
++	int brfd, flag, ret;
+ 
+ 	unsigned int raw_coding = ~(bitplanes ? bitplanes->bitplane_flags : 0);
+ 
+@@ -250,6 +251,15 @@
+ 	picture = &slice->picture_layer;
+ 	vopdquant = &slice->vopdquant;
+ 	metadata = &slice->metadata;
++
++	if (sequence->profile == VC1_PROFILE_SIMPLE ||
++	    sequence->profile == VC1_PROFILE_MAIN) {
++		ret = reset_control_reset(dev->rstc);
++		if (ret)
++			return ret;
++
++		cedrus_dst_format_set(dev, &ctx->dst_fmt);
++	}
+ 
+ 	second_field = !!(picture->flags & V4L2_VC1_PICTURE_LAYER_FLAG_SECOND_FIELD);
+ 	top_field_first = !!(picture->flags & V4L2_VC1_PICTURE_LAYER_FLAG_TFF);

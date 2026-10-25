@@ -1,0 +1,47 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: media: cedrus: allow experimental VC-1 Complex decoding
+
+Allow profile 2 for experimental decoding.
+Use Main-like reset and range handling for Complex pictures.
+Preserve profile 2 in the hardware register.
+Vendor software rejects Complex; hardware support remains unverified.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.c b/drivers/staging/media/sunxi/cedrus/cedrus.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.c
+@@ -109,10 +109,6 @@
+ 	} else if (ctrl->id == V4L2_CID_STATELESS_VC1_SLICE_PARAMS) {
+ 		const struct v4l2_ctrl_vc1_slice_params *slice = ctrl->p_new.p;
+ 
+-		if (slice->sequence.profile == V4L2_VC1_PROFILE_COMPLEX)
+-			/* Complex profile is not supported by the hardware */
+-			return -EINVAL;
+-
+ 		if (slice->picture_layer.respic)
+ 			/* Reduced-resolution (multi-res) coding is not supported */
+ 			return -EINVAL;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c b/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c
+@@ -251,7 +251,8 @@
+ 	metadata = &slice->metadata;
+ 
+ 	if (sequence->profile == VC1_PROFILE_SIMPLE ||
+-	    sequence->profile == VC1_PROFILE_MAIN) {
++	    sequence->profile == VC1_PROFILE_MAIN ||
++	    sequence->profile == VC1_PROFILE_COMPLEX) {
+ 		ret = reset_control_reset(dev->rstc);
+ 		if (ret)
+ 			return ret;
+@@ -271,7 +272,8 @@
+ 	 * RANGEREDFRM bit, so only reuse it for the exact match (assumes
+ 	 * symmetric luma/chroma mapping, as in practice).
+ 	 */
+-	if (sequence->profile == VC1_PROFILE_MAIN)
++	if (sequence->profile == VC1_PROFILE_MAIN ||
++	    sequence->profile == VC1_PROFILE_COMPLEX)
+ 		rangeredfrm = picture->flags & V4L2_VC1_PICTURE_LAYER_FLAG_RANGEREDFRM;
+ 	else
+ 		rangeredfrm = (entrypoint->flags & V4L2_VC1_ENTRYPOINT_HEADER_FLAG_RANGE_MAPY) &&

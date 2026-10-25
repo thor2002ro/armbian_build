@@ -4117,10 +4117,10 @@ index 0000000..5d89b71
 +};
 diff --git a/libavcodec/v4l2_request_vc1.c b/libavcodec/v4l2_request_vc1.c
 new file mode 100644
-index 0000000..33aee8e
+index 0000000..df8db4d
 --- /dev/null
 +++ b/libavcodec/v4l2_request_vc1.c
-@@ -0,0 +1,639 @@
+@@ -0,0 +1,677 @@
 +/*
 + * This file is part of FFmpeg.
 + *
@@ -4362,11 +4362,20 @@ index 0000000..33aee8e
 +           (v->s.pict_type == AV_PICTURE_TYPE_B && !v->bi_type);
 +}
 +
-+static inline void vc1_pack_bitplanes(uint8_t *bitplane, const uint8_t *source, const MpegEncContext *s)
++static inline int vc1_bitplanes_fit(unsigned int mb_width, unsigned int mb_height)
++{
++    return mb_width && mb_height &&
++           mb_width <= V4L2_VC1_BITPLANE_SIZE * 8 / mb_height;
++}
++
++static inline int vc1_pack_bitplanes(uint8_t *bitplane, const uint8_t *source, const MpegEncContext *s)
 +{
 +    int x, y, n, ff_bp_index;
 +
-+    memset(bitplane, 0, 2048);
++    if (!vc1_bitplanes_fit(s->mb_width, s->mb_height))
++        return AVERROR(ENOSYS);
++
++    memset(bitplane, 0, V4L2_VC1_BITPLANE_SIZE);
 +
 +    n = 0;
 +    for (y = 0; y < s->mb_height; y++)
@@ -4374,6 +4383,7 @@ index 0000000..33aee8e
 +            ff_bp_index = y * s->mb_stride + x;
 +            bitplane[n / 8] |= source[ff_bp_index] << (n % 8);
 +        }
++    return 0;
 +}
 +
 +static int v4l2_request_vc1_start_frame(AVCodecContext *avctx,
@@ -4390,6 +4400,10 @@ index 0000000..33aee8e
 +    struct v4l2_vc1_vopdquant *vopdquant;
 +    struct v4l2_vc1_sequence *sequence;
 +    struct v4l2_vc1_metadata *metadata;
++
++    if (!vc1_bitplanes_fit(s->mb_width, s->mb_height) ||
++        (v->profile == PROFILE_ADVANCED && (v->range_mapy_flag || v->range_mapuv_flag)))
++        return AVERROR(ENOSYS);
 +
 +    /*
 +     * A skipped picture (PTYPE == SKIPPED) carries no coded macroblocks;
@@ -4611,31 +4625,45 @@ index 0000000..33aee8e
 +    controls->bitplanes.bitplane_flags = 0;
 +    if (vc1_has_MVTYPEMB_bitplane(v)) {
 +        controls->bitplanes.bitplane_flags |= V4L2_VC1_BITPLANE_FLAG_MVTYPEMB;
-+        vc1_pack_bitplanes(controls->bitplanes.mvtypemb, v->mv_type_mb_plane, s);
++        ret = vc1_pack_bitplanes(controls->bitplanes.mvtypemb, v->mv_type_mb_plane, s);
++        if (ret < 0)
++            return ret;
 +    }
 +    if (vc1_has_DIRECTMB_bitplane(v)) {
 +        controls->bitplanes.bitplane_flags |= V4L2_VC1_BITPLANE_FLAG_DIRECTMB;
-+        vc1_pack_bitplanes(controls->bitplanes.directmb, v->direct_mb_plane, s);
++        ret = vc1_pack_bitplanes(controls->bitplanes.directmb, v->direct_mb_plane, s);
++        if (ret < 0)
++            return ret;
 +    }
 +    if (vc1_has_SKIPMB_bitplane(v)) {
 +        controls->bitplanes.bitplane_flags |= V4L2_VC1_BITPLANE_FLAG_SKIPMB;
-+        vc1_pack_bitplanes(controls->bitplanes.skipmb, s->mbskip_table, s);
++        ret = vc1_pack_bitplanes(controls->bitplanes.skipmb, s->mbskip_table, s);
++        if (ret < 0)
++            return ret;
 +    }
 +    if (vc1_has_FIELDTX_bitplane(v)) {
 +        controls->bitplanes.bitplane_flags |= V4L2_VC1_BITPLANE_FLAG_FIELDTX;
-+        vc1_pack_bitplanes(controls->bitplanes.fieldtx, v->fieldtx_plane, s);
++        ret = vc1_pack_bitplanes(controls->bitplanes.fieldtx, v->fieldtx_plane, s);
++        if (ret < 0)
++            return ret;
 +    }
 +    if (vc1_has_FORWARDMB_bitplane(v)) {
 +        controls->bitplanes.bitplane_flags |= V4L2_VC1_BITPLANE_FLAG_FORWARDMB;
-+        vc1_pack_bitplanes(controls->bitplanes.forwardmb, v->forward_mb_plane, s);
++        ret = vc1_pack_bitplanes(controls->bitplanes.forwardmb, v->forward_mb_plane, s);
++        if (ret < 0)
++            return ret;
 +    }
 +    if (vc1_has_ACPRED_bitplane(v)) {
 +        controls->bitplanes.bitplane_flags |= V4L2_VC1_BITPLANE_FLAG_ACPRED;
-+        vc1_pack_bitplanes(controls->bitplanes.acpred, v->acpred_plane, s);
++        ret = vc1_pack_bitplanes(controls->bitplanes.acpred, v->acpred_plane, s);
++        if (ret < 0)
++            return ret;
 +    }
 +    if (vc1_has_OVERFLAGS_bitplane(v)) {
 +        controls->bitplanes.bitplane_flags |= V4L2_VC1_BITPLANE_FLAG_OVERFLAGS;
-+        vc1_pack_bitplanes(controls->bitplanes.overflags, v->over_flags_plane, s);
++        ret = vc1_pack_bitplanes(controls->bitplanes.overflags, v->over_flags_plane, s);
++        if (ret < 0)
++            return ret;
 +    }
 +
 +
@@ -4693,6 +4721,7 @@ index 0000000..33aee8e
 +static int v4l2_request_vc1_init(AVCodecContext *avctx)
 +{
 +    const VC1Context *v = avctx->priv_data;
++    unsigned int mb_width, mb_height;
 +    struct v4l2_ctrl_vc1_slice_params slice_params = {
 +        .sequence = {
 +            .profile = v->profile,
@@ -4708,12 +4737,21 @@ index 0000000..33aee8e
 +        },
 +    };
 +
++    if (avctx->coded_width <= 0 || avctx->coded_height <= 0)
++        return AVERROR(ENOSYS);
++    mb_width = AV_CEIL_RSHIFT(avctx->coded_width, 4);
++    mb_height = AV_CEIL_RSHIFT(avctx->coded_height, 4);
++    if (!vc1_bitplanes_fit(mb_width, mb_height))
++        return AVERROR(ENOSYS);
++    if (v->profile == PROFILE_ADVANCED && (v->range_mapy_flag || v->range_mapuv_flag))
++        return AVERROR(ENOSYS);
++
 +    /*
 +     * Probe the device with the sequence header of the stream that is
 +     * about to be decoded. A driver that cannot handle this profile
 +     * rejects the control here, so the hwaccel fails to initialize and
 +     * decoding falls back to software instead of failing per frame once
-+     * the first request is queued. Cedrus rejects the Main profile.
++     * the first request is queued.
 +     */
 +    return ff_v4l2_request_init(avctx, control, FF_ARRAY_ELEMS(control), NULL);
 +}
@@ -5546,10 +5584,10 @@ index 0000000..e93937d
 +};
 diff --git a/libavcodec/vc1-ctrls.h b/libavcodec/vc1-ctrls.h
 new file mode 100644
-index 0000000..698dbbf
+index 0000000..ac652f1
 --- /dev/null
 +++ b/libavcodec/vc1-ctrls.h
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,171 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * These are the VC1 state controls for use with stateless VC1 codec drivers.
@@ -5706,16 +5744,18 @@ index 0000000..698dbbf
 +#define V4L2_VC1_BITPLANE_FLAG_ACPRED		0x20
 +#define V4L2_VC1_BITPLANE_FLAG_OVERFLAGS	0x40
 +
++#define V4L2_VC1_BITPLANE_SIZE			2048U
++
 +struct v4l2_ctrl_vc1_bitplanes {
 +	__u8	bitplane_flags;
 +
-+	__u8	mvtypemb[2048];
-+	__u8	directmb[2048];
-+	__u8	skipmb[2048];
-+	__u8	fieldtx[2048];
-+	__u8	forwardmb[2048];
-+	__u8	acpred[2048];
-+	__u8	overflags[2048];
++	__u8	mvtypemb[V4L2_VC1_BITPLANE_SIZE];
++	__u8	directmb[V4L2_VC1_BITPLANE_SIZE];
++	__u8	skipmb[V4L2_VC1_BITPLANE_SIZE];
++	__u8	fieldtx[V4L2_VC1_BITPLANE_SIZE];
++	__u8	forwardmb[V4L2_VC1_BITPLANE_SIZE];
++	__u8	acpred[V4L2_VC1_BITPLANE_SIZE];
++	__u8	overflags[V4L2_VC1_BITPLANE_SIZE];
 +};
 +
 +#endif

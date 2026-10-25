@@ -1,0 +1,317 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: media: cedrus: fix VC-1 buffers and request bounds
+
+Prevent oversized bitplanes and invalid bitstream access.
+Add external line buffers for wide frames.
+Reject unsupported range mapping.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.c b/drivers/staging/media/sunxi/cedrus/cedrus.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.c
+@@ -109,13 +109,7 @@
+ 	} else if (ctrl->id == V4L2_CID_STATELESS_VC1_SLICE_PARAMS) {
+ 		const struct v4l2_ctrl_vc1_slice_params *slice = ctrl->p_new.p;
+ 
+-		if (slice->picture_layer.respic)
+-			/* Reduced-resolution (multi-res) coding is not supported */
+-			return -EINVAL;
+-
+-		if (slice->picture_layer.pqindex > 31)
+-			/* PQINDEX is a 5-bit field; guards the pquant tables */
+-			return -EINVAL;
++		return cedrus_vc1_validate(slice);
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.h b/drivers/staging/media/sunxi/cedrus/cedrus.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -191,6 +191,9 @@
+ 		} vp8;
+ 		struct cedrus_vp9_ctx	*vp9;
+ 		struct {
++			void		*line_buf;
++			dma_addr_t	line_buf_addr;
++			size_t		line_buf_size;
+ 			void		*aux_buf;
+ 			dma_addr_t	aux_buf_addr;
+ 			void		*mv_buf;
+@@ -275,6 +278,7 @@
+ extern struct cedrus_dec_ops cedrus_dec_ops_vp8;
+ extern struct cedrus_dec_ops cedrus_dec_ops_vp9;
+ extern struct cedrus_dec_ops cedrus_dec_ops_vc1;
++int cedrus_vc1_validate(const struct v4l2_ctrl_vc1_slice_params *slice);
+ extern struct cedrus_dec_ops cedrus_dec_ops_jpeg;
+ 
+ static inline void cedrus_write(struct cedrus_dev *dev, u32 reg, u32 val)
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c b/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include <linux/delay.h>
++#include <linux/jiffies.h>
+ #include <linux/reset.h>
+ #include <linux/types.h>
+ 
+@@ -117,30 +118,37 @@
+ }
+ 
+ 
++int cedrus_vc1_validate(const struct v4l2_ctrl_vc1_slice_params *slice)
++{
++	const struct v4l2_vc1_entrypoint_header *entry = &slice->entrypoint_header;
++	unsigned int mb_width = DIV_ROUND_UP(entry->coded_width, 16);
++	unsigned int mb_height = DIV_ROUND_UP(entry->coded_height, 16);
++
++	if (slice->sequence.profile > VC1_PROFILE_ADVANCED ||
++	    slice->picture_layer.respic || slice->picture_layer.pqindex > 31)
++		return -EINVAL;
++
++	/* Zero dimensions permit control probing before format negotiation. */
++	if (!!mb_width != !!mb_height ||
++	    mb_width * mb_height > V4L2_VC1_BITPLANE_SIZE * 8)
++		return -EINVAL;
++
++	if (slice->sequence.profile == VC1_PROFILE_ADVANCED &&
++	    (entry->flags & (V4L2_VC1_ENTRYPOINT_HEADER_FLAG_RANGE_MAPY |
++			     V4L2_VC1_ENTRYPOINT_HEADER_FLAG_RANGE_MAPUV)))
++		return -EINVAL;
++
++	if (slice->bit_size && slice->data_bit_offset > slice->bit_size)
++		return -EINVAL;
++
++	return 0;
++}
++
+ static void cedrus_vc1_bitplanes_setup(struct cedrus_ctx *ctx,
+ 				       struct cedrus_run *run)
+ {
+-	const struct v4l2_vc1_entrypoint_header *entrypoint;
+-	const struct v4l2_ctrl_vc1_bitplanes *bitplanes;
+-	unsigned int mb_num, plane_size;
+-
+-	entrypoint = &run->vc1.slice_params->entrypoint_header;
+-	bitplanes = run->vc1.bitplanes;
+-
+-	/*
+-	 * FIXME: Not sure if max coded size or current code
+-	 * size is correct.
+-	 */
+-	mb_num = DIV_ROUND_UP(entrypoint->coded_width, 16) *
+-		 DIV_ROUND_UP(entrypoint->coded_height, 16);
+-	plane_size = DIV_ROUND_UP(mb_num, 8);
+-
+-	/*if (plane_size > 1024) {
+-		printk("VC-1: Warning, bitplane size too big!\n");
+-		plane_size = 1024;
+-	}*/
+-
+-	plane_size = 1024;
++	const struct v4l2_ctrl_vc1_bitplanes *bitplanes = run->vc1.bitplanes;
++	unsigned int plane_size = V4L2_VC1_BITPLANE_SIZE / 2;
+ 
+ 	if (bitplanes->bitplane_flags & V4L2_VC1_BITPLANE_FLAG_MVTYPEMB) {
+ 		memcpy(ctx->codec.vc1.bitplanes_buf + VC1_BITPLANE_OFFSET_MVTYPEMB,
+@@ -239,7 +247,9 @@
+ 	dma_addr_t src_buf_addr;
+ 	u32 reg, condover, pq, skip;
+ 	struct vb2_queue *vq;
+-	size_t buf_size;
++	unsigned long deadline;
++	size_t buf_size, payload;
++	u32 bit_size;
+ 	int brfd, flag, ret;
+ 
+ 	unsigned int raw_coding = ~(bitplanes ? bitplanes->bitplane_flags : 0);
+@@ -249,6 +259,23 @@
+ 	picture = &slice->picture_layer;
+ 	vopdquant = &slice->vopdquant;
+ 	metadata = &slice->metadata;
++
++	ret = cedrus_vc1_validate(slice);
++	if (ret)
++		return ret;
++	if (DIV_ROUND_UP(ctx->src_fmt.width, 16) *
++	    DIV_ROUND_UP(ctx->src_fmt.height, 16) > V4L2_VC1_BITPLANE_SIZE * 8)
++		return -EINVAL;
++	if (ctx->src_fmt.width > 2048 && !ctx->codec.vc1.line_buf)
++		return -EINVAL;
++
++	buf_size = vb2_plane_size(src_buf, 0);
++	payload = vb2_get_plane_payload(src_buf, 0);
++	if (!payload || payload > buf_size || payload > U32_MAX / 8)
++		return -EINVAL;
++	bit_size = slice->bit_size ? slice->bit_size : payload * 8;
++	if (bit_size > payload * 8 || slice->data_bit_offset > bit_size)
++		return -EINVAL;
+ 
+ 	if (sequence->profile == VC1_PROFILE_SIMPLE ||
+ 	    sequence->profile == VC1_PROFILE_MAIN ||
+@@ -264,20 +291,9 @@
+ 	top_field_first = !!(picture->flags & V4L2_VC1_PICTURE_LAYER_FLAG_TFF);
+ 	interlaced = picture->fcm != VC1_FCM_PROGRESSIVE;
+ 	ref_field = !!(picture->flags & V4L2_VC1_PICTURE_LAYER_FLAG_REFFIELD);
+-	/*
+-	 * The hardware RANGEREDFRM bit only applies a fixed factor-of-2 range
+-	 * expansion. The Advanced profile range mapping scales by
+-	 * (RANGE_MAPY + 9) / 8 (SMPTE 421M 6.2.15.1), which equals 2.0 only for
+-	 * RANGE_MAPY == 7. Other values cannot be expressed by the single
+-	 * RANGEREDFRM bit, so only reuse it for the exact match (assumes
+-	 * symmetric luma/chroma mapping, as in practice).
+-	 */
+-	if (sequence->profile == VC1_PROFILE_MAIN ||
+-	    sequence->profile == VC1_PROFILE_COMPLEX)
+-		rangeredfrm = picture->flags & V4L2_VC1_PICTURE_LAYER_FLAG_RANGEREDFRM;
+-	else
+-		rangeredfrm = (entrypoint->flags & V4L2_VC1_ENTRYPOINT_HEADER_FLAG_RANGE_MAPY) &&
+-			      entrypoint->range_mapy == 7;
++	rangeredfrm = (sequence->profile == VC1_PROFILE_MAIN ||
++		       sequence->profile == VC1_PROFILE_COMPLEX) &&
++		      (picture->flags & V4L2_VC1_PICTURE_LAYER_FLAG_RANGEREDFRM);
+ 	pq = cedrus_vc1_get_pq(picture->pqindex, entrypoint->quantizer);
+ 
+ 	if (picture->ptype != VC1_PICTURE_TYPE_P)
+@@ -323,6 +339,15 @@
+ 		bwd_buf = out_buf;
+ 
+ 	cedrus_engine_enable(ctx);
++
++	reg = cedrus_read(dev, VE_BUF_CTRL) & ~GENMASK(3, 0);
++	if (ctx->src_fmt.width > 2048) {
++		reg |= VE_BUF_CTRL_DBLK_MIXED_RAM | VE_BUF_CTRL_INTRAPRED_MIXED_RAM;
++		cedrus_write(dev, VE_DBLK_DRAM_BUF_ADDR, ctx->codec.vc1.line_buf_addr);
++		cedrus_write(dev, VE_INTRAPRED_DRAM_BUF_ADDR,
++			     ctx->codec.vc1.line_buf_addr + ALIGN(ctx->src_fmt.width, 32) * 20);
++	}
++	cedrus_write(dev, VE_BUF_CTRL, reg);
+ 
+ 	/*
+ 	 * Program EPHS first so that start-code / emulation-prevention-byte
+@@ -368,9 +393,7 @@
+ 	 * Keep BITS_END_ADDR at the page-rounded allocation boundary as
+ 	 * a safety net against runaway DMA (watchdog timeout).
+ 	 */
+-	buf_size = vb2_plane_size(src_buf, 0);
+-	cedrus_write(dev, VE_DEC_VC1_BITS_LEN,
+-		     slice->bit_size ? slice->bit_size : buf_size * 8);
++	cedrus_write(dev, VE_DEC_VC1_BITS_LEN, bit_size);
+ 	cedrus_write(dev, VE_DEC_VC1_BITS_OFFSET, 0);
+ 
+ 	src_buf_addr = vb2_dma_contig_plane_dma_addr(src_buf, 0);
+@@ -405,13 +428,18 @@
+ 	 * loop but is far fewer register writes. Wider (e.g. 32-bit) reads
+ 	 * overrun the bit FIFO and desync the VLD.
+ 	 */
++	deadline = jiffies + msecs_to_jiffies(100);
+ 	for (reg = 0; reg < slice->data_bit_offset; reg += skip) {
+ 		skip = min_t(u32, slice->data_bit_offset - reg, 24);
+ 		cedrus_write(dev, VE_DEC_VC1_TRIGGER_TYPE,
+ 			     VE_DEC_VC1_TRIGGER_TYPE_GET_BITS |
+ 			     VE_DEC_VC1_TRIGGER_TYPE_N_BITS(skip));
+ 
+-		cedrus_wait_for(dev, VE_DEC_VC1_STATUS, VE_DEC_VC1_STATUS_BITS_BUSY);
++		ret = cedrus_wait_for(dev, VE_DEC_VC1_STATUS, VE_DEC_VC1_STATUS_BITS_BUSY);
++		if (ret || time_after(jiffies, deadline)) {
++			reset_control_reset(dev->rstc);
++			return ret ? ret : -ETIMEDOUT;
++		}
+ 	}
+ 
+ 	cedrus_write(dev, VE_DEC_VC1_ROT_CTRL, 0);
+@@ -731,6 +759,10 @@
+ static int cedrus_vc1_start(struct cedrus_ctx *ctx)
+ {
+ 	struct cedrus_dev *dev = ctx->dev;
++	unsigned int width = ctx->src_fmt.width;
++
++	ctx->codec.vc1.line_buf = NULL;
++	ctx->codec.vc1.line_buf_size = 0;
+ 
+ 	ctx->codec.vc1.ic_oldval = 0;
+ 	ctx->codec.vc1.ic_intenen = false;
+@@ -746,6 +778,22 @@
+ 	if (!ctx->codec.vc1.aux_buf)
+ 		return -ENOMEM;
+ 
++	if (width > 2048) {
++		ctx->codec.vc1.line_buf_size = ALIGN(width, 32) * 20 +
++			(ALIGN(width, 32) + 2 * DIV_ROUND_UP(width, 16)) * 4;
++		ctx->codec.vc1.line_buf =
++			dma_alloc_attrs(dev->dev, ctx->codec.vc1.line_buf_size,
++					&ctx->codec.vc1.line_buf_addr, GFP_KERNEL,
++					DMA_ATTR_NO_KERNEL_MAPPING);
++		if (!ctx->codec.vc1.line_buf) {
++			dma_free_coherent(dev->dev, VC1_AUX_ALLOC_SIZE,
++					  ctx->codec.vc1.aux_buf,
++					  ctx->codec.vc1.aux_buf_addr);
++			ctx->codec.vc1.aux_buf = NULL;
++			return -ENOMEM;
++		}
++	}
++
+ 	ctx->codec.vc1.bitplanes_buf = ctx->codec.vc1.aux_buf + VC1_AUX_BPLANE_OFF;
+ 	ctx->codec.vc1.bitplanes_buf_addr = ctx->codec.vc1.aux_buf_addr + VC1_AUX_BPLANE_OFF;
+ 	ctx->codec.vc1.acdc_buf = ctx->codec.vc1.aux_buf + VC1_AUX_DCAC_OFF;
+@@ -762,9 +810,16 @@
+ 	struct cedrus_dev *dev = ctx->dev;
+ 
+ 
++	if (ctx->codec.vc1.line_buf) {
++		dma_free_attrs(dev->dev, ctx->codec.vc1.line_buf_size,
++			       ctx->codec.vc1.line_buf, ctx->codec.vc1.line_buf_addr,
++			       DMA_ATTR_NO_KERNEL_MAPPING);
++		ctx->codec.vc1.line_buf = NULL;
++	}
+ 	dma_free_coherent(dev->dev, VC1_AUX_ALLOC_SIZE,
+ 			  ctx->codec.vc1.aux_buf,
+ 			  ctx->codec.vc1.aux_buf_addr);
++	ctx->codec.vc1.aux_buf = NULL;
+ }
+ 
+ static void cedrus_vc1_trigger(struct cedrus_ctx *ctx)
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_video.c b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_video.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+@@ -207,6 +207,9 @@
+ 
+ 	/* Limit to hardware min/max. */
+ 	width = clamp(width, CEDRUS_MIN_WIDTH, max_width);
++	if (source_format == V4L2_PIX_FMT_VC1_SLICE)
++		max_height = min(max_height, V4L2_VC1_BITPLANE_SIZE * 8 /
++				 DIV_ROUND_UP(width, 16) * 16);
+ 	height = clamp(height, CEDRUS_MIN_HEIGHT, max_height);
+ 
+ 	switch (pix_fmt->pixelformat) {
+diff --git a/include/media/vc1-ctrls.h b/include/media/vc1-ctrls.h
+--- a/include/media/vc1-ctrls.h
++++ b/include/media/vc1-ctrls.h
+@@ -155,16 +155,18 @@
+ #define V4L2_VC1_BITPLANE_FLAG_ACPRED		0x20
+ #define V4L2_VC1_BITPLANE_FLAG_OVERFLAGS	0x40
+ 
++#define V4L2_VC1_BITPLANE_SIZE			2048U
++
+ struct v4l2_ctrl_vc1_bitplanes {
+ 	__u8	bitplane_flags;
+ 
+-	__u8	mvtypemb[2048];
+-	__u8	directmb[2048];
+-	__u8	skipmb[2048];
+-	__u8	fieldtx[2048];
+-	__u8	forwardmb[2048];
+-	__u8	acpred[2048];
+-	__u8	overflags[2048];
++	__u8	mvtypemb[V4L2_VC1_BITPLANE_SIZE];
++	__u8	directmb[V4L2_VC1_BITPLANE_SIZE];
++	__u8	skipmb[V4L2_VC1_BITPLANE_SIZE];
++	__u8	fieldtx[V4L2_VC1_BITPLANE_SIZE];
++	__u8	forwardmb[V4L2_VC1_BITPLANE_SIZE];
++	__u8	acpred[V4L2_VC1_BITPLANE_SIZE];
++	__u8	overflags[V4L2_VC1_BITPLANE_SIZE];
+ };
+ 
+ #endif
