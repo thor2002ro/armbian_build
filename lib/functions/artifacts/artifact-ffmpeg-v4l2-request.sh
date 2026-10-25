@@ -20,9 +20,11 @@ function artifact_ffmpeg-v4l2-request_prepare_version() {
 		"${SRC}/packages/ffmpeg-v4l2-request/build.sh" \
 		"${SRC}/patch/misc/ffmpeg-v4l2-request.patch" \
 		"${SRC}/patch/misc/ffmpeg-mjpeg-v4l2m2m.patch" \
+		"${SRC}/patch/misc/ffmpeg-cavs2-v4l2-request.patch" \
 		"${SRC}/patch/misc/ffmpeg-cavs-v4l2-request.patch" \
 		"${SRC}/patch/misc/ffmpeg-cavs-legacy-v4l2-request.patch" \
-		"${SRC}/patch/misc/ffmpeg-jpeg-v4l2-decode.patch"
+		"${SRC}/patch/misc/ffmpeg-jpeg-v4l2-decode.patch" \
+		"${SRC}/patch/misc/ffmpeg-cavs2-fields-v4l2-request.patch"
 	artifact_version="1-S${FFMPEG_V4L2_REQUEST_COMMIT:0:12}-B${hash_files:0:12}"
 	artifact_version_reason="FFmpeg ${FFMPEG_V4L2_REQUEST_COMMIT}; recipe and patches ${hash_files}"
 	artifact_name="ffmpeg-v4l2-request-${RELEASE}-${ARCH}"

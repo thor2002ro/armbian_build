@@ -1,0 +1,737 @@
+Subject: Local: media: cedrus: add experimental CAVS2 request decoding
+
+AVS2 needs syntax and field state that the existing CAVS path cannot carry.
+
+Add the missing request state and reject syntax that the controls cannot represent.
+---
+diff --git a/drivers/staging/media/sunxi/cedrus/Makefile b/drivers/staging/media/sunxi/cedrus/Makefile
+--- a/drivers/staging/media/sunxi/cedrus/Makefile
++++ b/drivers/staging/media/sunxi/cedrus/Makefile
+@@ -5,4 +5,4 @@
+ 		 cedrus_mpeg2.o cedrus_h264.o cedrus_h265.o \
+ 		 cedrus_vp8.o cedrus_vp9.o cedrus_vc1.o cedrus_jpeg.o
+ 
+-sunxi-cedrus-y += cedrus_enc.o cedrus_enc_h264.o cedrus_enc_jpeg.o
++sunxi-cedrus-y += cedrus_enc.o cedrus_enc_h264.o cedrus_enc_jpeg.o cedrus_cavs2.o
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.c b/drivers/staging/media/sunxi/cedrus/cedrus.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.c
+@@ -106,6 +106,22 @@
+ 			ctx->bit_depth = dec->bit_depth;
+ 			cedrus_reset_cap_format(ctx);
+ 		}
++	} else if (ctrl->id == V4L2_CID_STATELESS_CAVS2_FRAME) {
++		const struct v4l2_ctrl_cavs2_frame *frame = (const void *)ctrl->p_new.p_u8;
++		struct cedrus_ctx *ctx = container_of(ctrl->handler, struct cedrus_ctx, hdl);
++		struct vb2_queue *q;
++		int ret = cedrus_cavs2_validate(frame);
++
++		if (ret)
++			return ret;
++		q = v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx);
++		if (vb2_is_busy(q)) {
++			if (ctx->bit_depth != frame->bit_depth)
++				return -EINVAL;
++		} else if (ctx->bit_depth != frame->bit_depth) {
++			ctx->bit_depth = frame->bit_depth;
++			cedrus_reset_cap_format(ctx);
++		}
+ 	} else if (ctrl->id == V4L2_CID_STATELESS_VC1_SLICE_PARAMS) {
+ 		const struct v4l2_ctrl_vc1_slice_params *slice = ctrl->p_new.p;
+ 
+@@ -120,6 +136,19 @@
+ };
+ 
+ static const struct cedrus_control cedrus_controls[] = {
++	{
++		.cfg = {
++			.id = V4L2_CID_STATELESS_CAVS2_FRAME,
++			.name = "CAVS2 Frame Parameters",
++			.type = V4L2_CTRL_TYPE_U8,
++			.min = 0,
++			.max = 255,
++			.step = 1,
++			.dims = { sizeof(struct v4l2_ctrl_cavs2_frame) },
++			.ops = &cedrus_ctrl_ops,
++		},
++		.capabilities = CEDRUS_CAPABILITY_CAVS2_DEC,
++	},
+ 	{
+ 		.cfg = {
+ 			.id	= V4L2_CID_STATELESS_MPEG2_SEQUENCE,
+@@ -745,6 +774,7 @@
+ 			  CEDRUS_CAPABILITY_H265_8K_DEC |
+ 			  CEDRUS_CAPABILITY_VP9_8K_DEC |
+ 			  CEDRUS_CAPABILITY_JPEG_16K_DEC |
++			  CEDRUS_CAPABILITY_CAVS2_DEC |
+ 			  CEDRUS_CAPABILITY_VP8_DEC |
+ 			  CEDRUS_CAPABILITY_VP9_DEC |
+ 			  CEDRUS_CAPABILITY_VC1_DEC,
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.h b/drivers/staging/media/sunxi/cedrus/cedrus.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -17,6 +17,7 @@
+ #define _CEDRUS_H_
+ 
+ #include <media/v4l2-ctrls.h>
++#include <media/cavs2-ctrls.h>
+ #include <media/v4l2-device.h>
+ #include <media/v4l2-mem2mem.h>
+ #include <media/videobuf2-v4l2.h>
+@@ -41,6 +42,7 @@
+ #define CEDRUS_CAPABILITY_H265_8K_DEC	BIT(10)
+ #define CEDRUS_CAPABILITY_VP9_8K_DEC	BIT(11)
+ #define CEDRUS_CAPABILITY_JPEG_16K_DEC	BIT(12)
++#define CEDRUS_CAPABILITY_CAVS2_DEC	BIT(13)
+ 
+ enum cedrus_irq_status {
+ 	CEDRUS_IRQ_NONE,
+@@ -98,6 +100,10 @@
+ 	const struct v4l2_ctrl_vc1_bitplanes		*bitplanes;
+ };
+ 
++struct cedrus_cavs2_run {
++	const struct v4l2_ctrl_cavs2_frame *frame;
++};
++
+ struct cedrus_run {
+ 	struct vb2_v4l2_buffer	*src;
+ 	struct vb2_v4l2_buffer	*dst;
+@@ -109,6 +115,7 @@
+ 		struct cedrus_vp8_run	vp8;
+ 		struct cedrus_vp9_run	vp9;
+ 		struct cedrus_vc1_run	vc1;
++		struct cedrus_cavs2_run	cavs2;
+ 	};
+ };
+ 
+@@ -130,6 +137,14 @@
+ 			dma_addr_t	mv_col_buf_dma;
+ 			ssize_t		mv_col_buf_size;
+ 		} h265;
++		struct {
++			void *mv;
++			dma_addr_t mv_dma;
++			size_t mv_size;
++			u16 poi;
++			u16 ref_poi[V4L2_CAVS2_MAX_REFS];
++			bool valid;
++		} cavs2;
+ 		struct {
+ 			u32		width;
+ 			u32		height;
+@@ -190,6 +205,13 @@
+ 			dma_addr_t	entropy_probs_buf_dma;
+ 		} vp8;
+ 		struct cedrus_vp9_ctx	*vp9;
++		struct {
++			void *entry;
++			dma_addr_t entry_dma;
++			void *neighbor;
++			dma_addr_t neighbor_dma;
++			struct cedrus_buffer *dst;
++		} cavs2;
+ 		struct {
+ 			void		*line_buf;
+ 			dma_addr_t	line_buf_addr;
+@@ -281,6 +303,9 @@
+ extern struct cedrus_dec_ops cedrus_dec_ops_vc1;
+ int cedrus_vc1_validate(const struct v4l2_ctrl_vc1_slice_params *slice);
+ extern struct cedrus_dec_ops cedrus_dec_ops_jpeg;
++extern struct cedrus_dec_ops cedrus_dec_ops_cavs2;
++int cedrus_cavs2_validate(const struct v4l2_ctrl_cavs2_frame *frame);
++void cedrus_cavs2_buf_cleanup(struct cedrus_ctx *ctx, struct cedrus_buffer *buf);
+ 
+ static inline void cedrus_write(struct cedrus_dev *dev, u32 reg, u32 val)
+ {
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_video.c b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_video.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+@@ -70,6 +70,11 @@
+ 		.capabilities	= CEDRUS_CAPABILITY_JPEG_DEC,
+ 	},
+ 	{
++		.pixelformat = V4L2_PIX_FMT_CAVS2_FRAME,
++		.directions = CEDRUS_DECODE_SRC,
++		.capabilities = CEDRUS_CAPABILITY_CAVS2_DEC,
++	},
++	{
+ 		.pixelformat	= V4L2_PIX_FMT_YUV420_10_AFBC_16X16_SPLIT,
+ 		.directions	= CEDRUS_DECODE_DST,
+ 		.capabilities	= CEDRUS_CAPABILITY_UNTILED |
+@@ -159,6 +164,12 @@
+ 		    fmt->pixelformat != V4L2_PIX_FMT_NV12_32L32)
+ 			continue;
+ 
++		if (ctx->src_fmt.pixelformat == V4L2_PIX_FMT_CAVS2_FRAME &&
++		    directions == CEDRUS_DECODE_DST &&
++		    fmt->pixelformat != V4L2_PIX_FMT_NV12 &&
++		    fmt->pixelformat != V4L2_PIX_FMT_P010)
++			continue;
++
+ 		if (fmt->depth && fmt->depth != ctx->bit_depth)
+ 			continue;
+ 
+@@ -182,6 +193,8 @@
+ void cedrus_prepare_format(struct cedrus_ctx *ctx,
+ 			   struct v4l2_pix_format *pix_fmt, u32 source_format)
+ {
++	unsigned int min_width = source_format == V4L2_PIX_FMT_CAVS2_FRAME ? 64 : CEDRUS_MIN_WIDTH;
++	unsigned int min_height = source_format == V4L2_PIX_FMT_CAVS2_FRAME ? 64 : CEDRUS_MIN_HEIGHT;
+ 	unsigned int max_width = CEDRUS_MAX_WIDTH;
+ 	unsigned int max_height = CEDRUS_MAX_HEIGHT;
+ 	unsigned int width = pix_fmt->width;
+@@ -206,13 +219,14 @@
+ 	}
+ 
+ 	/* Limit to hardware min/max. */
+-	width = clamp(width, CEDRUS_MIN_WIDTH, max_width);
++	width = clamp(width, min_width, max_width);
+ 	if (source_format == V4L2_PIX_FMT_VC1_SLICE)
+ 		max_height = min(max_height, V4L2_VC1_BITPLANE_SIZE * 8 /
+ 				 DIV_ROUND_UP(width, 16) * 16);
+-	height = clamp(height, CEDRUS_MIN_HEIGHT, max_height);
++	height = clamp(height, min_height, max_height);
+ 
+ 	switch (pix_fmt->pixelformat) {
++	case V4L2_PIX_FMT_CAVS2_FRAME:
+ 	case V4L2_PIX_FMT_MPEG2_SLICE:
+ 	case V4L2_PIX_FMT_H264_SLICE:
+ 	case V4L2_PIX_FMT_HEVC_SLICE:
+@@ -504,6 +518,9 @@
+ 	}
+ 
+ 	switch (ctx->src_fmt.pixelformat) {
++	case V4L2_PIX_FMT_CAVS2_FRAME:
++		ctx->current_codec = &cedrus_dec_ops_cavs2;
++		break;
+ 	case V4L2_PIX_FMT_MPEG2_SLICE:
+ 		ctx->current_codec = &cedrus_dec_ops_mpeg2;
+ 		break;
+@@ -737,7 +754,17 @@
+ 	v4l2_ctrl_request_complete(vb->req_obj.req, &ctx->hdl);
+ }
+ 
++static void cedrus_buf_cleanup(struct vb2_buffer *vb)
++{
++	struct cedrus_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
++
++	if (V4L2_TYPE_IS_CAPTURE(vb->vb2_queue->type) &&
++	    ctx->src_fmt.pixelformat == V4L2_PIX_FMT_CAVS2_FRAME)
++		cedrus_cavs2_buf_cleanup(ctx, vb2_to_cedrus_buffer(vb));
++}
++
+ static const struct vb2_ops cedrus_qops = {
++	.buf_cleanup = cedrus_buf_cleanup,
+ 	.queue_setup		= cedrus_queue_setup,
+ 	.buf_prepare		= cedrus_buf_prepare,
+ 	.buf_queue		= cedrus_buf_queue,
+@@ -779,6 +806,9 @@
+ 	dst_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
+ 	dst_vq->lock = &ctx->dev->dev_mutex;
+ 	dst_vq->dev = ctx->dev->dev;
++	/* Allow CAVS2 request references and reordered output pictures. */
++	if (cedrus_is_capable(ctx, CEDRUS_CAPABILITY_CAVS2_DEC))
++		dst_vq->max_num_buffers = 64;
+ 
+ 	return vb2_queue_init(dst_vq);
+ }
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+@@ -55,6 +55,10 @@
+ 	case V4L2_PIX_FMT_H264_SLICE:
+ 	case V4L2_PIX_FMT_VP8_FRAME:
+ 		reg |= VE_MODE_DEC_H264;
++		break;
++
++	case V4L2_PIX_FMT_CAVS2_FRAME:
++		reg = VE_MODE_DDR_MODE_BW_256 | VE_MODE_DEC_H265;
+ 		break;
+ 
+ 	case V4L2_PIX_FMT_HEVC_SLICE:
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_dec.c b/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
+@@ -99,6 +99,10 @@
+ 			V4L2_CID_STATELESS_VP9_COMPRESSED_HDR);
+ 		break;
+ 
++	case V4L2_PIX_FMT_CAVS2_FRAME:
++		run.cavs2.frame = cedrus_find_control_data(ctx, V4L2_CID_STATELESS_CAVS2_FRAME);
++		break;
++
+ 	case V4L2_PIX_FMT_VC1_SLICE:
+ 		run.vc1.slice_params = cedrus_find_control_data(ctx,
+ 			V4L2_CID_STATELESS_VC1_SLICE_PARAMS);
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_cavs2.c b/drivers/staging/media/sunxi/cedrus/cedrus_cavs2.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_cavs2.c
+@@ -0,0 +1,381 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Experimental H616 CAVS2 request decoding. */
++#include <linux/dma-mapping.h>
++#include <linux/unaligned.h>
++#include <media/cavs2-ctrls.h>
++#include <media/videobuf2-dma-contig.h>
++#include <media/v4l2-mem2mem.h>
++
++#include "cedrus.h"
++#include "cedrus_hw.h"
++#include "cedrus_regs.h"
++
++#define CAVS2_REG(n) (VE_ENGINE_DEC_H265 + (n))
++#define CAVS2_ENTRY_SIZE 512
++#define CAVS2_NEIGHBOR_SIZE SZ_2M
++#define CAVS2_IRQ_MASK 7
++
++struct cedrus_cavs2_reference {
++	dma_addr_t luma;
++	dma_addr_t chroma;
++	u16 poi;
++	u16 ref_poi[V4L2_CAVS2_MAX_REFS];
++};
++
++int cedrus_cavs2_validate(const struct v4l2_ctrl_cavs2_frame *f)
++{
++	unsigned int i, j;
++
++	if (!f || f->width < 64 || f->width > 4096 ||
++	    f->height < 64 || f->height > 2304 ||
++	    (f->profile != 0x20 && f->profile != 0x22) ||
++	    (f->bit_depth != 8 && f->bit_depth != 10) ||
++	    (f->profile == 0x20 && f->bit_depth != 8) ||
++	    f->log2_lcu_size < 4 || f->log2_lcu_size > 6 ||
++	    (f->sequence_flags & ~0x1fffU) || (f->flags & ~127U) ||
++	    (f->flags & V4L2_CAVS2_FRAME_INTERLACED &&
++	     f->sequence_flags & V4L2_CAVS2_SEQ_PROGRESSIVE) ||
++	    f->picture_type > 4 || f->num_refs > V4L2_CAVS2_MAX_REFS ||
++	    (f->picture_type && !f->num_refs) ||
++	    (f->picture_type == 2 && f->num_refs != 2) ||
++	    (f->picture_type == 4 && (f->num_refs != 1 ||
++	     !(f->flags & V4L2_CAVS2_FRAME_BACKGROUND_REFERENCE))) ||
++	    ((f->flags & V4L2_CAVS2_FRAME_BACKGROUND_REFERENCE) &&
++	     (!(f->sequence_flags & V4L2_CAVS2_SEQ_BACKGROUND) ||
++	      (f->picture_type != 1 && f->picture_type != 3 && f->picture_type != 4))) ||
++	    f->picture_qp > 63 + (f->bit_depth - 8) * 8 ||
++	    f->chroma_qp_delta_cb < -32 || f->chroma_qp_delta_cb > 31 ||
++	    f->chroma_qp_delta_cr < -32 || f->chroma_qp_delta_cr > 31 ||
++	    f->alpha_offset < -16 || f->alpha_offset > 15 ||
++	    f->beta_offset < -16 || f->beta_offset > 15 ||
++	    f->alf_flags > 7 || !f->num_luma_filters ||
++	    f->num_luma_filters > 16 ||
++	    (f->alf_flags && !(f->sequence_flags & V4L2_CAVS2_SEQ_ALF)))
++		return -EINVAL;
++	for (i = 0; i < 16; i++)
++		if (!f->quant_4x4[i] || f->alf_region_index[i] >= f->num_luma_filters)
++			return -EINVAL;
++	for (i = 0; i < 64; i++)
++		if (!f->quant_8x8[i])
++			return -EINVAL;
++	for (i = 0; i < 18; i++)
++		for (j = 0; j < 9; j++)
++			if (f->alf_coefficients[i][j] < -128 ||
++			    f->alf_coefficients[i][j] > 127)
++				return -EINVAL;
++	return 0;
++}
++
++static u32 cedrus_cavs2_sequence_reg(const struct v4l2_ctrl_cavs2_frame *f)
++{
++	u32 flags = f->sequence_flags;
++
++	return BIT(30) | !!(flags & V4L2_CAVS2_SEQ_PROGRESSIVE) << 28 |
++	       !!(flags & V4L2_CAVS2_SEQ_BACKGROUND) << 29 | (f->log2_lcu_size - 3) |
++	       (f->bit_depth & 7) << 3 |
++	       !!(flags & V4L2_CAVS2_SEQ_WSM) << 16 |
++	       !!(flags & V4L2_CAVS2_SEQ_DHP) << 17 |
++	       !!(flags & V4L2_CAVS2_SEQ_MHP_SKIP) << 18 |
++	       !!(flags & V4L2_CAVS2_SEQ_PMVR) << 19 |
++	       !!(flags & V4L2_CAVS2_SEQ_SECOND_TRANSFORM) << 20 |
++	       !!(flags & V4L2_CAVS2_SEQ_NSQT) << 21 |
++	       !!(flags & V4L2_CAVS2_SEQ_SDIP) << 22 |
++	       !!(flags & V4L2_CAVS2_SEQ_AMP) << 23 |
++	       !(flags & V4L2_CAVS2_SEQ_SAO) << 24 |
++	       !!(flags & V4L2_CAVS2_SEQ_ALF) << 25 |
++	       !!(flags & V4L2_CAVS2_SEQ_CROSS_LOOP_FILTER) << 26;
++}
++
++static u32 cedrus_cavs2_picture_reg(const struct v4l2_ctrl_cavs2_frame *f)
++{
++	return f->alf_flags |
++	       !!(f->flags & V4L2_CAVS2_FRAME_BACKGROUND_REFERENCE) << 5 |
++	       !!(f->flags & V4L2_CAVS2_FRAME_FIXED_QP) << 3 |
++	       !!(f->flags & V4L2_CAVS2_FRAME_LOOP_FILTER_DISABLED) << 4 |
++	       (u32)f->picture_qp << 8 |
++	       !!(f->flags & V4L2_CAVS2_FRAME_REFERENCE) << 15 |
++	       ((u32)f->chroma_qp_delta_cb & 63) << 16 |
++	       ((u32)f->chroma_qp_delta_cr & 63) << 24;
++}
++
++static u32 cedrus_cavs2_reference_reg(const struct v4l2_ctrl_cavs2_frame *f)
++{
++	u32 value = f->picture_type | f->num_refs << 3;
++
++	if (!(f->flags & V4L2_CAVS2_FRAME_LOOP_FILTER_DISABLED))
++		value |= ((u32)f->alpha_offset & 31) << 6 |
++			 ((u32)f->beta_offset & 31) << 11;
++	return value;
++}
++
++static u64 cedrus_cavs2_history(const struct cedrus_cavs2_reference *r, u64 value)
++{
++	int i;
++
++	for (i = V4L2_CAVS2_MAX_REFS - 1; i >= 0; i--)
++		value = value << 9 | (r->ref_poi[i] & 511);
++	return value;
++}
++
++static void cedrus_cavs2_pack_tables(u8 *table, const struct v4l2_ctrl_cavs2_frame *f,
++				   const struct cedrus_cavs2_reference *refs)
++{
++	u64 history = 0;
++	unsigned int i, j;
++
++	memset(table, 0, CAVS2_ENTRY_SIZE);
++	if (f->sequence_flags & V4L2_CAVS2_SEQ_ALF) {
++		for (i = 0; i < 18; i++) {
++			int sum = 0;
++			unsigned int base = i < 16 ? i * 8 : 0x80 + (i - 16) * 8;
++			unsigned int center = i < 16 ? 0x90 + i : 0xa0 + i - 16;
++
++			for (j = 0; j < 8; j++) {
++				table[base + j] = f->alf_coefficients[i][j];
++				sum += 2 * f->alf_coefficients[i][j];
++			}
++			table[center] = 64 + f->alf_coefficients[i][8] - sum;
++		}
++		for (i = 0; i < 8; i++)
++			table[0xa4 + i] = f->alf_region_index[i * 2] |
++					  f->alf_region_index[i * 2 + 1] << 4;
++	}
++	memcpy(table + 0xb0, f->quant_4x4, 16);
++	memcpy(table + 0xc0, f->quant_8x8, 64);
++	for (i = 0; i < f->num_refs; i++) {
++		u8 *entry = table + 0x100 + i * 16;
++
++		put_unaligned_le32(refs[i].luma >> 5, entry);
++		put_unaligned_le32(((f->flags & V4L2_CAVS2_FRAME_BACKGROUND_REFERENCE) &&
++				    i == f->num_refs - 1 ? f->picture_order_count :
++				    refs[i].poi) & 511, entry + 4);
++		put_unaligned_le32(refs[i].chroma >> 5, entry + 8);
++		history = cedrus_cavs2_history(&refs[i], history);
++		if (!i) {
++			put_unaligned_le32(history, table + 0x10c);
++			put_unaligned_le32(history >> 32, table + 0x11c);
++		} else {
++			put_unaligned_le64(history, table + 0x180 + (i - 1) * 8);
++		}
++	}
++	put_unaligned_le32(refs[7].luma >> 5, table + 0x170);
++	put_unaligned_le32(refs[7].poi & 511, table + 0x174);
++	put_unaligned_le32(refs[7].chroma >> 5, table + 0x178);
++	put_unaligned_le64(cedrus_cavs2_history(&refs[7], 0), table + 0x1b0);
++}
++
++static enum cedrus_irq_status cedrus_cavs2_irq_status(struct cedrus_ctx *ctx)
++{
++	u32 status = cedrus_read(ctx->dev, CAVS2_REG(0x38)) & CAVS2_IRQ_MASK;
++
++	if (!status)
++		return CEDRUS_IRQ_NONE;
++	return status & 6 ? CEDRUS_IRQ_ERROR : CEDRUS_IRQ_OK;
++}
++
++static void cedrus_cavs2_irq_clear(struct cedrus_ctx *ctx)
++{
++	u32 status = cedrus_read(ctx->dev, CAVS2_REG(0x38));
++
++	if (ctx->codec.cavs2.dst)
++		ctx->codec.cavs2.dst->codec.cavs2.valid = (status & 7) == 1;
++	ctx->codec.cavs2.dst = NULL;
++	cedrus_write(ctx->dev, CAVS2_REG(0x38), status);
++}
++
++static void cedrus_cavs2_irq_disable(struct cedrus_ctx *ctx)
++{
++	cedrus_write(ctx->dev, CAVS2_REG(0x30),
++		     cedrus_read(ctx->dev, CAVS2_REG(0x30)) & ~CAVS2_IRQ_MASK);
++}
++
++static int cedrus_cavs2_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
++{
++	const struct v4l2_ctrl_cavs2_frame *f = run->cavs2.frame;
++	struct cedrus_buffer *dst = vb2_to_cedrus_buffer(&run->dst->vb2_buf);
++	struct vb2_queue *q = v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx);
++	struct cedrus_cavs2_reference refs[8] = { };
++	struct cedrus_buffer *ref_buf[7] = { };
++	struct vb2_buffer *src = &run->src->vb2_buf;
++	struct cedrus_dev *dev = ctx->dev;
++	struct v4l2_pix_format recon = cedrus_dst_frame_fmt(ctx);
++	size_t payload = vb2_get_plane_payload(src, 0);
++	dma_addr_t source = vb2_dma_contig_plane_dma_addr(src, 0);
++	size_t mv_size;
++	unsigned int i;
++	u32 reg;
++	int ret;
++
++	dst->codec.cavs2.valid = false;
++	ret = cedrus_cavs2_validate(f);
++	if (ret)
++		return ret;
++	if (f->width != ctx->src_fmt.width || f->height != ctx->src_fmt.height ||
++	    f->bit_depth != ctx->bit_depth || !f->bitstream_size ||
++	    f->bitstream_offset > payload ||
++	    f->bitstream_size > payload - f->bitstream_offset ||
++	    f->bitstream_offset > 0x7ffffff || f->bitstream_size > 0x7ffffff ||
++	    (source & 255) || !vb2_plane_size(src, 0))
++		return -EINVAL;
++	for (i = 0; i < f->num_refs; i++) {
++		struct vb2_buffer *vb = vb2_find_buffer(q, f->reference_ts[i]);
++
++		if (!vb || vb == &run->dst->vb2_buf)
++			return -EINVAL;
++		ref_buf[i] = vb2_to_cedrus_buffer(vb);
++		if (!ref_buf[i]->codec.cavs2.valid)
++			return -EINVAL;
++		refs[i].luma = cedrus_dst_frame_addr(ctx, vb, 0);
++		refs[i].chroma = cedrus_dst_frame_addr(ctx, vb, 1);
++		refs[i].poi = ref_buf[i]->codec.cavs2.poi;
++		memcpy(refs[i].ref_poi, ref_buf[i]->codec.cavs2.ref_poi,
++		       sizeof(refs[i].ref_poi));
++	}
++	mv_size = DIV_ROUND_UP(ctx->src_fmt.width, 64) *
++		  DIV_ROUND_UP(ctx->src_fmt.height, 64) * 128;
++	if (dst->codec.cavs2.mv_size && dst->codec.cavs2.mv_size != mv_size)
++		return -EINVAL;
++	if (!dst->codec.cavs2.mv_size) {
++		dst->codec.cavs2.mv = dma_alloc_attrs(dev->dev, mv_size,
++						 &dst->codec.cavs2.mv_dma, GFP_KERNEL,
++						 DMA_ATTR_NO_KERNEL_MAPPING);
++		if (!dst->codec.cavs2.mv)
++			return -ENOMEM;
++		dst->codec.cavs2.mv_size = mv_size;
++	}
++	dst->codec.cavs2.valid = false;
++	dst->codec.cavs2.poi = f->picture_order_count;
++	memset(dst->codec.cavs2.ref_poi, 0, sizeof(dst->codec.cavs2.ref_poi));
++	for (i = 0; i < f->num_refs; i++)
++		dst->codec.cavs2.ref_poi[i] = refs[i].poi;
++	if (!f->picture_type)
++		for (i = 0; i < 4; i++)
++			dst->codec.cavs2.ref_poi[i] = dst->codec.cavs2.poi;
++	else if (f->picture_type == 2) {
++		dst->codec.cavs2.ref_poi[0] = refs[1].poi;
++		dst->codec.cavs2.ref_poi[1] = refs[0].poi;
++	}
++	refs[7].luma = cedrus_dst_frame_addr(ctx, &run->dst->vb2_buf, 0);
++	refs[7].chroma = cedrus_dst_frame_addr(ctx, &run->dst->vb2_buf, 1);
++	refs[7].poi = dst->codec.cavs2.poi;
++	memcpy(refs[7].ref_poi, dst->codec.cavs2.ref_poi, sizeof(refs[7].ref_poi));
++	cedrus_cavs2_pack_tables(ctx->codec.cavs2.entry, f, refs);
++	ret = cedrus_engine_enable(ctx);
++	if (ret)
++		return ret;
++	cedrus_dst_format_set(dev, &recon);
++	cedrus_write(dev, CAVS2_REG(4), cedrus_cavs2_sequence_reg(f));
++	cedrus_write(dev, CAVS2_REG(8), ALIGN(f->width, 8) | ALIGN(f->height, 8) << 16);
++	cedrus_write(dev, CAVS2_REG(0x10), cedrus_cavs2_picture_reg(f));
++	cedrus_write(dev, CAVS2_REG(0x14), cedrus_cavs2_reference_reg(f));
++	cedrus_write(dev, CAVS2_REG(0x44), f->bitstream_offset * 8);
++	cedrus_write(dev, CAVS2_REG(0x48), f->bitstream_size * 8);
++	cedrus_write(dev, CAVS2_REG(0x4c), (source + vb2_plane_size(src, 0) - 1) >> 8);
++	cedrus_write(dev, CAVS2_REG(0x40), source >> 8 | 0x70000000);
++	cedrus_write(dev, CAVS2_REG(0x60), ctx->codec.cavs2.neighbor_dma >> 8);
++	cedrus_write(dev, CAVS2_REG(0x64), ctx->codec.cavs2.entry_dma >> 8);
++	cedrus_write(dev, CAVS2_REG(0x78),
++		     (f->num_refs ? ref_buf[0]->codec.cavs2.mv_dma :
++		      dst->codec.cavs2.mv_dma) >> 8);
++	cedrus_write(dev, CAVS2_REG(0x7c), dst->codec.cavs2.mv_dma >> 8);
++	reg = 0;
++	if (f->bit_depth == 10)
++		reg = recon.bytesperline * recon.height * 3 / 2;
++	cedrus_write(dev, CAVS2_REG(0x84), reg);
++	reg = f->bit_depth == 10 ? ALIGN(recon.bytesperline / 4, 32) : 0;
++	if (cedrus_dst_is_p010(ctx)) {
++		cedrus_dst_p010_output_set(ctx, &run->dst->vb2_buf);
++		reg |= VE_DEC_10BIT_CFG_P010;
++	} else {
++		cedrus_write(dev, CAVS2_REG(0x50), 0);
++		cedrus_write(dev, CAVS2_REG(0x54), 0);
++		cedrus_write(dev, CAVS2_REG(0x58), 0);
++	}
++	cedrus_write(dev, CAVS2_REG(0x8c), reg);
++	reg = BIT(24) | CAVS2_IRQ_MASK;
++	if ((u32)(f->width - 129) < 64 && f->height > 64)
++		reg |= BIT(31);
++	if (cedrus_dst_is_p010(ctx))
++		reg |= BIT(9);
++	cedrus_write(dev, CAVS2_REG(0x30), reg);
++	ctx->codec.cavs2.dst = dst;
++	return 0;
++}
++
++static void cedrus_cavs2_trigger(struct cedrus_ctx *ctx)
++{
++	cedrus_write(ctx->dev, CAVS2_REG(0x34), 7);
++	cedrus_write(ctx->dev, CAVS2_REG(0x38), 0x80100);
++	cedrus_write(ctx->dev, CAVS2_REG(0x3c), 0);
++	cedrus_write(ctx->dev, CAVS2_REG(0x34), 8);
++}
++
++static int cedrus_cavs2_start(struct cedrus_ctx *ctx)
++{
++	struct cedrus_dev *dev = ctx->dev;
++
++	ctx->codec.cavs2.entry = dma_alloc_coherent(dev->dev, CAVS2_ENTRY_SIZE,
++						 &ctx->codec.cavs2.entry_dma, GFP_KERNEL);
++	if (!ctx->codec.cavs2.entry)
++		return -ENOMEM;
++	ctx->codec.cavs2.neighbor = dma_alloc_attrs(dev->dev, CAVS2_NEIGHBOR_SIZE,
++						 &ctx->codec.cavs2.neighbor_dma,
++						 GFP_KERNEL, DMA_ATTR_NO_KERNEL_MAPPING);
++	if (!ctx->codec.cavs2.neighbor) {
++		dma_free_coherent(dev->dev, CAVS2_ENTRY_SIZE, ctx->codec.cavs2.entry,
++				  ctx->codec.cavs2.entry_dma);
++		ctx->codec.cavs2.entry = NULL;
++		return -ENOMEM;
++	}
++	ctx->codec.cavs2.dst = NULL;
++	return 0;
++}
++
++void cedrus_cavs2_buf_cleanup(struct cedrus_ctx *ctx, struct cedrus_buffer *buf)
++{
++	if (buf->codec.cavs2.mv_size) {
++		dma_free_attrs(ctx->dev->dev, buf->codec.cavs2.mv_size,
++			       buf->codec.cavs2.mv, buf->codec.cavs2.mv_dma,
++			       DMA_ATTR_NO_KERNEL_MAPPING);
++		buf->codec.cavs2.mv_size = 0;
++		buf->codec.cavs2.mv = NULL;
++	}
++	buf->codec.cavs2.valid = false;
++	if (ctx->codec.cavs2.dst == buf)
++		ctx->codec.cavs2.dst = NULL;
++}
++
++static void cedrus_cavs2_stop(struct cedrus_ctx *ctx)
++{
++	struct cedrus_dev *dev = ctx->dev;
++	struct vb2_queue *q = v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx);
++	unsigned int i;
++
++	for (i = 0; i < vb2_get_num_buffers(q); i++) {
++		struct vb2_buffer *vb = vb2_get_buffer(q, i);
++		struct cedrus_buffer *buf;
++
++		if (!vb)
++			continue;
++		buf = vb2_to_cedrus_buffer(vb);
++		cedrus_cavs2_buf_cleanup(ctx, buf);
++	}
++	dma_free_attrs(dev->dev, CAVS2_NEIGHBOR_SIZE, ctx->codec.cavs2.neighbor,
++		       ctx->codec.cavs2.neighbor_dma, DMA_ATTR_NO_KERNEL_MAPPING);
++	dma_free_coherent(dev->dev, CAVS2_ENTRY_SIZE, ctx->codec.cavs2.entry,
++			  ctx->codec.cavs2.entry_dma);
++	ctx->codec.cavs2.entry = NULL;
++	ctx->codec.cavs2.neighbor = NULL;
++	ctx->codec.cavs2.dst = NULL;
++}
++
++struct cedrus_dec_ops cedrus_dec_ops_cavs2 = {
++	.irq_clear = cedrus_cavs2_irq_clear,
++	.irq_disable = cedrus_cavs2_irq_disable,
++	.irq_status = cedrus_cavs2_irq_status,
++	.setup = cedrus_cavs2_setup,
++	.start = cedrus_cavs2_start,
++	.stop = cedrus_cavs2_stop,
++	.trigger = cedrus_cavs2_trigger,
++	.extra_cap_size = cedrus_dst_10bit_extra_size,
++};
+diff --git a/drivers/media/v4l2-core/v4l2-ioctl.c b/drivers/media/v4l2-core/v4l2-ioctl.c
+--- a/drivers/media/v4l2-core/v4l2-ioctl.c
++++ b/drivers/media/v4l2-core/v4l2-ioctl.c
+@@ -26,6 +26,7 @@
+ #include <media/v4l2-fh.h>
+ #include <media/v4l2-event.h>
+ #include <media/v4l2-device.h>
++#include <media/cavs2-ctrls.h>
+ #include <media/videobuf2-v4l2.h>
+ #include <media/v4l2-mc.h>
+ #include <media/v4l2-mem2mem.h>
+@@ -1519,6 +1520,7 @@
+ 		case V4L2_PIX_FMT_VP8:		descr = "VP8"; break;
+ 		case V4L2_PIX_FMT_VP8_FRAME:    descr = "VP8 Frame"; break;
+ 		case V4L2_PIX_FMT_VP9:		descr = "VP9"; break;
++		case V4L2_PIX_FMT_CAVS2_FRAME: descr = "CAVS2 Parsed Frame"; break;
+ 		case V4L2_PIX_FMT_VP9_FRAME:    descr = "VP9 Frame"; break;
+ 		case V4L2_PIX_FMT_HEVC:		descr = "HEVC"; break; /* aka H.265 */
+ 		case V4L2_PIX_FMT_HEVC_SLICE:	descr = "HEVC Parsed Slice Data"; break;
+diff --git a/include/media/cavs2-ctrls.h b/include/media/cavs2-ctrls.h
+new file mode 100644
+--- /dev/null
++++ b/include/media/cavs2-ctrls.h
+@@ -0,0 +1,61 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef _CAVS2_CTRLS_H_
++#define _CAVS2_CTRLS_H_
++
++#include <linux/types.h>
++#include <linux/v4l2-controls.h>
++#include <linux/videodev2.h>
++
++/* Experimental frame control; keep the kernel and userspace definitions identical. */
++#define V4L2_PIX_FMT_CAVS2_FRAME v4l2_fourcc('C', 'A', 'V', '2')
++#define V4L2_CID_STATELESS_CAVS2_FRAME (V4L2_CID_CODEC_STATELESS_BASE + 600)
++#define V4L2_CAVS2_MAX_REFS 7
++#define V4L2_CAVS2_SEQ_MHP_SKIP (1U << 0)
++#define V4L2_CAVS2_SEQ_DHP (1U << 1)
++#define V4L2_CAVS2_SEQ_WSM (1U << 2)
++#define V4L2_CAVS2_SEQ_AMP (1U << 3)
++#define V4L2_CAVS2_SEQ_NSQT (1U << 4)
++#define V4L2_CAVS2_SEQ_SDIP (1U << 5)
++#define V4L2_CAVS2_SEQ_SECOND_TRANSFORM (1U << 6)
++#define V4L2_CAVS2_SEQ_SAO (1U << 7)
++#define V4L2_CAVS2_SEQ_ALF (1U << 8)
++#define V4L2_CAVS2_SEQ_PMVR (1U << 9)
++#define V4L2_CAVS2_SEQ_CROSS_LOOP_FILTER (1U << 10)
++#define V4L2_CAVS2_SEQ_PROGRESSIVE (1U << 11)
++#define V4L2_CAVS2_SEQ_BACKGROUND (1U << 12)
++#define V4L2_CAVS2_FRAME_BACKGROUND_REFERENCE (1U << 3)
++#define V4L2_CAVS2_FRAME_INTERLACED (1U << 4)
++#define V4L2_CAVS2_FRAME_TOP_FIELD_FIRST (1U << 5)
++#define V4L2_CAVS2_FRAME_REPEAT_FIRST_FIELD (1U << 6)
++#define V4L2_CAVS2_FRAME_FIXED_QP (1U << 0)
++#define V4L2_CAVS2_FRAME_LOOP_FILTER_DISABLED (1U << 1)
++#define V4L2_CAVS2_FRAME_REFERENCE (1U << 2)
++
++struct v4l2_ctrl_cavs2_frame {
++	__u64 reference_ts[V4L2_CAVS2_MAX_REFS];
++	__s32 picture_order_count;
++	__u32 sequence_flags;
++	__u32 bitstream_offset;
++	__u32 bitstream_size;
++	__u32 flags;
++	__u16 width;
++	__u16 height;
++	__u8 profile;
++	__u8 bit_depth;
++	__u8 log2_lcu_size;
++	__u8 picture_type; /* I=0, P=1, B=2, F=3, P_BG=4. */
++	__u8 picture_qp;
++	__u8 num_refs;
++	__u8 alf_flags;
++	__u8 num_luma_filters;
++	__s8 chroma_qp_delta_cb;
++	__s8 chroma_qp_delta_cr;
++	__s8 alpha_offset;
++	__s8 beta_offset;
++	__u8 alf_region_index[16];
++	__u8 quant_4x4[16];
++	__u8 quant_8x8[64];
++	__s16 alf_coefficients[18][9]; /* Sixteen luma filters, Cb, Cr. */
++};
++
++#endif
