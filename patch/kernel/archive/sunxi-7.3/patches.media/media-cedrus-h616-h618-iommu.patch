@@ -1,0 +1,52 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: media: cedrus: enable H616/H618 IOMMU buffers
+
+Use IOMMU-backed video buffers on H616 and H618.
+Preserve bypass for unassigned DMA masters.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/Documentation/devicetree/bindings/media/allwinner,sun4i-a10-video-engine.yaml b/Documentation/devicetree/bindings/media/allwinner,sun4i-a10-video-engine.yaml
+--- a/Documentation/devicetree/bindings/media/allwinner,sun4i-a10-video-engine.yaml
++++ b/Documentation/devicetree/bindings/media/allwinner,sun4i-a10-video-engine.yaml
+@@ -57,7 +57,8 @@
+     description: Phandle to the device SRAM
+ 
+   iommus:
+-    maxItems: 1
++    minItems: 1
++    maxItems: 2
+ 
+   nvmem-cells:
+     maxItems: 1
+@@ -87,11 +88,17 @@
+         compatible:
+           const: allwinner,sun50i-h616-video-engine
+     then:
++      properties:
++        iommus:
++          minItems: 2
++          maxItems: 2
+       dependentRequired:
+         nvmem-cells: [ nvmem-cell-names ]
+         nvmem-cell-names: [ nvmem-cells ]
+     else:
+       properties:
++        iommus:
++          maxItems: 1
+         nvmem-cells: false
+         nvmem-cell-names: false
+ 
+diff --git a/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi b/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
+--- a/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
++++ b/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
+@@ -338,6 +338,7 @@
+ 			resets = <&ccu RST_BUS_VE>;
+ 			interrupts = <GIC_SPI 93 IRQ_TYPE_LEVEL_HIGH>;
+ 			allwinner,sram = <&ve_sram 1>;
++			iommus = <&iommu 2>, <&iommu 3>;
+ 			nvmem-cells = <&cpu_speed_grade>;
+ 			nvmem-cell-names = "soc-id";
+ 		};
+-- 
+Armbian
