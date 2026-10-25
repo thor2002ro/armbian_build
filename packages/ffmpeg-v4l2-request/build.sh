@@ -23,9 +23,11 @@ cd /build/objects
 	--enable-shared --disable-static --enable-pic --disable-autodetect \
 	--enable-gpl --enable-version3 --enable-libdrm --enable-libudev \
 	--enable-v4l2-request --enable-v4l2-m2m --enable-libx264 --enable-openssl \
+	--enable-encoder=mjpeg_v4l2m2m \
 	--enable-decoder=mjpeg_v4l2m2m --enable-hwaccel=mjpeg_v4l2request \
 	--enable-zlib --enable-bzlib --enable-lzma --disable-doc --disable-debug --disable-ffplay \
 	--extra-version=armbian-v4l2-request
+grep -qx 'CONFIG_MJPEG_V4L2M2M_ENCODER=yes' ffbuild/config.mak
 grep -qx 'CONFIG_MJPEG_V4L2M2M_DECODER=yes' ffbuild/config.mak
 grep -qx 'CONFIG_MJPEG_V4L2REQUEST_HWACCEL=yes' ffbuild/config.mak
 make "${threads}" REVISION="git-${snapshot_commit}"

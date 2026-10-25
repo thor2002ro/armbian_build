@@ -24,7 +24,7 @@ function compile_ffmpeg-v4l2-request() {
 		--output="${tmp_dir}/source.tar" "${FFMPEG_V4L2_REQUEST_COMMIT}"
 	run_host_command_logged_raw tar -xf "${tmp_dir}/source.tar" -C "${rootfs}/build/src"
 	declare codec_patch
-	for codec_patch in ffmpeg-v4l2-request.patch ffmpeg-jpeg-v4l2-decode.patch; do
+	for codec_patch in ffmpeg-v4l2-request.patch ffmpeg-mjpeg-v4l2m2m.patch ffmpeg-jpeg-v4l2-decode.patch; do
 		run_host_command_logged_raw env GIT_CEILING_DIRECTORIES="${rootfs}/build" \
 			git -C "${rootfs}/build/src" apply "${SRC}/patch/misc/${codec_patch}"
 	done
@@ -43,7 +43,7 @@ function compile_ffmpeg-v4l2-request() {
 		Section: video
 		Priority: optional
 		Homepage: https://ffmpeg.org/
-		Description: Shared FFmpeg with LibreELEC V4L2 Request decoding
+		Description: Shared FFmpeg with V4L2 Request codec support
 	CONTROL
 	dpkg_deb_build "${destination}" "ffmpeg-v4l2-request"
 	done_with_temp_dir "${cleanup_id}"
