@@ -1,0 +1,24 @@
+Subject: [PATCH] Local: media: cedrus: program CAVS input bounds before publishing
+
+Writing the flagged CAVS address can start the VLD engine immediately. Late offset or length writes can then describe a different input window.
+
+Write the complete range first and publish the address last. Valid streams keep the same data.
+---
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_cavs.c b/drivers/staging/media/sunxi/cedrus/cedrus_cavs.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_cavs.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_cavs.c
+@@ -287,11 +287,12 @@
+ 			 ctrl_before, cedrus_cavs_sequence_reg(f), sequence_readback,
+ 			 cedrus_read(dev, CAVS_REG(0x20)), cedrus_read(dev, CAVS_REG(4)));
+ 	cedrus_write(dev, CAVS_REG(0x2c), 0);
+-	cedrus_write(dev, CAVS_REG(0x30),
+-		     (source & 0xffffff0) | (source >> 28) | 0x70000000);
+ 	cedrus_write(dev, CAVS_REG(0x34), f->bitstream_offset * 8);
+ 	cedrus_write(dev, CAVS_REG(0x38), f->bitstream_size * 8);
+ 	cedrus_write(dev, CAVS_REG(0x3c), source + vb2_plane_size(src, 0) - 1);
++	/* Writing the flagged address starts VLD, so publish it last. */
++	cedrus_write(dev, CAVS_REG(0x30),
++		     (source & 0xffffff0) | (source >> 28) | 0x70000000);
+ 	cedrus_write(dev, CAVS_REG(0x40), 0);
+ 	cedrus_write(dev, CAVS_REG(0x50), ctx->codec.cavs.mv_dma);
+ 	cedrus_write(dev, CAVS_REG(0x54), ctx->codec.cavs.mb_dma);
