@@ -1,0 +1,83 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: media: cedrus: wait for H616/H618 VC-1 completion
+
+Wait for VE idle before returning decoded frames.
+Reset the engine after decoding errors or completion timeouts.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.h b/drivers/staging/media/sunxi/cedrus/cedrus.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -194,6 +194,7 @@
+ 			void		*line_buf;
+ 			dma_addr_t	line_buf_addr;
+ 			size_t		line_buf_size;
++			bool		wait_idle;
+ 			void		*aux_buf;
+ 			dma_addr_t	aux_buf_addr;
+ 			void		*mv_buf;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c b/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c
+@@ -7,6 +7,7 @@
+ 
+ #include <linux/delay.h>
+ #include <linux/jiffies.h>
++#include <linux/of.h>
+ #include <linux/reset.h>
+ #include <linux/types.h>
+ 
+@@ -201,13 +202,24 @@
+ 	u32 reg = cedrus_read(dev, VE_DEC_VC1_STATUS);
+ 
+ 	if (reg & (VE_DEC_VC1_STATUS_ERROR |
+-		   VE_DEC_VC1_STATUS_VLD_DATA_REQ))
++		   VE_DEC_VC1_STATUS_VLD_DATA_REQ)) {
++		reset_control_reset(dev->rstc);
+ 		return CEDRUS_IRQ_ERROR;
+-
+-	if (reg & VE_DEC_VC1_STATUS_SUCCESS)
+-		return CEDRUS_IRQ_OK;
+-
+-	return CEDRUS_IRQ_NONE;
++	}
++
++	if (!(reg & VE_DEC_VC1_STATUS_SUCCESS))
++		return CEDRUS_IRQ_NONE;
++
++	if (ctx->codec.vc1.wait_idle &&
++	    readl_poll_timeout_atomic(dev->base + VE_STATUS, reg,
++				      (reg & VE_STATUS_VE_IDLE) &&
++				      (cedrus_read(dev, VE_STATUS) & VE_STATUS_VE_IDLE),
++				      1, 1000)) {
++		reset_control_reset(dev->rstc);
++		return CEDRUS_IRQ_ERROR;
++	}
++
++	return CEDRUS_IRQ_OK;
+ }
+ 
+ static void cedrus_vc1_irq_clear(struct cedrus_ctx *ctx)
+@@ -763,6 +775,8 @@
+ 
+ 	ctx->codec.vc1.line_buf = NULL;
+ 	ctx->codec.vc1.line_buf_size = 0;
++	ctx->codec.vc1.wait_idle = of_device_is_compatible(dev->dev->of_node,
++							   "allwinner,sun50i-h616-video-engine");
+ 
+ 	ctx->codec.vc1.ic_oldval = 0;
+ 	ctx->codec.vc1.ic_intenen = false;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_regs.h b/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
+@@ -62,6 +62,9 @@
+ #define VE_MODE_DEC_VC1				(0x02 << 0)
+ #define VE_MODE_DEC_H264			(0x01 << 0)
+ #define VE_MODE_DEC_MPEG			(0x00 << 0)
++
++#define VE_STATUS				0x04
++#define VE_STATUS_VE_IDLE			BIT(9)
+ 
+ #define VE_DEC_COUNTER				0x08
+ #define VE_DEC_COUNTER_EN			BIT(31)

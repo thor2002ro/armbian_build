@@ -1,0 +1,41 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: media: cedrus: correct VC-1 buffer description
+
+Describe the fixed auxiliary buffer layout.
+Remove unused motion-vector size and slot constants.
+Keep the existing allocation size and offsets.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c b/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c
+@@ -17,22 +17,20 @@
+ 
+ /* #define CEDRUS_VC1_DEBUG */
+ 
+-#define MV_BUF_SIZE			(112 * SZ_1K)
+ #define ACDC_BUF_SIZE			(16 * SZ_1K)
+ #define BITPLANES_BUF_SIZE		(16 * SZ_1K)
+ 
+-/* Vendor allocates BPLANE+DCAC+MV as one contiguous block:
+- *   BPLANE @ +0x0000  16KB
+- *   DCAC   @ +0x4000  16KB
+- *   MV     @ +0x8000 112KB (7 slots × 16KB, rotated per decode)
+- * Total = 144KB, 16KB-aligned
++/* Auxiliary buffers share one allocation with fixed offsets:
++ *   Bitplanes: 0x0000,  16 KiB
++ *   DCAC:      0x4000,  16 KiB
++ *   MV:        0x8000, 112 KiB
++ * The MV address stays fixed across pictures.
++ * The vendor's seven software bitplanes use a separate allocation.
+  */
+ #define VC1_AUX_ALLOC_SIZE		(144 * SZ_1K)
+ #define VC1_AUX_BPLANE_OFF		0x0000
+ #define VC1_AUX_DCAC_OFF		0x4000
+ #define VC1_AUX_MV_OFF			0x8000
+-#define MV_SLOT_SIZE			(16 * SZ_1K)
+-#define MV_SLOT_COUNT			7
+ #define VC1_IC_LUMSCALE_DEFAULT		32
+ 
+ #define VC1_PROFILE_SIMPLE		0
