@@ -1,0 +1,69 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: media: cedrus: enable experimental VC-1 Main decoding
+
+Accept Simple, Main, and Advanced VC-1 profiles.
+Apply Main range flags and the extended motion-vector flag.
+Main skipped-block reconstruction still requires hardware investigation.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.c b/drivers/staging/media/sunxi/cedrus/cedrus.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.c
+@@ -113,15 +113,6 @@
+ 			/* Complex profile is not supported by the hardware */
+ 			return -EINVAL;
+ 
+-		if (slice->sequence.profile == V4L2_VC1_PROFILE_MAIN)
+-			/*
+-			 * Main profile decodes incorrectly: the engine leaves
+-			 * the macroblocks a P picture flags as skipped
+-			 * untouched instead of copying them from the forward
+-			 * reference, so they keep stale destination content.
+-			 */
+-			return -EINVAL;
+-
+ 		if (slice->picture_layer.respic)
+ 			/* Reduced-resolution (multi-res) coding is not supported */
+ 			return -EINVAL;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c b/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c
+@@ -261,11 +261,13 @@
+ 	 * (RANGE_MAPY + 9) / 8 (SMPTE 421M 6.2.15.1), which equals 2.0 only for
+ 	 * RANGE_MAPY == 7. Other values cannot be expressed by the single
+ 	 * RANGEREDFRM bit, so only reuse it for the exact match (assumes
+-	 * symmetric luma/chroma mapping, as in practice). The Main profile
+-	 * range reduction the bit was meant for is not supported.
++	 * symmetric luma/chroma mapping, as in practice).
+ 	 */
+-	rangeredfrm = (entrypoint->flags & V4L2_VC1_ENTRYPOINT_HEADER_FLAG_RANGE_MAPY) &&
+-		      entrypoint->range_mapy == 7;
++	if (sequence->profile == VC1_PROFILE_MAIN)
++		rangeredfrm = picture->flags & V4L2_VC1_PICTURE_LAYER_FLAG_RANGEREDFRM;
++	else
++		rangeredfrm = (entrypoint->flags & V4L2_VC1_ENTRYPOINT_HEADER_FLAG_RANGE_MAPY) &&
++			      entrypoint->range_mapy == 7;
+ 	pq = cedrus_vc1_get_pq(picture->pqindex, entrypoint->quantizer);
+ 
+ 	if (picture->ptype != VC1_PICTURE_TYPE_P)
+@@ -326,7 +328,7 @@
+ 		reg |= VE_DEC_VC1_EPHS_LOOPFILTER;
+ 	if (entrypoint->flags & V4L2_VC1_ENTRYPOINT_HEADER_FLAG_FASTUVMC)
+ 		reg |= VE_DEC_VC1_EPHS_FASTUVMC;
+-	if (entrypoint->flags & V4L2_VC1_ENTRYPOINT_HEADER_FLAG_EXTENDED_DMV)
++	if (entrypoint->flags & V4L2_VC1_ENTRYPOINT_HEADER_FLAG_EXTENDED_MV)
+ 		reg |= VE_DEC_VC1_EPHS_EXTENDEDMV;
+ 	reg |= VE_DEC_VC1_EPHS_DQUANT(entrypoint->dquant);
+ 	if (entrypoint->flags & V4L2_VC1_ENTRYPOINT_HEADER_FLAG_VSTRANSFORM)
+@@ -334,6 +336,8 @@
+ 	if (entrypoint->flags & V4L2_VC1_ENTRYPOINT_HEADER_FLAG_OVERLAP)
+ 		reg |= VE_DEC_VC1_EPHS_OVERLAP;
+ 	reg |= VE_DEC_VC1_EPHS_QUANTIZER(entrypoint->quantizer);
++	if (metadata->flags & V4L2_VC1_METADATA_FLAG_RANGERED)
++		reg |= VE_DEC_VC1_EPHS_RANGERED;
+ 	if (sequence->flags & V4L2_VC1_SEQUENCE_FLAG_FINTERPFLAG)
+ 		reg |= VE_DEC_VC1_EPHS_FINTERPFLAG;
+ 	if (metadata->flags & V4L2_VC1_METADATA_FLAG_SYNCMARKER)
+-- 
+Armbian
