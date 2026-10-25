@@ -1,0 +1,209 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: media: cedrus: allow H616/H618 8K HEVC testing
+
+Raise the H616 and H618 HEVC limit to 7680x4320.
+Keep other codecs and SoCs at their current limits.
+Expand HEVC scratch buffers for experimental 8K decoding.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.c b/drivers/staging/media/sunxi/cedrus/cedrus.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.c
+@@ -258,8 +258,8 @@
+ 	{
+ 		.cfg = {
+ 			.id	= V4L2_CID_STATELESS_HEVC_ENTRY_POINT_OFFSETS,
+-			/* maximum 256 entry point offsets per slice */
+-			.dims	= { 256 },
++			/* Maximum 512 entry point offsets per slice. */
++			.dims	= { 512 },
+ 			.max = 0xffffffff,
+ 			.step = 1,
+ 		},
+@@ -761,6 +761,7 @@
+ 			  CEDRUS_CAPABILITY_H264_DEC |
+ 			  CEDRUS_CAPABILITY_H265_DEC |
+ 			  CEDRUS_CAPABILITY_H265_10_DEC |
++			  CEDRUS_CAPABILITY_H265_8K_DEC |
+ 			  CEDRUS_CAPABILITY_VP8_DEC |
+ 			  CEDRUS_CAPABILITY_VP9_DEC |
+ 			  CEDRUS_CAPABILITY_VC1_DEC,
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.h b/drivers/staging/media/sunxi/cedrus/cedrus.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -38,6 +38,7 @@
+ #define CEDRUS_CAPABILITY_VC1_DEC	BIT(7)
+ #define CEDRUS_CAPABILITY_JPEG_DEC	BIT(8)
+ #define CEDRUS_CAPABILITY_H264_ENC	BIT(9)
++#define CEDRUS_CAPABILITY_H265_8K_DEC	BIT(10)
+ 
+ enum cedrus_irq_status {
+ 	CEDRUS_IRQ_NONE,
+@@ -174,6 +175,7 @@
+ 		struct {
+ 			void		*neighbor_info_buf;
+ 			dma_addr_t	neighbor_info_buf_addr;
++			unsigned int	neighbor_info_buf_size;
+ 			void		*entry_points_buf;
+ 			dma_addr_t	entry_points_buf_addr;
+ 		} h265;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_h265.c b/drivers/staging/media/sunxi/cedrus/cedrus_h265.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_h265.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_h265.c
+@@ -15,6 +15,7 @@
+ #include "cedrus.h"
+ #include "cedrus_hw.h"
+ #include "cedrus_regs.h"
++#include "cedrus_video.h"
+ 
+ /*
+  * These are the sizes for side buffers required by the hardware for storing
+@@ -24,7 +25,7 @@
+  * for the H6 SoC, which may be related to 10 bit H265 support.
+  */
+ #define CEDRUS_H265_NEIGHBOR_INFO_BUF_SIZE	(794 * SZ_1K)
+-#define CEDRUS_H265_ENTRY_POINTS_BUF_SIZE	(4 * SZ_1K)
++#define CEDRUS_H265_ENTRY_POINTS_BUF_SIZE	(8 * SZ_1K)
+ #define CEDRUS_H265_MV_COL_BUF_UNIT_CTB_SIZE	160
+ 
+ struct cedrus_h265_sram_frame_info {
+@@ -433,6 +434,16 @@
+ 	cedrus_buf = vb2_to_cedrus_buffer(&run->dst->vb2_buf);
+ 	slice_bytes = vb2_get_plane_payload(&run->src->vb2_buf, 0);
+ 
++	if (!sps->pic_width_in_luma_samples ||
++	    !sps->pic_height_in_luma_samples ||
++	    sps->pic_width_in_luma_samples > ctx->src_fmt.width ||
++	    sps->pic_height_in_luma_samples > ctx->src_fmt.height)
++		return -EINVAL;
++
++	if (num_entry_point_offsets >
++	    CEDRUS_H265_ENTRY_POINTS_BUF_SIZE / (4 * sizeof(u32)))
++		return -ERANGE;
++
+ 	/*
+ 	 * If entry points offsets are present, we should get them
+ 	 * exactly the right amount.
+@@ -848,9 +859,15 @@
+ {
+ 	struct cedrus_dev *dev = ctx->dev;
+ 
++	/* Reserve scratch space for each 4K frame region. */
++	ctx->codec.h265.neighbor_info_buf_size =
++		CEDRUS_H265_NEIGHBOR_INFO_BUF_SIZE *
++		DIV_ROUND_UP(ctx->src_fmt.width, CEDRUS_MAX_WIDTH) *
++		DIV_ROUND_UP(ctx->src_fmt.height, CEDRUS_MAX_HEIGHT);
++
+ 	/* Buffer is never accessed by CPU, so we can skip kernel mapping. */
+ 	ctx->codec.h265.neighbor_info_buf =
+-		dma_alloc_attrs(dev->dev, CEDRUS_H265_NEIGHBOR_INFO_BUF_SIZE,
++		dma_alloc_attrs(dev->dev, ctx->codec.h265.neighbor_info_buf_size,
+ 				&ctx->codec.h265.neighbor_info_buf_addr,
+ 				GFP_KERNEL, DMA_ATTR_NO_KERNEL_MAPPING);
+ 	if (!ctx->codec.h265.neighbor_info_buf)
+@@ -861,7 +878,7 @@
+ 				   &ctx->codec.h265.entry_points_buf_addr,
+ 				   GFP_KERNEL);
+ 	if (!ctx->codec.h265.entry_points_buf) {
+-		dma_free_attrs(dev->dev, CEDRUS_H265_NEIGHBOR_INFO_BUF_SIZE,
++		dma_free_attrs(dev->dev, ctx->codec.h265.neighbor_info_buf_size,
+ 			       ctx->codec.h265.neighbor_info_buf,
+ 			       ctx->codec.h265.neighbor_info_buf_addr,
+ 			       DMA_ATTR_NO_KERNEL_MAPPING);
+@@ -899,7 +916,7 @@
+ 		}
+ 	}
+ 
+-	dma_free_attrs(dev->dev, CEDRUS_H265_NEIGHBOR_INFO_BUF_SIZE,
++	dma_free_attrs(dev->dev, ctx->codec.h265.neighbor_info_buf_size,
+ 		       ctx->codec.h265.neighbor_info_buf,
+ 		       ctx->codec.h265.neighbor_info_buf_addr,
+ 		       DMA_ATTR_NO_KERNEL_MAPPING);
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+@@ -79,7 +79,7 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	if (ctx->src_fmt.width == 4096)
++	if (ctx->src_fmt.width >= 4096)
+ 		reg |= VE_MODE_PIC_WIDTH_IS_4096;
+ 	if (ctx->src_fmt.width > 2048)
+ 		reg |= VE_MODE_PIC_WIDTH_MORE_2048;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_video.c b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_video.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+@@ -179,8 +179,11 @@
+ 	return &cedrus_formats[i];
+ }
+ 
+-void cedrus_prepare_format(struct v4l2_pix_format *pix_fmt)
+-{
++void cedrus_prepare_format(struct cedrus_ctx *ctx,
++			   struct v4l2_pix_format *pix_fmt, u32 source_format)
++{
++	unsigned int max_width = CEDRUS_MAX_WIDTH;
++	unsigned int max_height = CEDRUS_MAX_HEIGHT;
+ 	unsigned int width = pix_fmt->width;
+ 	unsigned int height = pix_fmt->height;
+ 	unsigned int sizeimage = pix_fmt->sizeimage;
+@@ -188,9 +191,15 @@
+ 
+ 	pix_fmt->field = V4L2_FIELD_NONE;
+ 
++	if (source_format == V4L2_PIX_FMT_HEVC_SLICE &&
++	    cedrus_is_capable(ctx, CEDRUS_CAPABILITY_H265_8K_DEC)) {
++		max_width = CEDRUS_H265_8K_MAX_WIDTH;
++		max_height = CEDRUS_H265_8K_MAX_HEIGHT;
++	}
++
+ 	/* Limit to hardware min/max. */
+-	width = clamp(width, CEDRUS_MIN_WIDTH, CEDRUS_MAX_WIDTH);
+-	height = clamp(height, CEDRUS_MIN_HEIGHT, CEDRUS_MAX_HEIGHT);
++	width = clamp(width, CEDRUS_MIN_WIDTH, max_width);
++	height = clamp(height, CEDRUS_MIN_HEIGHT, max_height);
+ 
+ 	switch (pix_fmt->pixelformat) {
+ 	case V4L2_PIX_FMT_MPEG2_SLICE:
+@@ -374,7 +383,7 @@
+ 	pix_fmt->pixelformat = fmt->pixelformat;
+ 	pix_fmt->width = ctx->src_fmt.width;
+ 	pix_fmt->height = ctx->src_fmt.height;
+-	cedrus_prepare_format(pix_fmt);
++	cedrus_prepare_format(ctx, pix_fmt, ctx->src_fmt.pixelformat);
+ 
+ 	/*
+ 	 * The VP9 hardware requires the chroma plane offset (which equals
+@@ -420,7 +429,7 @@
+ 		pix_fmt->width = min(pix_fmt->width, 2048U);
+ 		pix_fmt->height = min(pix_fmt->height, 2048U);
+ 	}
+-	cedrus_prepare_format(pix_fmt);
++	cedrus_prepare_format(ctx, pix_fmt, pix_fmt->pixelformat);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_video.h b/drivers/staging/media/sunxi/cedrus/cedrus_video.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_video.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_video.h
+@@ -28,12 +28,15 @@
+ #define CEDRUS_MIN_HEIGHT	16U
+ #define CEDRUS_MAX_WIDTH	4096U
+ #define CEDRUS_MAX_HEIGHT	2304U
++#define CEDRUS_H265_8K_MAX_WIDTH	7680U
++#define CEDRUS_H265_8K_MAX_HEIGHT	4320U
+ 
+ extern const struct v4l2_ioctl_ops cedrus_ioctl_ops;
+ 
+ int cedrus_queue_init(void *priv, struct vb2_queue *src_vq,
+ 		      struct vb2_queue *dst_vq);
+-void cedrus_prepare_format(struct v4l2_pix_format *pix_fmt);
++void cedrus_prepare_format(struct cedrus_ctx *ctx,
++			   struct v4l2_pix_format *pix_fmt, u32 source_format);
+ void cedrus_reset_cap_format(struct cedrus_ctx *ctx);
+ void cedrus_reset_out_format(struct cedrus_ctx *ctx);
+ 
+-- 
+Armbian
