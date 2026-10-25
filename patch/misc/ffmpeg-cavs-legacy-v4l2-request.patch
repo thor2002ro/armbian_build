@@ -1,0 +1,171 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: avcodec: prepare implicit legacy CAVS slices
+
+Prepare revision-0 pictures for experimental V4L2 Request decoding.
+Preserve picture values and unaligned macroblock data.
+Use canonical sequence fields for prepared slices.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/libavcodec/cavs.h b/libavcodec/cavs.h
+--- a/libavcodec/cavs.h
++++ b/libavcodec/cavs.h
+@@ -196,6 +196,7 @@
+     int quant_index, quant_model, quant_param[6];
+     int chroma_qp_delta_cb, chroma_qp_delta_cr, aec;
+     int hw_failed;
++    int hw_legacy_slice;
+     AVFrame *sequence_output, *sequence_output_next;
+     int progressive;
+     int pic_structure;
+diff --git a/libavcodec/cavsdec.c b/libavcodec/cavsdec.c
+--- a/libavcodec/cavsdec.c
++++ b/libavcodec/cavsdec.c
+@@ -40,6 +40,7 @@
+ #include "decode.h"
+ #include "mathops.h"
+ #include "mpeg12data.h"
++#include "put_bits.h"
+ #include "startcode.h"
+ 
+ static const uint8_t mv_scan[4] = {
+@@ -1002,6 +1003,53 @@
+     return 0;
+ }
+ 
++static int cavs_legacy_slice(AVSContext *h, const uint8_t *buffer, int size,
++                            uint8_t **slice)
++{
++    GetBitContext input;
++    PutBitContext output;
++    int offset = get_bits_count(&h->gb);
++    int extra = (!h->pic_qp_fixed ? 7 : 0) +
++                (h->cur.f->pict_type != AV_PICTURE_TYPE_I);
++    int bits, bytes, ret;
++    uint8_t *data;
++
++    *slice = NULL;
++    if (!h->cavs_tv_compat || h->stream_revision || h->profile != 0x20 ||
++        !h->progressive || !h->pic_structure)
++        return AVERROR_PATCHWELCOME;
++    if (size < 0 || size > (INT_MAX - 64) / 8 || offset < 0 || offset >= size * 8)
++        return AVERROR_INVALIDDATA;
++    bits = size * 8 - offset;
++    bytes = (32 + extra + bits + 7) / 8;
++    data = av_mallocz(bytes + AV_INPUT_BUFFER_PADDING_SIZE);
++    if (!data)
++        return AVERROR(ENOMEM);
++    ret = init_get_bits8(&input, buffer, size);
++    if (ret < 0) {
++        av_free(data);
++        return ret;
++    }
++    skip_bits_long(&input, offset);
++    init_put_bits(&output, data, bytes);
++    put_bits32(&output, 0x00000100);
++    if (!h->pic_qp_fixed) {
++        put_bits(&output, 1, h->qp_fixed);
++        put_bits(&output, 6, h->qp);
++    }
++    if (h->cur.f->pict_type != AV_PICTURE_TYPE_I)
++        put_bits(&output, 1, 0);
++    while (bits >= 16) {
++        put_bits(&output, 16, get_bits(&input, 16));
++        bits -= 16;
++    }
++    if (bits)
++        put_bits(&output, bits, get_bits(&input, bits));
++    flush_put_bits(&output);
++    *slice = data;
++    return bytes;
++}
++
+ static int cavs_parse_picture_header(AVSContext *h)
+ {
+     skip_bits(&h->gb, 16);//bbv_dwlay
+@@ -1123,6 +1171,7 @@
+ 
+     av_frame_unref(h->cur.f);
+ 
++    h->hw_legacy_slice = 0;
+     ret = cavs_parse_picture_header(h);
+     if (ret < 0)
+         return ret;
+@@ -1156,30 +1205,59 @@
+ 
+     if (h->avctx->hwaccel) {
+         const FFHWAccel *hw = ffhwaccel(h->avctx->hwaccel);
++        const uint8_t *slice;
++        uint8_t *legacy_slice = NULL;
++        int slice_size;
+         int first = -1, last = size;
+         for (int i = (get_bits_count(&h->gb) + 7) / 8; i <= size - 4; i++) {
+             if (buf[i] || buf[i + 1] || buf[i + 2] != 1)
+                 continue;
+             if (buf[i + 3] <= 0xaf && first < 0)
+                 first = i;
+-            else if (first >= 0 && (buf[i + 3] == 0xb0 || buf[i + 3] == 0xb1 ||
+-                                   buf[i + 3] == 0xb3 || buf[i + 3] == 0xb6)) {
++            else if (buf[i + 3] == 0xb0 || buf[i + 3] == 0xb1 ||
++                     buf[i + 3] == 0xb3 || buf[i + 3] == 0xb6) {
+                 last = i;
+                 break;
+             }
+         }
+-        if (first < 0)
+-            return AVERROR_INVALIDDATA;
++        if (first >= 0 && !h->stream_revision && h->cavs_tv_compat) {
++            int offset = get_bits_count(&h->gb);
++            int align = (-offset) & 7;
++
++            if (!align && show_bits(&h->gb, 8) == 0x80)
++                align = 8;
++            if (first != (offset + align) / 8) {
++                av_log(h->avctx, AV_LOG_ERROR,
++                       "Legacy AVS pictures with an implicit first slice and additional slices are unsupported.\n");
++                return AVERROR_PATCHWELCOME;
++            }
++        }
++        if (first < 0) {
++            ret = cavs_legacy_slice(h, buf, last, &legacy_slice);
++            if (ret < 0) {
++                av_log(h->avctx, AV_LOG_ERROR,
++                       "Cannot prepare AVS picture without a slice start code (revision %d).\n",
++                       h->stream_revision);
++                return ret;
++            }
++            slice = legacy_slice;
++            slice_size = ret;
++            h->hw_legacy_slice = 1;
++        } else {
++            slice = buf + first;
++            slice_size = last - first;
++        }
+         if (!h->progressive)
+             h->cur.f->flags |= AV_FRAME_FLAG_INTERLACED;
+         if (h->top_field_first)
+             h->cur.f->flags |= AV_FRAME_FLAG_TOP_FIELD_FIRST;
+         h->cur.f->repeat_pict = h->repeat_first_field;
+-        ret = hw->start_frame(h->avctx, NULL, buf + first, last - first);
++        ret = hw->start_frame(h->avctx, NULL, slice, slice_size);
+         if (ret >= 0)
+-            ret = hw->decode_slice(h->avctx, buf + first, last - first);
++            ret = hw->decode_slice(h->avctx, slice, slice_size);
+         if (ret >= 0)
+             ret = hw->end_frame(h->avctx);
++        av_free(legacy_slice);
+         if (ret < 0) {
+             ff_hwaccel_uninit(h->avctx);
+             h->hw_failed = ret;
+diff --git a/libavcodec/v4l2_request_cavs.c b/libavcodec/v4l2_request_cavs.c
+--- a/libavcodec/v4l2_request_cavs.c
++++ b/libavcodec/v4l2_request_cavs.c
+@@ -34,7 +34,7 @@
+         .chroma_qp_delta_cr = h->chroma_qp_delta_cr,
+         .alpha_offset = h->alpha_offset, .beta_offset = h->beta_offset,
+     };
+-    if (h->cavs_tv_compat) {
++    if (h->cavs_tv_compat && !h->hw_legacy_slice) {
+         f->flags |= V4L2_CAVS_TV_COMPAT;
+         f->chroma_format = h->chroma_format;
+         f->sample_precision = h->sample_precision;
