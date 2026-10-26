@@ -1,0 +1,661 @@
+Subject: Local: media: cedrus: extend H616/H618 MPEG decoding
+
+Older MPEG and H.263 formats could not submit their parsed picture state to Cedrus.
+
+Add the request state for supported tools and reject unsupported header combinations.
+---
+diff --git a/drivers/media/v4l2-core/v4l2-ioctl.c b/drivers/media/v4l2-core/v4l2-ioctl.c
+--- a/drivers/media/v4l2-core/v4l2-ioctl.c
++++ b/drivers/media/v4l2-core/v4l2-ioctl.c
+@@ -29,6 +29,7 @@
+ #include <media/cavs2-ctrls.h>
+ #include <media/cavs-ctrls.h>
+ #include <media/mpeg4-ctrls.h>
++#include <media/mpeg1-ctrls.h>
+ #include <media/videobuf2-v4l2.h>
+ #include <media/v4l2-mc.h>
+ #include <media/v4l2-mem2mem.h>
+@@ -1511,7 +1512,12 @@
+ 		case V4L2_PIX_FMT_H263:		descr = "H.263"; break;
+ 		case V4L2_PIX_FMT_MPEG1:	descr = "MPEG-1 ES"; break;
+ 		case V4L2_PIX_FMT_MPEG2:	descr = "MPEG-2 ES"; break;
+-		case V4L2_PIX_FMT_MPEG2_SLICE:	descr = "MPEG-2 Parsed Slice Data"; break;
++		case V4L2_PIX_FMT_MPEG1_SLICE:
++			descr = "MPEG-1 Parsed Slice Data";
++			break;
++		case V4L2_PIX_FMT_MPEG2_SLICE:
++			descr = "MPEG-2 Parsed Slice Data";
++			break;
+ 		case V4L2_PIX_FMT_MPEG4:	descr = "MPEG-4 Part 2 ES"; break;
+ 		case V4L2_PIX_FMT_XVID:		descr = "Xvid"; break;
+ 		case V4L2_PIX_FMT_VC1_ANNEX_G:	descr = "VC-1 (SMPTE 412M Annex G)"; break;
+@@ -1523,8 +1529,15 @@
+ 		case V4L2_PIX_FMT_VP8_FRAME:    descr = "VP8 Frame"; break;
+ 		case V4L2_PIX_FMT_VP9:		descr = "VP9"; break;
+ 		case V4L2_PIX_FMT_MPEG4_FRAME: descr = "MPEG4 Parsed Frame"; break;
+-	case V4L2_PIX_FMT_H263_FRAME: descr = "H263 Parsed Frame"; break;
+-	case V4L2_PIX_FMT_CAVS_FRAME: descr = "CAVS Parsed Frame"; break;
++		case V4L2_PIX_FMT_SORENSON_FRAME:
++			descr = "Sorenson Parsed Frame";
++			break;
++		case V4L2_PIX_FMT_H263_FRAME:
++			descr = "H263 Parsed Frame";
++			break;
++		case V4L2_PIX_FMT_CAVS_FRAME:
++			descr = "CAVS Parsed Frame";
++			break;
+ 		case V4L2_PIX_FMT_CAVS2_FRAME: descr = "CAVS2 Parsed Frame"; break;
+ 		case V4L2_PIX_FMT_VP9_FRAME:    descr = "VP9 Frame"; break;
+ 		case V4L2_PIX_FMT_HEVC:		descr = "HEVC"; break; /* aka H.265 */
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.c b/drivers/staging/media/sunxi/cedrus/cedrus.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.c
+@@ -142,6 +142,16 @@
+ static const struct cedrus_control cedrus_controls[] = {
+ 	{
+ 		.cfg = {
++			.id = V4L2_CID_STATELESS_MPEG1_FLAGS,
++			.name = "MPEG1 Full-pel Flags",
++			.type = V4L2_CTRL_TYPE_U8,
++			.min = 0, .max = 1, .step = 1,
++			.dims = { sizeof(struct v4l2_ctrl_mpeg1_flags) },
++		},
++		.capabilities = CEDRUS_CAPABILITY_MPEG1_DEC,
++	},
++	{
++		.cfg = {
+ 			.id = V4L2_CID_STATELESS_MPEG4_FRAME,
+ 			.name = "MPEG4 Frame Parameters",
+ 			.type = V4L2_CTRL_TYPE_U8,
+@@ -790,7 +800,8 @@
+ };
+ 
+ static const struct cedrus_variant sun50i_h616_cedrus_variant = {
+-	.capabilities	= CEDRUS_CAPABILITY_MPEG4_DEC |
++	.capabilities	= CEDRUS_CAPABILITY_MPEG1_DEC |
++			  CEDRUS_CAPABILITY_MPEG4_DEC |
+ 			  CEDRUS_CAPABILITY_H264_ENC |
+ 			  CEDRUS_CAPABILITY_JPEG_DEC |
+ 			  CEDRUS_CAPABILITY_UNTILED |
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.h b/drivers/staging/media/sunxi/cedrus/cedrus.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -20,6 +20,7 @@
+ #include <media/cavs2-ctrls.h>
+ #include <media/cavs-ctrls.h>
+ #include <media/mpeg4-ctrls.h>
++#include <media/mpeg1-ctrls.h>
+ #include <media/v4l2-device.h>
+ #include <media/v4l2-mem2mem.h>
+ #include <media/videobuf2-v4l2.h>
+@@ -47,6 +48,7 @@
+ #define CEDRUS_CAPABILITY_CAVS2_DEC	BIT(13)
+ #define CEDRUS_CAPABILITY_CAVS_DEC BIT(14)
+ #define CEDRUS_CAPABILITY_MPEG4_DEC BIT(15)
++#define CEDRUS_CAPABILITY_MPEG1_DEC BIT(16)
+ 
+ enum cedrus_irq_status {
+ 	CEDRUS_IRQ_NONE,
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_dec.c b/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
+@@ -46,6 +46,7 @@
+ 		v4l2_ctrl_request_setup(src_req, &ctx->hdl);
+ 
+ 	switch (ctx->src_fmt.pixelformat) {
++	case V4L2_PIX_FMT_MPEG1_SLICE:
+ 	case V4L2_PIX_FMT_MPEG2_SLICE:
+ 		run.mpeg2.sequence = cedrus_find_control_data(ctx,
+ 			V4L2_CID_STATELESS_MPEG2_SEQUENCE);
+@@ -100,6 +101,7 @@
+ 		break;
+ 
+ 	case V4L2_PIX_FMT_MPEG4_FRAME:
++	case V4L2_PIX_FMT_SORENSON_FRAME:
+ 	case V4L2_PIX_FMT_H263_FRAME:
+ 		run.mpeg4.frame = cedrus_find_control_data(ctx, V4L2_CID_STATELESS_MPEG4_FRAME);
+ 		break;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+@@ -18,6 +18,7 @@
+ #include <linux/of_reserved_mem.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/interrupt.h>
++#include <linux/iopoll.h>
+ #include <linux/jiffies.h>
+ #include <linux/clk.h>
+ #include <linux/pm_runtime.h>
+@@ -100,7 +101,9 @@
+ 	switch (ctx->src_fmt.pixelformat) {
+ 	/* MPEG2 and JPEG both use the same decoding mode bit. */
+ 	case V4L2_PIX_FMT_MPEG4_FRAME:
++	case V4L2_PIX_FMT_SORENSON_FRAME:
+ 	case V4L2_PIX_FMT_H263_FRAME:
++	case V4L2_PIX_FMT_MPEG1_SLICE:
+ 	case V4L2_PIX_FMT_MPEG2_SLICE:
+ 	case V4L2_PIX_FMT_JPEG:
+ 		reg |= VE_MODE_DEC_MPEG;
+@@ -262,6 +265,16 @@
+ 	cedrus_write(dev, VE_DEC_SECOND_OUT_CHROMA_ADDR, chroma >> 8);
+ }
+ 
++int cedrus_h616_wait_idle(struct cedrus_ctx *ctx)
++{
++	u32 status;
++
++	if (!cedrus_is_capable(ctx, CEDRUS_CAPABILITY_MPEG1_DEC))
++		return 0;
++	return readl_poll_timeout_atomic(ctx->dev->base + 0x04, status,
++					status & BIT(9), 1, 1000);
++}
++
+ void cedrus_watchdog_start(struct cedrus_dev *dev)
+ {
+ 	struct cedrus_ctx *ctx = v4l2_m2m_get_curr_priv(dev->m2m_dev);
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_hw.h b/drivers/staging/media/sunxi/cedrus/cedrus_hw.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.h
+@@ -34,5 +34,6 @@
+ 
+ void cedrus_watchdog(struct work_struct *work);
+ void cedrus_watchdog_start(struct cedrus_dev *dev);
++int cedrus_h616_wait_idle(struct cedrus_ctx *ctx);
+ 
+ #endif
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_mpeg2.c b/drivers/staging/media/sunxi/cedrus/cedrus_mpeg2.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_mpeg2.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_mpeg2.c
+@@ -7,6 +7,7 @@
+  * Copyright (C) 2018 Bootlin
+  */
+ 
++#include <linux/reset.h>
+ #include <media/videobuf2-dma-contig.h>
+ 
+ #include "cedrus.h"
+@@ -26,9 +27,15 @@
+ 
+ 	if (reg & VE_DEC_MPEG_STATUS_CHECK_ERROR ||
+ 	    !(reg & VE_DEC_MPEG_STATUS_SUCCESS))
+-		return CEDRUS_IRQ_ERROR;
+-
++		goto error;
++
++	if (cedrus_h616_wait_idle(ctx))
++		goto error;
+ 	return CEDRUS_IRQ_OK;
++error:
++	if (cedrus_is_capable(ctx, CEDRUS_CAPABILITY_MPEG1_DEC))
++		reset_control_reset(dev->rstc);
++	return CEDRUS_IRQ_ERROR;
+ }
+ 
+ static void cedrus_mpeg2_irq_clear(struct cedrus_ctx *ctx)
+@@ -46,6 +53,29 @@
+ 	reg &= ~VE_DEC_MPEG_CTRL_IRQ_MASK;
+ 
+ 	cedrus_write(dev, VE_DEC_MPEG_CTRL, reg);
++}
++
++static u32 cedrus_mpeg2_output(struct cedrus_ctx *ctx, dma_addr_t luma,
++			       dma_addr_t chroma)
++{
++	struct cedrus_dev *dev = ctx->dev;
++	u32 format;
++
++	if (!cedrus_is_capable(ctx, CEDRUS_CAPABILITY_MPEG1_DEC))
++		return 0;
++	cedrus_write(dev, VE_DEC_MPEG_ROT_LUMA, luma);
++	cedrus_write(dev, VE_DEC_MPEG_ROT_CHROMA, chroma);
++	cedrus_write(dev, VE_DEC_MPEG_SD_ROT_DBLK_CTL, 0);
++	format = cedrus_read(dev, VE_PRIMARY_OUT_FMT);
++	cedrus_write(dev, VE_PRIMARY_OUT_FMT,
++		     (format & ~GENMASK(3, 0)) | ((format >> 4) & 0xf));
++	if (ctx->dst_fmt.pixelformat == V4L2_PIX_FMT_NV12_32L32)
++		cedrus_write(dev, VE_CHROMA_BUF_LEN, VE_SECONDARY_OUT_FMT_TILED_32_NV12);
++	else
++		cedrus_write(dev, VE_CHROMA_BUF_LEN,
++			VE_SECONDARY_OUT_FMT_EXT | VE_CHROMA_WIDTH_ALIGN_8 |
++			VE_CHROMA_BUF_LEN_SDRT(ctx->dst_fmt.bytesperline * ctx->dst_fmt.height / 4));
++	return VE_DEC_MPEG_CTRL_ROTATE_SCALE_OUT_EN;
+ }
+ 
+ static int cedrus_mpeg2_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+@@ -53,20 +83,36 @@
+ 	const struct v4l2_ctrl_mpeg2_sequence *seq;
+ 	const struct v4l2_ctrl_mpeg2_picture *pic;
+ 	const struct v4l2_ctrl_mpeg2_quantisation *quantisation;
++	const struct v4l2_ctrl_mpeg1_flags *mpeg1 = NULL;
+ 	dma_addr_t src_buf_addr, dst_luma_addr, dst_chroma_addr;
+ 	struct cedrus_dev *dev = ctx->dev;
+ 	struct vb2_queue *vq;
+ 	const u8 *matrix;
+ 	unsigned int i;
+ 	u32 reg;
++	int ret;
+ 
+ 	seq = run->mpeg2.sequence;
+ 	pic = run->mpeg2.picture;
+ 
+ 	quantisation = run->mpeg2.quantisation;
++	if (!seq || !pic || !quantisation || seq->chroma_format != 1 ||
++	    !seq->horizontal_size || !seq->vertical_size ||
++	    seq->horizontal_size > ctx->src_fmt.width ||
++	    seq->vertical_size > ctx->src_fmt.height)
++		return -EINVAL;
++	if (ctx->src_fmt.pixelformat == V4L2_PIX_FMT_MPEG1_SLICE) {
++		mpeg1 = cedrus_find_control_data(
++			ctx, V4L2_CID_STATELESS_MPEG1_FLAGS);
++		if (!mpeg1 || mpeg1->full_pel_forward > 1 ||
++		    mpeg1->full_pel_backward > 1)
++			return -EINVAL;
++	}
+ 
+ 	/* Activate MPEG engine. */
+-	cedrus_engine_enable(ctx);
++	ret = cedrus_engine_enable(ctx);
++	if (ret)
++		return ret;
+ 
+ 	/* Set intra quantisation matrix. */
+ 	matrix = quantisation->intra_quantiser_matrix;
+@@ -101,8 +147,10 @@
+ 	reg |= VE_DEC_MPEG_MP12HDR_Q_SCALE_TYPE(pic->flags & V4L2_MPEG2_PIC_FLAG_Q_SCALE_TYPE);
+ 	reg |= VE_DEC_MPEG_MP12HDR_INTRA_VLC_FORMAT(pic->flags & V4L2_MPEG2_PIC_FLAG_INTRA_VLC);
+ 	reg |= VE_DEC_MPEG_MP12HDR_ALTERNATE_SCAN(pic->flags & V4L2_MPEG2_PIC_FLAG_ALT_SCAN);
+-	reg |= VE_DEC_MPEG_MP12HDR_FULL_PEL_FORWARD_VECTOR(0);
+-	reg |= VE_DEC_MPEG_MP12HDR_FULL_PEL_BACKWARD_VECTOR(0);
++	reg |= VE_DEC_MPEG_MP12HDR_FULL_PEL_FORWARD_VECTOR(
++		mpeg1 && mpeg1->full_pel_forward);
++	reg |= VE_DEC_MPEG_MP12HDR_FULL_PEL_BACKWARD_VECTOR(
++		mpeg1 && mpeg1->full_pel_backward);
+ 
+ 	cedrus_write(dev, VE_DEC_MPEG_MP12HDR, reg);
+ 
+@@ -171,6 +219,7 @@
+ 
+ 	reg = VE_DEC_MPEG_CTRL_IRQ_MASK | VE_DEC_MPEG_CTRL_MC_NO_WRITEBACK |
+ 	      VE_DEC_MPEG_CTRL_MC_CACHE_EN;
++	reg |= cedrus_mpeg2_output(ctx, dst_luma_addr, dst_chroma_addr);
+ 
+ 	cedrus_write(dev, VE_DEC_MPEG_CTRL, reg);
+ 
+@@ -183,7 +232,10 @@
+ 	u32 reg;
+ 
+ 	/* Trigger MPEG engine. */
+-	reg = VE_DEC_MPEG_TRIGGER_HW_MPEG_VLD | VE_DEC_MPEG_TRIGGER_MPEG2 |
++	reg = VE_DEC_MPEG_TRIGGER_HW_MPEG_VLD |
++	      (ctx->src_fmt.pixelformat == V4L2_PIX_FMT_MPEG1_SLICE ?
++		       VE_DEC_MPEG_TRIGGER_MPEG1 :
++		       VE_DEC_MPEG_TRIGGER_MPEG2) |
+ 	      VE_DEC_MPEG_TRIGGER_MB_BOUNDARY;
+ 
+ 	cedrus_write(dev, VE_DEC_MPEG_TRIGGER, reg);
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_mpeg4.c b/drivers/staging/media/sunxi/cedrus/cedrus_mpeg4.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_mpeg4.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_mpeg4.c
+@@ -16,20 +16,56 @@
+ {
+ 	unsigned int i, total;
+ 
+-	if (!f || f->width < 16 || f->width > 4096 ||
+-	    f->height < 16 || f->height > 4096 || f->picture_type > 2 ||
+-	    f->forward_code < 1 || f->forward_code > 7 ||
+-	    f->backward_code < 1 || f->backward_code > 7 || f->backward_type > 1 ||
+-	    (f->flags & ~31U) || f->reserved[0] || f->reserved[1] ||
++	if (!f || f->width < 16 || f->width > 4096 || f->height < 16 ||
++	    f->height > 4096 || f->picture_type > 3 || f->forward_code < 1 ||
++	    f->forward_code > 7 || f->backward_code < 1 ||
++	    f->backward_code > 7 || f->backward_type > 3 || (f->flags & ~2047U) ||
++	    f->reserved ||
++	    f->sorenson_version > !!(f->flags & V4L2_MPEG4_SORENSON) ||
+ 	    !f->bitstream_size || f->bitstream_size > SZ_16M ||
+ 	    !f->num_packets || f->num_packets > V4L2_MPEG4_MAX_PACKETS ||
+ 	    (f->picture_type && !f->reference_ts[0]) ||
+-	    (f->picture_type == 2 && (!f->reference_ts[1] || !f->trd || f->trb >= f->trd)))
++	    (f->picture_type == 2 &&
++	     (!f->reference_ts[1] || !f->trd || f->trb >= f->trd)))
+ 		return -EINVAL;
+ 	if ((f->flags & V4L2_MPEG4_SHORT_HEADER) &&
+ 	    (f->picture_type == 2 ||
+-	     (f->flags & (V4L2_MPEG4_MPEG_QUANT | V4L2_MPEG4_QUARTER_SAMPLE))))
+-		return -EINVAL;
++	     (f->flags & (V4L2_MPEG4_MPEG_QUANT | V4L2_MPEG4_QUARTER_SAMPLE |
++			 V4L2_MPEG4_INTERLACED))))
++		return -EINVAL;
++	if ((f->flags & V4L2_MPEG4_H263_AIC) &&
++	    (!(f->flags & V4L2_MPEG4_SHORT_HEADER) || f->picture_type ||
++	     (f->flags & V4L2_MPEG4_SORENSON)))
++		return -EINVAL;
++	if ((f->flags & V4L2_MPEG4_SORENSON) &&
++	    !(f->flags & V4L2_MPEG4_SHORT_HEADER))
++		return -EINVAL;
++	if (!(f->flags & V4L2_MPEG4_INTERLACED) &&
++	    ((f->flags & (V4L2_MPEG4_TOP_FIELD_FIRST | V4L2_MPEG4_ALTERNATE_SCAN)) ||
++	     f->trb_field || f->trd_field))
++		return -EINVAL;
++	if ((f->flags & V4L2_MPEG4_INTERLACED) &&
++	    ((f->picture_type == 2 && (!f->trb_field || f->trb_field >= f->trd_field)) ||
++	     (f->picture_type != 2 && (f->trb_field || f->trd_field))))
++		return -EINVAL;
++	if (!!(f->flags & V4L2_MPEG4_GMC) != (f->picture_type == 3) ||
++	    (f->picture_type == 3 && (f->flags & V4L2_MPEG4_SHORT_HEADER)))
++		return -EINVAL;
++	if (f->flags & V4L2_MPEG4_GMC) {
++		const struct v4l2_mpeg4_sprite *sp = &f->sprite;
++
++		if (sp->accuracy > 3 || sp->points > 3 || sp->shift[0] > 31 ||
++		    sp->shift[1] > 31 || sp->luma[0] < -32768 ||
++		    sp->luma[0] > 32767 || sp->luma[1] < -32768 || sp->luma[1] > 32767)
++			return -EINVAL;
++		for (i = 0; i < 4; i++)
++			if (sp->luma[i + 2] < -65536 || sp->luma[i + 2] > 65535 ||
++			    sp->chroma[i + 2] < -65536 || sp->chroma[i + 2] > 65535 ||
++			    sp->mv[i] < -16384 || sp->mv[i] > 16383)
++				return -EINVAL;
++	} else if (memchr_inv(&f->sprite, 0, sizeof(f->sprite))) {
++		return -EINVAL;
++	}
+ 	total = DIV_ROUND_UP(f->width, 16) * DIV_ROUND_UP(f->height, 16);
+ 	for (i = 0; i < f->num_packets; i++) {
+ 		const struct v4l2_mpeg4_packet *p = &f->packets[i];
+@@ -65,13 +101,22 @@
+ 		 !!(f->flags & V4L2_MPEG4_NO_ROUNDING) << 17 |
+ 		 !!(f->flags & V4L2_MPEG4_MPEG_QUANT) << 24 |
+ 		 !!(f->flags & V4L2_MPEG4_QUARTER_SAMPLE) << 23 |
+-		 !!(f->flags & V4L2_MPEG4_RESYNC_DISABLED) << 22;
++		 !!(f->flags & V4L2_MPEG4_RESYNC_DISABLED) << 22 |
++		 !!(f->flags & V4L2_MPEG4_INTERLACED) << 30 |
++		 !!(f->flags & V4L2_MPEG4_TOP_FIELD_FIRST) << 7 |
++		 !!(f->flags & V4L2_MPEG4_ALTERNATE_SCAN) << 6;
+ 	if (f->picture_type == 2)
+ 		header |= f->backward_type << 28;
++	if (f->picture_type == 3)
++		header |= f->sprite.points << 20 | f->sprite.accuracy << 25;
+ 	if (f->flags & V4L2_MPEG4_SHORT_HEADER) {
+ 		header &= ~GENMASK(19, 18);
+-		header |= BIT(31) | BIT(16) | BIT(22) |
+-			  (f->picture_type ? 2U << 18 : 0);
++		header |= BIT(31) | BIT(16) | BIT(22) | f->picture_type << 18;
++		if (f->flags & V4L2_MPEG4_H263_AIC)
++			header |= BIT(15) | BIT(13) | BIT(12);
++		if (f->flags & V4L2_MPEG4_SORENSON)
++			header |= BIT(15) | BIT(12) |
++				  (u32)f->sorenson_version << 11;
+ 	}
+ 	cedrus_write(dev, MP4_REG(4), header);
+ 	cedrus_write(dev, MP4_REG(0x10), ctx->codec.mpeg4.mb % width << 8 |
+@@ -97,16 +142,16 @@
+ 	if (!(reg & MP4_IRQ_MASK))
+ 		return CEDRUS_IRQ_NONE;
+ 	if ((reg & 6) || !f || !ctx->codec.mpeg4.dst)
+-		return CEDRUS_IRQ_ERROR;
++		goto error;
+ 	if (!(reg & BIT(0))) {
+ 		cedrus_write(dev, MP4_REG(0x1c), reg & MP4_IRQ_MASK);
+ 		return CEDRUS_IRQ_CONTINUE;
+ 	}
+ 	ret = readl_poll_timeout_atomic(dev->base + MP4_REG(0x1c), reg,
+-		!(reg & (VE_DEC_MPEG_STATUS_MC_BUSY | VE_DEC_MPEG_STATUS_ROTATE_BUSY)),
++		!(reg & (GENMASK(13, 8) | VE_DEC_MPEG_STATUS_ROTATE_BUSY)),
+ 		1, 1000);
+ 	if (ret || (reg & 6))
+-		return CEDRUS_IRQ_ERROR;
++		goto error;
+ 	ctx->codec.mpeg4.mb += ctx->codec.mpeg4.count;
+ 	end = ctx->codec.mpeg4.packet + 1 < f->num_packets ?
+ 		f->packets[ctx->codec.mpeg4.packet + 1].first_mb :
+@@ -114,7 +159,7 @@
+ 	if (ctx->codec.mpeg4.mb < end) {
+ 		ctx->codec.mpeg4.offset = cedrus_read(dev, MP4_REG(0x2c));
+ 		if (ctx->codec.mpeg4.offset >= f->bitstream_size * 8)
+-			return CEDRUS_IRQ_ERROR;
++			goto error;
+ 		cedrus_mpeg4_packet(ctx, false);
+ 		return CEDRUS_IRQ_CONTINUE;
+ 	}
+@@ -123,8 +168,13 @@
+ 		cedrus_mpeg4_packet(ctx, true);
+ 		return CEDRUS_IRQ_CONTINUE;
+ 	}
++	if (cedrus_h616_wait_idle(ctx))
++		goto error;
+ 	ctx->codec.mpeg4.dst->codec.mpeg4.valid = true;
+ 	return CEDRUS_IRQ_OK;
++error:
++	reset_control_reset(dev->rstc);
++	return CEDRUS_IRQ_ERROR;
+ }
+ 
+ static void cedrus_mpeg4_irq_clear(struct cedrus_ctx *ctx)
+@@ -192,6 +242,45 @@
+ 	ctx->codec.mpeg4.dst = NULL;
+ }
+ 
++static void cedrus_mpeg4_sprite(struct cedrus_ctx *ctx,
++			       const struct v4l2_ctrl_mpeg4_frame *f)
++{
++	const struct v4l2_mpeg4_sprite *sp = &f->sprite;
++	struct cedrus_dev *dev = ctx->dev;
++	u32 shift = sp->shift[0] | sp->shift[1] << 8;
++	bool wide = false;
++	unsigned int i, bank;
++
++	for (i = 2; i < 6; i++)
++		wide |= sp->luma[i] < -32768 || sp->luma[i] > 32767 ||
++			sp->chroma[i] < -32768 || sp->chroma[i] > 32767;
++	for (bank = 0; bank < 2; bank++) {
++		const s32 *v = bank ? sp->chroma : sp->luma;
++		u32 base = bank ? 0x78 : 0x6c;
++
++		cedrus_write(dev, MP4_REG(base),
++			((u32)(v[2] >> wide) & 0xffff) << 16 |
++			((u32)(v[4] >> wide) & 0xffff));
++		cedrus_write(dev, MP4_REG(base + 4),
++			((u32)(v[3] >> wide) & 0xffff) << 16 |
++			((u32)(v[5] >> wide) & 0xffff));
++		if (wide)
++			shift |= BIT(31) | (v[2] & 1) << (16 + bank * 4) |
++				 (v[4] & 1) << (17 + bank * 4) |
++				 (v[3] & 1) << (18 + bank * 4) |
++				 (v[5] & 1) << (19 + bank * 4);
++	}
++	cedrus_write(dev, MP4_REG(0x68),
++		     ((u32)sp->luma[0] & 0xffff) << 16 | ((u32)sp->luma[1] & 0xffff));
++	cedrus_write(dev, MP4_REG(0x60), sp->chroma[0]);
++	cedrus_write(dev, MP4_REG(0x64), sp->chroma[1]);
++	cedrus_write(dev, MP4_REG(0x74), shift);
++	cedrus_write(dev, MP4_REG(0xa8),
++		     ((u32)sp->mv[0] & 0x7fff) << 16 | ((u32)sp->mv[1] & 0x7fff));
++	cedrus_write(dev, MP4_REG(0xac),
++		     ((u32)sp->mv[2] & 0x7fff) << 16 | ((u32)sp->mv[3] & 0x7fff));
++}
++
+ static int cedrus_mpeg4_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ {
+ 	const struct v4l2_ctrl_mpeg4_frame *f = run->mpeg4.frame;
+@@ -209,9 +298,13 @@
+ 	vb2_to_cedrus_buffer(dst)->codec.mpeg4.valid = false;
+ 	if (ret)
+ 		return ret;
+-	if (f->width != ctx->src_fmt.width || f->height != ctx->src_fmt.height ||
++	if (f->width != ctx->src_fmt.width ||
++	    f->height != ctx->src_fmt.height ||
+ 	    !!(f->flags & V4L2_MPEG4_SHORT_HEADER) !=
+-	    (ctx->src_fmt.pixelformat == V4L2_PIX_FMT_H263_FRAME) ||
++		    (ctx->src_fmt.pixelformat == V4L2_PIX_FMT_H263_FRAME ||
++		     ctx->src_fmt.pixelformat == V4L2_PIX_FMT_SORENSON_FRAME) ||
++	    !!(f->flags & V4L2_MPEG4_SORENSON) !=
++		    (ctx->src_fmt.pixelformat == V4L2_PIX_FMT_SORENSON_FRAME) ||
+ 	    f->bitstream_size > vb2_get_plane_payload(src, 0) ||
+ 	    ALIGN(f->bitstream_size, 4) > capacity || !capacity ||
+ 	    base + capacity - 1 > U32_MAX || !ctx->codec.mpeg4.aux ||
+@@ -248,7 +341,9 @@
+ 		     (width & 0xff) << 8 | (height & 0xff));
+ 	cedrus_write(dev, MP4_REG(0xc), (ALIGN(f->width, 16) & 0xfff) << 16 |
+ 		     (ALIGN(f->height, 16) & 0xfff));
+-	cedrus_write(dev, MP4_REG(0x24), f->trd | f->trb << 16);
++	cedrus_write(dev, MP4_REG(0x24),
++		     f->picture_type == 2 ? f->trd | f->trb << 16 : 0);
++	cedrus_write(dev, MP4_REG(0x20), f->trb_field << 8 | f->trd_field);
+ 	cedrus_write(dev, MP4_REG(0x38), ctx->codec.mpeg4.aux_dma);
+ 	cedrus_write(dev, MP4_REG(0x3c), ctx->codec.mpeg4.dc_dma);
+ 	cedrus_write(dev, MP4_REG(0x44), ctx->codec.mpeg4.nc_dma);
+@@ -266,17 +361,18 @@
+ 			cedrus_write(dev, MP4_REG(0x80), BIT(14) | i << 8 | f->intra_quant[i]);
+ 			cedrus_write(dev, MP4_REG(0x80), i << 8 | f->inter_quant[i]);
+ 		}
++	if (f->flags & V4L2_MPEG4_GMC)
++		cedrus_mpeg4_sprite(ctx, f);
+ 	control = BIT(31) | BIT(19) | BIT(14) | BIT(8) | BIT(7) |
+ 		  VE_DEC_MPEG_CTRL_IRQ_MASK;
+ 	if (f->picture_type == 1)
+ 		control |= BIT(12);
+-	if (f->flags & V4L2_MPEG4_QUARTER_SAMPLE) {
+-		if (f->picture_type == 1)
+-			control |= 0x1a00000;
+-		else if (f->picture_type == 2)
+-			control |= 0x2500000;
+-	}
++	if ((f->flags & V4L2_MPEG4_QUARTER_SAMPLE) && f->picture_type)
++		control |= BIT(20);
+ 	cedrus_write(dev, MP4_REG(0x14), control);
++	run->dst->field = !(f->flags & V4L2_MPEG4_INTERLACED) ? V4L2_FIELD_NONE :
++		(f->flags & V4L2_MPEG4_TOP_FIELD_FIRST) ?
++			V4L2_FIELD_INTERLACED_TB : V4L2_FIELD_INTERLACED_BT;
+ 	*ctx->codec.mpeg4.frame = *f;
+ 	ctx->codec.mpeg4.dst = vb2_to_cedrus_buffer(dst);
+ 	ctx->codec.mpeg4.mb = ctx->codec.mpeg4.packet = 0;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_video.c b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_video.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+@@ -30,6 +30,12 @@
+ #define CEDRUS_DECODE_DST	BIT(1)
+ 
+ static struct cedrus_format cedrus_formats[] = {
++	{ .pixelformat = V4L2_PIX_FMT_SORENSON_FRAME,
++	  .directions = CEDRUS_DECODE_SRC,
++	  .capabilities = CEDRUS_CAPABILITY_MPEG4_DEC },
++	{ .pixelformat = V4L2_PIX_FMT_MPEG1_SLICE,
++	  .directions = CEDRUS_DECODE_SRC,
++	  .capabilities = CEDRUS_CAPABILITY_MPEG1_DEC },
+ 	{
+ 		.pixelformat = V4L2_PIX_FMT_MPEG4_FRAME,
+ 		.directions = CEDRUS_DECODE_SRC,
+@@ -181,6 +187,7 @@
+ 
+ 		if ((ctx->src_fmt.pixelformat == V4L2_PIX_FMT_MPEG4_FRAME ||
+ 		     ctx->src_fmt.pixelformat == V4L2_PIX_FMT_H263_FRAME ||
++		     ctx->src_fmt.pixelformat == V4L2_PIX_FMT_SORENSON_FRAME ||
+ 		     ctx->src_fmt.pixelformat == V4L2_PIX_FMT_CAVS_FRAME) &&
+ 		    directions == CEDRUS_DECODE_DST &&
+ 		    fmt->pixelformat != V4L2_PIX_FMT_NV12)
+@@ -246,7 +253,8 @@
+ 	}
+ 
+ 	if (source_format == V4L2_PIX_FMT_MPEG4_FRAME ||
+-	    source_format == V4L2_PIX_FMT_H263_FRAME)
++	    source_format == V4L2_PIX_FMT_H263_FRAME ||
++	    source_format == V4L2_PIX_FMT_SORENSON_FRAME)
+ 		max_width = max_height = 4096;
+ 
+ 	/* Limit to hardware min/max. */
+@@ -258,9 +266,11 @@
+ 
+ 	switch (pix_fmt->pixelformat) {
+ 	case V4L2_PIX_FMT_MPEG4_FRAME:
++	case V4L2_PIX_FMT_SORENSON_FRAME:
+ 	case V4L2_PIX_FMT_H263_FRAME:
+ 	case V4L2_PIX_FMT_CAVS_FRAME:
+ 	case V4L2_PIX_FMT_CAVS2_FRAME:
++	case V4L2_PIX_FMT_MPEG1_SLICE:
+ 	case V4L2_PIX_FMT_MPEG2_SLICE:
+ 	case V4L2_PIX_FMT_H264_SLICE:
+ 	case V4L2_PIX_FMT_HEVC_SLICE:
+@@ -553,6 +563,7 @@
+ 
+ 	switch (ctx->src_fmt.pixelformat) {
+ 	case V4L2_PIX_FMT_MPEG4_FRAME:
++	case V4L2_PIX_FMT_SORENSON_FRAME:
+ 	case V4L2_PIX_FMT_H263_FRAME:
+ 		ctx->bit_depth = 8;
+ 		ctx->current_codec = &cedrus_dec_ops_mpeg4;
+@@ -563,6 +574,7 @@
+ 	case V4L2_PIX_FMT_CAVS2_FRAME:
+ 		ctx->current_codec = &cedrus_dec_ops_cavs2;
+ 		break;
++	case V4L2_PIX_FMT_MPEG1_SLICE:
+ 	case V4L2_PIX_FMT_MPEG2_SLICE:
+ 		ctx->current_codec = &cedrus_dec_ops_mpeg2;
+ 		break;
+diff --git a/include/media/mpeg1-ctrls.h b/include/media/mpeg1-ctrls.h
+new file mode 100644
+--- /dev/null
++++ b/include/media/mpeg1-ctrls.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef _MPEG1_CTRLS_H_
++#define _MPEG1_CTRLS_H_
++#include <linux/videodev2.h>
++#define V4L2_PIX_FMT_MPEG1_SLICE v4l2_fourcc('M', 'G', '1', 'S')
++#define V4L2_CID_STATELESS_MPEG1_FLAGS (V4L2_CID_CODEC_STATELESS_BASE + 604)
++struct v4l2_ctrl_mpeg1_flags {
++	__u8 full_pel_forward;
++	__u8 full_pel_backward;
++};
++#endif
+diff --git a/include/media/mpeg4-ctrls.h b/include/media/mpeg4-ctrls.h
+--- a/include/media/mpeg4-ctrls.h
++++ b/include/media/mpeg4-ctrls.h
+@@ -7,6 +7,7 @@
+ 
+ #define V4L2_PIX_FMT_MPEG4_FRAME v4l2_fourcc('M', 'P', '4', 'F')
+ #define V4L2_PIX_FMT_H263_FRAME v4l2_fourcc('H', '2', '6', 'F')
++#define V4L2_PIX_FMT_SORENSON_FRAME v4l2_fourcc('S', 'P', 'R', 'F')
+ #define V4L2_CID_STATELESS_MPEG4_FRAME (V4L2_CID_CODEC_STATELESS_BASE + 602)
+ #define V4L2_MPEG4_MAX_PACKETS 512
+ #define V4L2_MPEG4_SHORT_HEADER (1U << 0)
+@@ -14,12 +15,24 @@
+ #define V4L2_MPEG4_QUARTER_SAMPLE (1U << 2)
+ #define V4L2_MPEG4_NO_ROUNDING (1U << 3)
+ #define V4L2_MPEG4_RESYNC_DISABLED (1U << 4)
++#define V4L2_MPEG4_SORENSON (1U << 5)
++#define V4L2_MPEG4_INTERLACED (1U << 6)
++#define V4L2_MPEG4_TOP_FIELD_FIRST (1U << 7)
++#define V4L2_MPEG4_ALTERNATE_SCAN (1U << 8)
++#define V4L2_MPEG4_GMC (1U << 9)
++#define V4L2_MPEG4_H263_AIC (1U << 10)
+ 
+ struct v4l2_mpeg4_packet {
+ 	__u32 bit_offset;
+ 	__u16 first_mb;
+ 	__u8 quantizer;
+ 	__u8 intra_dc_threshold;
++};
++
++struct v4l2_mpeg4_sprite {
++	__s32 luma[6], chroma[6]; /* X, Y, XX, XY, YX, YY. */
++	__s16 mv[4];
++	__u8 shift[2], accuracy, points;
+ };
+ 
+ struct v4l2_ctrl_mpeg4_frame {
+@@ -29,11 +42,14 @@
+ 	__u16 width, height;
+ 	__u16 trb, trd;
+ 	__u16 num_packets;
+-	__u8 picture_type; /* I=0, P=1, B=2. */
++	__u8 picture_type; /* I=0, P=1, B=2, S=3. */
+ 	__u8 forward_code, backward_code, backward_type;
+-	__u8 reserved[2];
++	__u8 sorenson_version; /* FLV1 escape version, 0 or 1. */
++	__u8 reserved;
++	__u8 trb_field, trd_field;
+ 	__u8 intra_quant[64]; /* Zigzag order. */
+ 	__u8 inter_quant[64];
++	struct v4l2_mpeg4_sprite sprite;
+ 	struct v4l2_mpeg4_packet packets[V4L2_MPEG4_MAX_PACKETS];
+ };
+ #endif
