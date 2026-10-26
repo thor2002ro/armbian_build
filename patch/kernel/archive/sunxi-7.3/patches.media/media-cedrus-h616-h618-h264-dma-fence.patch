@@ -1,0 +1,83 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: media: cedrus: fence H616/H618 H.264 bitstream DMA
+
+The encoder can update registers while bitstream DMA still owns the previous output. That race can damage the next frame.
+
+Wait for DMA idle before changing shared state. A stalled engine still returns a bounded error.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.h b/drivers/staging/media/sunxi/cedrus/cedrus.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -196,6 +196,7 @@
+ 			void		*intra_pred_buf;
+ 			dma_addr_t	intra_pred_buf_dma;
+ 			ssize_t		intra_pred_buf_size;
++			bool		h616;
+ 		} h264;
+ 		struct {
+ 			void		*neighbor_info_buf;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_h264.c b/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
+@@ -8,6 +8,7 @@
+ 
+ #include <linux/delay.h>
+ #include <linux/iopoll.h>
++#include <linux/of.h>
+ #include <linux/reset.h>
+ #include <linux/types.h>
+ 
+@@ -319,6 +320,15 @@
+ 			}
+ 		}
+ 	}
++}
++
++static int cedrus_h264_wait_dma(struct cedrus_dev *dev)
++{
++	u32 status;
++
++	return readl_poll_timeout_atomic(dev->base + VE_H264_STATUS, status,
++					!(status & VE_H264_STATUS_BS_DMA_BUSY),
++					1, 1000);
+ }
+ 
+ /*
+@@ -551,6 +561,14 @@
+ 	if (ret)
+ 		return ret;
+ 
++	if (ctx->codec.h264.h616) {
++		ret = cedrus_h264_wait_dma(dev);
++		if (ret) {
++			reset_control_reset(dev->rstc);
++			return ret;
++		}
++	}
++
+ 	cedrus_write(dev, VE_H264_SDROT_CTRL, 0);
+ 	cedrus_write(dev, VE_H264_EXTRA_BUFFER1,
+ 		     ctx->codec.h264.pic_info_buf_dma);
+@@ -574,6 +592,9 @@
+ 	struct cedrus_dev *dev = ctx->dev;
+ 	unsigned int pic_info_size;
+ 	int ret;
++
++	ctx->codec.h264.h616 = of_device_is_compatible(dev->dev->of_node,
++						       "allwinner,sun50i-h616-video-engine");
+ 
+ 	/*
+ 	 * NOTE: All buffers allocated here are only used by HW, so we
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_regs.h b/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
+@@ -786,6 +786,7 @@
+ #define VE_H264_STATUS_SLICE_DECODE_INT		VE_H264_CTRL_SLICE_DECODE_INT
+ #define VE_H264_STATUS_VLD_BUSY			BIT(8)
+ #define VE_H264_STATUS_VP8_UPPROB_BUSY		BIT(17)
++#define VE_H264_STATUS_BS_DMA_BUSY		BIT(22)
+ 
+ #define VE_H264_STATUS_INT_MASK			VE_H264_CTRL_INT_MASK
+ 

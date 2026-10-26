@@ -1,0 +1,87 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: media: cedrus: check H616/H618 H.264 picture completion
+
+Reject incomplete H616 and H618 pictures after the final slice.
+Wait for bitstream DMA before returning each decoded slice.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.h b/drivers/staging/media/sunxi/cedrus/cedrus.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -197,6 +197,8 @@
+ 			dma_addr_t	intra_pred_buf_dma;
+ 			ssize_t		intra_pred_buf_size;
+ 			bool		h616;
++			bool		check_mb_count;
++			u32		expected_mbs;
+ 		} h264;
+ 		struct {
+ 			void		*neighbor_info_buf;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_h264.c b/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
+@@ -520,12 +520,30 @@
+ 
+ 	if (reg & (VE_H264_STATUS_DECODE_ERR_INT |
+ 		   VE_H264_STATUS_VLD_DATA_REQ_INT))
+-		return CEDRUS_IRQ_ERROR;
+-
+-	if (reg & VE_H264_CTRL_SLICE_DECODE_INT)
+-		return CEDRUS_IRQ_OK;
+-
+-	return CEDRUS_IRQ_NONE;
++		goto error;
++
++	if (!(reg & VE_H264_STATUS_SLICE_DECODE_INT))
++		return CEDRUS_IRQ_NONE;
++
++	if (ctx->codec.h264.h616 && cedrus_h264_wait_dma(dev))
++		goto error;
++
++	if (ctx->codec.h264.check_mb_count) {
++		u32 expected = ctx->codec.h264.expected_mbs;
++		u32 decoded;
++
++		decoded = cedrus_read(dev, VE_H264_CUR_MB_NUM);
++		/* Match both count conventions accepted by the vendor decoder. */
++		if (decoded != expected && decoded != 2 * expected)
++			goto error;
++	}
++
++	return CEDRUS_IRQ_OK;
++
++error:
++	if (ctx->codec.h264.h616)
++		reset_control_reset(dev->rstc);
++	return CEDRUS_IRQ_ERROR;
+ }
+ 
+ static void cedrus_h264_irq_clear(struct cedrus_ctx *ctx)
+@@ -549,8 +567,26 @@
+ {
+ 	struct cedrus_dev *dev = ctx->dev;
+ 	struct vb2_buffer *src_buf = &run->src->vb2_buf;
++	const struct v4l2_ctrl_h264_sps *sps = run->h264.sps;
+ 	size_t slice_bytes = vb2_get_plane_payload(src_buf, 0);
+ 	int ret;
++
++	if (ctx->codec.h264.h616 &&
++	    (sps->pic_width_in_mbs_minus1 > 0xff ||
++	     sps->pic_height_in_map_units_minus1 > 0xff))
++		return -EINVAL;
++
++	ctx->codec.h264.check_mb_count = ctx->codec.h264.h616 &&
++		!(run->src->flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF);
++	if (ctx->codec.h264.check_mb_count) {
++		ctx->codec.h264.expected_mbs =
++			(sps->pic_width_in_mbs_minus1 + 1) *
++			(sps->pic_height_in_map_units_minus1 + 1);
++		if (!(sps->flags & V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY) &&
++		    !(run->h264.decode_params->flags &
++		      V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC))
++			ctx->codec.h264.expected_mbs *= 2;
++	}
+ 
+ 	if (!slice_bytes || slice_bytes > vb2_plane_size(src_buf, 0) ||
+ 	    slice_bytes > U32_MAX / 8 ||

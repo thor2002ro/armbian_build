@@ -1,0 +1,119 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: media: cedrus: retain queued H264 ownership
+
+Keep queued H264 slices in one Cedrus mem2mem job.
+Prevent an encoder reset between queued decoder slices.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -183,6 +183,7 @@
+ struct cedrus_ctx {
+ 	bool				encoder;
+ 	struct cedrus_enc_ctx		*enc;
++	struct work_struct		h264_resume_work;
+ 	struct v4l2_fh			fh;
+ 	struct cedrus_dev		*dev;
+ 
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_dec.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_dec.h
+@@ -17,5 +17,6 @@
+ #define _CEDRUS_DEC_H_
+ 
+ void cedrus_device_run(void *priv);
++void cedrus_h264_resume_work(struct work_struct *work);
+ 
+ #endif
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
+@@ -23,6 +23,15 @@
+ #include "cedrus_dec.h"
+ #include "cedrus_hw.h"
+ 
++void cedrus_h264_resume_work(struct work_struct *work)
++{
++	struct cedrus_ctx *ctx = container_of(work, struct cedrus_ctx,
++					      h264_resume_work);
++
++	if (v4l2_m2m_get_curr_priv(ctx->dev->m2m_dev) == ctx)
++		cedrus_device_run(ctx);
++}
++
+ void cedrus_device_run(void *priv)
+ {
+ 	struct cedrus_ctx *ctx = priv;
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+@@ -30,6 +30,7 @@
+ #include <media/v4l2-mem2mem.h>
+ 
+ #include "cedrus.h"
++#include "cedrus_dec.h"
+ #include "cedrus_enc.h"
+ #include "cedrus_hw.h"
+ #include "cedrus_regs.h"
+@@ -293,6 +294,35 @@
+ 	schedule_delayed_work(&dev->watchdog_work, timeout);
+ }
+ 
++static bool cedrus_h264_schedule_next_slice(struct cedrus_ctx *ctx,
++					 enum vb2_buffer_state state)
++{
++	struct v4l2_m2m_ctx *m2m_ctx = ctx->fh.m2m_ctx;
++	struct vb2_v4l2_buffer *src, *dst;
++
++	if (state != VB2_BUF_STATE_DONE ||
++	    ctx->src_fmt.pixelformat != V4L2_PIX_FMT_H264_SLICE)
++		return false;
++
++	src = v4l2_m2m_next_src_buf(m2m_ctx);
++	if (!src || !(src->flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF) ||
++	    v4l2_m2m_num_src_bufs_ready(m2m_ctx) < 2)
++		return false;
++
++	dst = v4l2_m2m_next_dst_buf(m2m_ctx);
++	if (!dst)
++		return false;
++
++	/* Keep this capture buffer until the picture's last slice finishes. */
++	dst->is_held = true;
++	m2m_ctx->new_frame = false;
++	src = v4l2_m2m_src_buf_remove(m2m_ctx);
++	v4l2_m2m_buf_done(src, state);
++	schedule_work(&ctx->h264_resume_work);
++
++	return true;
++}
++
+ static irqreturn_t cedrus_irq(int irq, void *data)
+ {
+ 	irqreturn_t handled = IRQ_NONE;
+@@ -342,6 +371,9 @@
+ 	else
+ 		state = VB2_BUF_STATE_DONE;
+ 
++	if (cedrus_h264_schedule_next_slice(ctx, state))
++		return IRQ_HANDLED;
++
+ 	v4l2_m2m_buf_done_and_job_finish(ctx->dev->m2m_dev, ctx->fh.m2m_ctx,
+ 					 state);
+ 
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.c
+@@ -498,6 +498,7 @@
+ 	v4l2_fh_init(&ctx->fh, video_devdata(file));
+ 	ctx->dev = dev;
+ 	ctx->bit_depth = 8;
++	INIT_WORK(&ctx->h264_resume_work, cedrus_h264_resume_work);
+ 
+ 	ctx->fh.m2m_ctx = v4l2_m2m_ctx_init(dev->m2m_dev, ctx,
+ 					    &cedrus_queue_init);
+@@ -536,6 +537,7 @@
+ 	mutex_lock(&dev->dev_mutex);
+ 
+ 	v4l2_fh_del(&ctx->fh, file);
++	flush_work(&ctx->h264_resume_work);
+ 	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
+ 
+ 	v4l2_ctrl_handler_free(&ctx->hdl);
