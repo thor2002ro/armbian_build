@@ -1,0 +1,36 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: dt-bindings: media: describe H616/H618 VE DDR mode
+
+Define one VE DDR field value for H616 and H618 codecs.
+Keep reconstruction write mode under codec control.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/Documentation/devicetree/bindings/media/allwinner,sun4i-a10-video-engine.yaml b/Documentation/devicetree/bindings/media/allwinner,sun4i-a10-video-engine.yaml
+--- a/Documentation/devicetree/bindings/media/allwinner,sun4i-a10-video-engine.yaml
++++ b/Documentation/devicetree/bindings/media/allwinner,sun4i-a10-video-engine.yaml
+@@ -56,6 +56,16 @@
+           - description: register value for device
+     description: Phandle to the device SRAM
+ 
++  allwinner,ve-ddr-mode:
++    $ref: /schemas/types.yaml#/definitions/uint32
++    enum: [2, 3]
++    description: |
++      Select the VE_MODE DDR field value in bits 17:16 for all H616 and H618 codecs.
++      The driver preserves reconstruction write bit 20 and each codec's other controls.
++      These values describe VE access modes, not the installed DDR generation or RAM width.
++      H616 and H618 default to mode 2 when this property is absent.
++      This property does not configure SRAM routing or the external DRAM controller.
++
+   iommus:
+     minItems: 1
+     maxItems: 2
+@@ -97,6 +107,7 @@
+         nvmem-cell-names: [ nvmem-cells ]
+     else:
+       properties:
++        allwinner,ve-ddr-mode: false
+         iommus:
+           maxItems: 1
+         nvmem-cells: false
