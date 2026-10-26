@@ -1,0 +1,60 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: media: cedrus: advertise hold capability early
+
+Advertise capture-buffer holding before userspace queries the queue.
+Reject hold flags for formats that do not support sliced capture.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_video.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+@@ -571,19 +571,6 @@
+ 	vq->dma_attrs = vq->requires_requests ? DMA_ATTR_NO_KERNEL_MAPPING : 0;
+ 
+ 	switch (ctx->src_fmt.pixelformat) {
+-	case V4L2_PIX_FMT_H264_SLICE:
+-	case V4L2_PIX_FMT_HEVC_SLICE:
+-	case V4L2_PIX_FMT_VC1_SLICE:
+-		vq->subsystem_flags |=
+-			VB2_V4L2_FL_SUPPORTS_M2M_HOLD_CAPTURE_BUF;
+-		break;
+-	default:
+-		vq->subsystem_flags &=
+-			~VB2_V4L2_FL_SUPPORTS_M2M_HOLD_CAPTURE_BUF;
+-		break;
+-	}
+-
+-	switch (ctx->src_fmt.pixelformat) {
+ 	case V4L2_PIX_FMT_MPEG4_FRAME:
+ 	case V4L2_PIX_FMT_SORENSON_FRAME:
+ 	case V4L2_PIX_FMT_H263_FRAME:
+@@ -742,8 +729,20 @@
+ static int cedrus_buf_out_validate(struct vb2_buffer *vb)
+ {
+ 	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
++	struct cedrus_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
+ 
+ 	vbuf->field = V4L2_FIELD_NONE;
++	if (vbuf->flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF) {
++		switch (ctx->src_fmt.pixelformat) {
++		case V4L2_PIX_FMT_H264_SLICE:
++		case V4L2_PIX_FMT_HEVC_SLICE:
++		case V4L2_PIX_FMT_VC1_SLICE:
++			break;
++		default:
++			return -EINVAL;
++		}
++	}
++
+ 	return 0;
+ }
+ 
+@@ -868,6 +867,8 @@
+ 	src_vq->dev = ctx->dev->dev;
+ 	src_vq->supports_requests = true;
+ 	src_vq->requires_requests = true;
++	src_vq->subsystem_flags =
++		VB2_V4L2_FL_SUPPORTS_M2M_HOLD_CAPTURE_BUF;
+ 
+ 	ret = vb2_queue_init(src_vq);
+ 	if (ret)
