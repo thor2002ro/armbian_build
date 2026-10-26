@@ -1,0 +1,27 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: media: cedrus: pad H616/H618 H.264 deblock storage
+
+Wide H.264 pictures need more deblock storage than the generic estimate provides. A short buffer can overlap adjacent state.
+
+Use the vendor margin for H616 and H618. Smaller pictures keep their current allocation.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_h264.c b/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
+@@ -683,8 +683,12 @@
+ 		 * are taken from CedarX source.
+ 		 */
+ 
+-		ctx->codec.h264.deblk_buf_size =
+-			ALIGN(ctx->src_fmt.width, 32) * 12;
++		if (ctx->codec.h264.h616)
++			ctx->codec.h264.deblk_buf_size =
++				DIV_ROUND_UP(ctx->src_fmt.width, 16) * 192 + 5952;
++		else
++			ctx->codec.h264.deblk_buf_size =
++				ALIGN(ctx->src_fmt.width, 32) * 12;
+ 		ctx->codec.h264.deblk_buf =
+ 			dma_alloc_attrs(dev->dev,
+ 					ctx->codec.h264.deblk_buf_size,

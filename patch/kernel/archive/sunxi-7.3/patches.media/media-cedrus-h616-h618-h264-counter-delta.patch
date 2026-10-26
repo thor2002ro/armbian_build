@@ -1,0 +1,43 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: media: cedrus: validate H616/H618 macroblock delta
+
+Track the 16-bit counter at each frame start.
+Validate the wrapped frame delta after the final slice.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -211,6 +211,7 @@
+ 			bool		h616;
+ 			bool		check_mb_count;
+ 			u32		expected_mbs;
++			u16		mb_count_start;
+ 		} h264;
+ 		struct {
+ 			void		*neighbor_info_buf;
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
+@@ -532,7 +532,9 @@
+ 		u32 expected = ctx->codec.h264.expected_mbs;
+ 		u32 decoded;
+ 
+-		decoded = cedrus_read(dev, VE_H264_CUR_MB_NUM);
++		/* The register is cumulative, so compare only this picture's work. */
++		decoded = (u16)(cedrus_read(dev, VE_H264_CUR_MB_NUM) -
++				ctx->codec.h264.mb_count_start);
+ 		/* Match both count conventions accepted by the vendor decoder. */
+ 		if (decoded != expected && decoded != 2 * expected)
+ 			goto error;
+@@ -605,6 +606,11 @@
+ 		}
+ 	}
+ 
++	if (ctx->codec.h264.h616 &&
++	    run->h264.slice_params->first_mb_in_slice == 0)
++		ctx->codec.h264.mb_count_start =
++			cedrus_read(dev, VE_H264_CUR_MB_NUM);
++
+ 	cedrus_write(dev, VE_H264_SDROT_CTRL, 0);
+ 	cedrus_write(dev, VE_H264_EXTRA_BUFFER1,
+ 		     ctx->codec.h264.pic_info_buf_dma);

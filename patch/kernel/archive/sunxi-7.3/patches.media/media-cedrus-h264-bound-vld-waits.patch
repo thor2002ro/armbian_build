@@ -1,0 +1,132 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: media: cedrus: bound H.264 bitstream waits
+
+A damaged H.264 slice can leave the VLD engine busy forever. An unbounded wait then holds the shared video engine.
+
+Bound each wait and return the hardware error. Valid slices keep the same launch sequence.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_h264.c b/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
+@@ -7,6 +7,8 @@
+  */
+ 
+ #include <linux/delay.h>
++#include <linux/iopoll.h>
++#include <linux/reset.h>
+ #include <linux/types.h>
+ 
+ #include <media/videobuf2-dma-contig.h>
+@@ -324,25 +326,37 @@
+  * rare cases frame is not decoded correctly. However, setting offset to 0 and
+  * skipping appropriate amount of bits with flush bits trigger always works.
+  */
+-static void cedrus_skip_bits(struct cedrus_dev *dev, int num)
+-{
+-	int count = 0;
++static int cedrus_skip_bits(struct cedrus_dev *dev, unsigned int num)
++{
++	unsigned int count = 0;
++	u32 status;
++	int ret;
+ 
+ 	while (count < num) {
+-		int tmp = min(num - count, 32);
++		unsigned int tmp = min(num - count, 32U);
+ 
+ 		cedrus_write(dev, VE_H264_TRIGGER_TYPE,
+ 			     VE_H264_TRIGGER_TYPE_FLUSH_BITS |
+ 			     VE_H264_TRIGGER_TYPE_N_BITS(tmp));
+-		while (cedrus_read(dev, VE_H264_STATUS) & VE_H264_STATUS_VLD_BUSY)
+-			udelay(1);
++		ret = readl_poll_timeout_atomic(dev->base + VE_H264_STATUS, status,
++						!(status & VE_H264_STATUS_VLD_BUSY) ||
++						(status & (VE_H264_STATUS_DECODE_ERR_INT |
++							   VE_H264_STATUS_VLD_DATA_REQ_INT)),
++						1, 1000);
++		if (ret)
++			return ret;
++		if (status & (VE_H264_STATUS_DECODE_ERR_INT |
++			      VE_H264_STATUS_VLD_DATA_REQ_INT))
++			return -EIO;
+ 
+ 		count += tmp;
+ 	}
+-}
+-
+-static void cedrus_set_params(struct cedrus_ctx *ctx,
+-			      struct cedrus_run *run)
++
++	return 0;
++}
++
++static int cedrus_set_params(struct cedrus_ctx *ctx,
++			     struct cedrus_run *run)
+ {
+ 	const struct v4l2_ctrl_h264_decode_params *decode = run->h264.decode_params;
+ 	const struct v4l2_ctrl_h264_slice_params *slice = run->h264.slice_params;
+@@ -355,6 +369,7 @@
+ 	unsigned int pic_width_in_mbs;
+ 	bool mbaff_pic;
+ 	u32 reg;
++	int ret;
+ 
+ 	cedrus_write(dev, VE_H264_VLD_LEN, slice_bytes * 8);
+ 	cedrus_write(dev, VE_H264_VLD_OFFSET, 0);
+@@ -389,7 +404,9 @@
+ 	cedrus_write(dev, VE_H264_TRIGGER_TYPE,
+ 		     VE_H264_TRIGGER_TYPE_INIT_SWDEC);
+ 
+-	cedrus_skip_bits(dev, slice->header_bit_size);
++	ret = cedrus_skip_bits(dev, slice->header_bit_size);
++	if (ret)
++		return ret;
+ 
+ 	if (V4L2_H264_CTRL_PRED_WEIGHTS_REQUIRED(pps, slice))
+ 		cedrus_write_pred_weight_table(ctx, run);
+@@ -481,6 +498,8 @@
+ 		     VE_H264_CTRL_SLICE_DECODE_INT |
+ 		     VE_H264_CTRL_DECODE_ERR_INT |
+ 		     VE_H264_CTRL_VLD_DATA_REQ_INT);
++
++	return 0;
+ }
+ 
+ static enum cedrus_irq_status
+@@ -519,9 +538,18 @@
+ static int cedrus_h264_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ {
+ 	struct cedrus_dev *dev = ctx->dev;
++	struct vb2_buffer *src_buf = &run->src->vb2_buf;
++	size_t slice_bytes = vb2_get_plane_payload(src_buf, 0);
+ 	int ret;
+ 
+-	cedrus_engine_enable(ctx);
++	if (!slice_bytes || slice_bytes > vb2_plane_size(src_buf, 0) ||
++	    slice_bytes > U32_MAX / 8 ||
++	    run->h264.slice_params->header_bit_size > slice_bytes * 8)
++		return -EINVAL;
++
++	ret = cedrus_engine_enable(ctx);
++	if (ret)
++		return ret;
+ 
+ 	cedrus_write(dev, VE_H264_SDROT_CTRL, 0);
+ 	cedrus_write(dev, VE_H264_EXTRA_BUFFER1,
+@@ -534,9 +562,11 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	cedrus_set_params(ctx, run);
+-
+-	return 0;
++	ret = cedrus_set_params(ctx, run);
++	if (ret)
++		reset_control_reset(dev->rstc);
++
++	return ret;
+ }
+ 
+ static int cedrus_h264_start(struct cedrus_ctx *ctx)
