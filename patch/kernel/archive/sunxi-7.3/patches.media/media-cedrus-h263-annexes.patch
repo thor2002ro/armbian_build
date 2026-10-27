@@ -1,0 +1,54 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: media: cedrus: support H263 AIC and modified quantization
+
+Decode H263 I/P pictures with advanced intra coding and modified quantization.
+Keep unsupported picture types and incompatible formats rejected.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_mpeg4.c b/drivers/staging/media/sunxi/cedrus/cedrus_mpeg4.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_mpeg4.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_mpeg4.c
+@@ -19,7 +19,7 @@
+ 	if (!f || f->width < 16 || f->width > 4096 || f->height < 16 ||
+ 	    f->height > 4096 || f->picture_type > 3 || f->forward_code < 1 ||
+ 	    f->forward_code > 7 || f->backward_code < 1 ||
+-	    f->backward_code > 7 || f->backward_type > 3 || (f->flags & ~2047U) ||
++	    f->backward_code > 7 || f->backward_type > 3 || (f->flags & ~4095U) ||
+ 	    f->reserved ||
+ 	    f->sorenson_version > !!(f->flags & V4L2_MPEG4_SORENSON) ||
+ 	    !f->bitstream_size || f->bitstream_size > SZ_16M ||
+@@ -33,8 +33,9 @@
+ 	     (f->flags & (V4L2_MPEG4_MPEG_QUANT | V4L2_MPEG4_QUARTER_SAMPLE |
+ 			 V4L2_MPEG4_INTERLACED))))
+ 		return -EINVAL;
+-	if ((f->flags & V4L2_MPEG4_H263_AIC) &&
+-	    (!(f->flags & V4L2_MPEG4_SHORT_HEADER) || f->picture_type ||
++	if ((f->flags & (V4L2_MPEG4_H263_AIC |
++			 V4L2_MPEG4_H263_MODIFIED_QUANT)) &&
++	    (!(f->flags & V4L2_MPEG4_SHORT_HEADER) || f->picture_type > 1 ||
+ 	     (f->flags & V4L2_MPEG4_SORENSON)))
+ 		return -EINVAL;
+ 	if ((f->flags & V4L2_MPEG4_SORENSON) &&
+@@ -114,6 +115,8 @@
+ 		header |= BIT(31) | BIT(16) | BIT(22) | f->picture_type << 18;
+ 		if (f->flags & V4L2_MPEG4_H263_AIC)
+ 			header |= BIT(15) | BIT(13) | BIT(12);
++		if (f->flags & V4L2_MPEG4_H263_MODIFIED_QUANT)
++			header |= BIT(15) | BIT(14) | BIT(12);
+ 		if (f->flags & V4L2_MPEG4_SORENSON)
+ 			header |= BIT(15) | BIT(12) |
+ 				  (u32)f->sorenson_version << 11;
+diff --git a/include/media/mpeg4-ctrls.h b/include/media/mpeg4-ctrls.h
+--- a/include/media/mpeg4-ctrls.h
++++ b/include/media/mpeg4-ctrls.h
+@@ -21,6 +21,7 @@
+ #define V4L2_MPEG4_ALTERNATE_SCAN (1U << 8)
+ #define V4L2_MPEG4_GMC (1U << 9)
+ #define V4L2_MPEG4_H263_AIC (1U << 10)
++#define V4L2_MPEG4_H263_MODIFIED_QUANT (1U << 11)
+ 
+ struct v4l2_mpeg4_packet {
+ 	__u32 bit_offset;
+-- 
+Armbian

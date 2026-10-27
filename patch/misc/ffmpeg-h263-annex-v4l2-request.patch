@@ -1,0 +1,165 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: avcodec: support H263 AIC and modified quantization requests
+
+Pass H263 AIC and modified quantization flags to the decoder.
+Expose V4L2 Request decoding for the H263P decoder.
+Reject invalid reserved bits and unsupported CPM headers.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/libavcodec/v4l2_request_mpeg4.c b/libavcodec/v4l2_request_mpeg4.c
+--- a/libavcodec/v4l2_request_mpeg4.c
++++ b/libavcodec/v4l2_request_mpeg4.c
+@@ -17,6 +17,11 @@
+     struct v4l2_ctrl_mpeg4_frame frame;
+     int h263_unsupported;
+ } MPEG4RequestContext;
++
++static int mpeg4_h263_codec(enum AVCodecID codec)
++{
++    return codec == AV_CODEC_ID_H263 || codec == AV_CODEC_ID_H263P;
++}
+ 
+ static int mpeg4_dc_threshold(int value)
+ {
+@@ -147,20 +152,22 @@
+                              uint32_t size)
+ {
+     GetBitContext header;
+-    int format, ufep;
++    int format, ufep, picture_type, options, cpm;
++    int unsupported = ctx->h263_unsupported;
+ 
+     if (size < 5 || init_get_bits8(&header, buffer, size) < 0)
+         return AVERROR_INVALIDDATA;
+     skip_bits_long(&header, 35);
+     format = get_bits(&header, 3);
+     if (format != 7) {
+-        if (format < 1 || format > 5)
++        if (format < 1 || format > 5 || get_bits_left(&header) < 11)
+             return AVERROR_INVALIDDATA;
+-        if (get_bits_left(&header) < 3)
+-            return AVERROR_INVALIDDATA;
+-        skip_bits(&header, 2);
+-        ctx->h263_unsupported = get_bits1(&header);
+-        return ctx->h263_unsupported ? AVERROR(ENOSYS) : 0;
++        skip_bits1(&header);
++        unsupported = get_bits(&header, 4); /* UMV, SAC, advanced prediction, PB. */
++        skip_bits(&header, 5);
++        cpm = get_bits1(&header);
++        ctx->h263_unsupported = unsupported;
++        return unsupported || cpm ? AVERROR(ENOSYS) : 0;
+     }
+     if (get_bits_left(&header) < 3)
+         return AVERROR_INVALIDDATA;
+@@ -168,18 +175,26 @@
+     if (ufep == 1) {
+         if (get_bits_left(&header) < 18)
+             return AVERROR_INVALIDDATA;
+-        skip_bits(&header, 5);
+-        ctx->h263_unsupported = get_bits1(&header); /* Arithmetic coding. */
+-        skip_bits(&header, 4);
+-        ctx->h263_unsupported |= get_bits(&header, 2); /* Reference and segment modes. */
+-        skip_bits(&header, 6);
++        skip_bits(&header, 4); /* Source format and custom picture clock. */
++        unsupported = get_bits(&header, 3); /* UMV, SAC, advanced prediction. */
++        skip_bits1(&header); /* AIC. */
++        unsupported |= get_bits(&header, 5); /* Deblocking, slices, RPS, ISD, alternative VLC. */
++        skip_bits1(&header); /* Modified quantization. */
++        if (get_bits(&header, 4) != 8)
++            return AVERROR_INVALIDDATA;
+     } else if (ufep) {
+         return AVERROR_INVALIDDATA;
+     }
+-    if (get_bits_left(&header) < 5)
++    if (get_bits_left(&header) < 10)
+         return AVERROR_INVALIDDATA;
+-    skip_bits(&header, 3);
+-    if (get_bits(&header, 2) || ctx->h263_unsupported)
++    picture_type = get_bits(&header, 3);
++    options = get_bits(&header, 2); /* Reference resampling and reduced resolution. */
++    skip_bits1(&header); /* Rounding type. */
++    if (get_bits(&header, 3) != 1)
++        return AVERROR_INVALIDDATA;
++    cpm = get_bits1(&header);
++    ctx->h263_unsupported = unsupported;
++    if (picture_type > 1 || options || cpm || unsupported)
+         return AVERROR(ENOSYS);
+     return 0;
+ }
+@@ -272,11 +287,11 @@
+     MPEG4RequestContext *ctx = avctx->internal->hwaccel_priv_data;
+     struct v4l2_ctrl_mpeg4_frame *f = &ctx->frame;
+     int sorenson = avctx->codec_id == AV_CODEC_ID_FLV1;
+-    int short_header = avctx->codec_id == AV_CODEC_ID_H263 || sorenson;
++    int short_header = mpeg4_h263_codec(avctx->codec_id) || sorenson;
+     int ret;
+ 
+-    if (s->h263_aic && (avctx->codec_id != AV_CODEC_ID_H263 ||
+-                        s->pict_type != AV_PICTURE_TYPE_I))
++    if ((s->h263_aic || h->modified_quant) &&
++        !mpeg4_h263_codec(avctx->codec_id))
+         return AVERROR(ENOSYS);
+     if (short_header && !s->progressive_sequence)
+         return AVERROR(ENOSYS);
+@@ -284,7 +299,7 @@
+         s->width < 16 || s->height < 16 ||
+         s->width > 4096 || s->height > 4096 || size > 16 * 1024 * 1024 ||
+         h->pb_frame || h->h263_long_vectors || h->umvplus || s->obmc ||
+-        h->loop_filter || h->modified_quant ||
++        h->loop_filter ||
+         h->alt_inter_vlc || h->h263_slice_structured || h->data_partitioning)
+         return AVERROR(ENOSYS);
+     if (!short_header) {
+@@ -319,6 +334,8 @@
+         f->flags |= V4L2_MPEG4_SHORT_HEADER;
+         if (s->h263_aic)
+             f->flags |= V4L2_MPEG4_H263_AIC;
++        if (h->modified_quant)
++            f->flags |= V4L2_MPEG4_H263_MODIFIED_QUANT;
+     } else {
+         Mpeg4DecContext *m = avctx->priv_data;
+         int threshold = mpeg4_dc_threshold(m->intra_dc_threshold);
+@@ -409,12 +426,13 @@
+ 
+ static int mpeg4_request_params(AVCodecContext *avctx, AVBufferRef *frames)
+ {
+-    return ff_v4l2_request_frame_params(
+-        avctx, frames,
+-        avctx->codec_id == AV_CODEC_ID_FLV1   ? V4L2_PIX_FMT_SORENSON_FRAME
+-        : avctx->codec_id == AV_CODEC_ID_H263 ? V4L2_PIX_FMT_H263_FRAME
+-                                              : V4L2_PIX_FMT_MPEG4_FRAME,
+-        8);
++    uint32_t format = V4L2_PIX_FMT_MPEG4_FRAME;
++
++    if (mpeg4_h263_codec(avctx->codec_id))
++        format = V4L2_PIX_FMT_H263_FRAME;
++    else if (avctx->codec_id == AV_CODEC_ID_FLV1)
++        format = V4L2_PIX_FMT_SORENSON_FRAME;
++    return ff_v4l2_request_frame_params(avctx, frames, format, 8);
+ }
+ 
+ static int mpeg4_request_init(AVCodecContext *avctx)
+diff --git a/libavcodec/v4l2_request_mpeg4.h b/libavcodec/v4l2_request_mpeg4.h
+--- a/libavcodec/v4l2_request_mpeg4.h
++++ b/libavcodec/v4l2_request_mpeg4.h
+@@ -21,6 +21,7 @@
+ #define V4L2_MPEG4_ALTERNATE_SCAN (1U << 8)
+ #define V4L2_MPEG4_GMC (1U << 9)
+ #define V4L2_MPEG4_H263_AIC (1U << 10)
++#define V4L2_MPEG4_H263_MODIFIED_QUANT (1U << 11)
+ 
+ struct v4l2_mpeg4_packet {
+ 	__u32 bit_offset;
+diff --git a/libavcodec/h263dec.c b/libavcodec/h263dec.c
+--- a/libavcodec/h263dec.c
++++ b/libavcodec/h263dec.c
+@@ -741,5 +741,5 @@
+                       FF_CODEC_CAP_SKIP_FRAME_FILL_PARAM,
+     .flush          = ff_mpeg_flush,
+     .p.max_lowres   = 3,
+-    .hw_configs     = h263_hw_config_list,
++    .hw_configs     = h263_request_hw_config_list,
+ };
+-- 
+Armbian
