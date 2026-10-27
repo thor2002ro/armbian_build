@@ -1,0 +1,280 @@
+Subject: [PATCH] Local: media: cedrus: trace CAVS requests and registers
+
+Capture request controls and register readback before decoding and reset.
+Limit setup tracing to the first request per stream.
+---
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.h b/drivers/staging/media/sunxi/cedrus/cedrus.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -253,6 +253,8 @@
+ 			dma_addr_t mv_dma;
+ 			size_t mv_size;
+ 			struct cedrus_buffer *dst;
++			bool diag_logged;
++			bool diag_active;
+ 		} cavs;
+ 		struct {
+ 			void		*line_buf;
+@@ -348,6 +350,7 @@
+ int cedrus_vc1_validate(const struct v4l2_ctrl_vc1_slice_params *slice);
+ extern struct cedrus_dec_ops cedrus_dec_ops_jpeg;
+ extern struct cedrus_dec_ops cedrus_dec_ops_cavs;
++void cedrus_cavs_dump_regs(struct cedrus_ctx *ctx, const char *phase);
+ int cedrus_cavs_validate(const struct v4l2_ctrl_cavs_frame *frame);
+ extern struct cedrus_dec_ops cedrus_dec_ops_cavs2;
+ int cedrus_cavs2_validate(const struct v4l2_ctrl_cavs2_frame *frame);
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_cavs.c b/drivers/staging/media/sunxi/cedrus/cedrus_cavs.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_cavs.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_cavs.c
+@@ -136,6 +136,10 @@
+ 	if (ctx->codec.cavs.dst)
+ 		ctx->codec.cavs.dst->codec.cavs.valid =
+ 			cedrus_cavs_irq_status(ctx) == CEDRUS_IRQ_OK;
++	if (ctx->codec.cavs.diag_active) {
++		cedrus_cavs_dump_regs(ctx, "irq");
++		ctx->codec.cavs.diag_active = false;
++	}
+ 	ctx->codec.cavs.dst = NULL;
+ 	cedrus_write(ctx->dev, CAVS_REG(0x28), status & CAVS_IRQ_MASK);
+ }
+@@ -144,6 +148,49 @@
+ {
+ 	cedrus_write(ctx->dev, CAVS_REG(0x20),
+ 		     cedrus_read(ctx->dev, CAVS_REG(0x20)) & ~CAVS_IRQ_MASK);
++}
++
++static void cedrus_cavs_dump_request(struct cedrus_ctx *ctx, struct cedrus_run *run)
++{
++	const struct v4l2_ctrl_cavs_frame *f = run->cavs.frame;
++	struct vb2_buffer *src = &run->src->vb2_buf;
++	struct vb2_buffer *dst = &run->dst->vb2_buf;
++	struct cedrus_dev *dev = ctx->dev;
++	dma_addr_t source = vb2_dma_contig_plane_dma_addr(src, 0);
++	unsigned int i;
++
++	if (!f) {
++		dev_dbg(dev->dev, "CAVS request: missing frame control\n");
++		return;
++	}
++	dev_dbg(dev->dev,
++		 "CAVS request: size=%ux%u profile=%02x level=%02x type=%u qp=%u distance=%u\n",
++		 f->width, f->height, f->profile, f->level,
++		 f->picture_type, f->picture_qp, f->picture_distance);
++	dev_dbg(dev->dev,
++		 "CAVS request: flags=%08x chroma=%u precision=%u refs=%u control_size=%zu\n",
++		 f->flags, f->chroma_format, f->sample_precision,
++		 f->num_refs, sizeof(*f));
++	dev_dbg(dev->dev,
++		 "CAVS input: index=%u timestamp=%llu dma=%pad payload=%lu allocation=%lu offset=%u size=%u\n",
++		 src->index, src->timestamp, &source,
++		 vb2_get_plane_payload(src, 0), vb2_plane_size(src, 0),
++		 f->bitstream_offset, f->bitstream_size);
++	dev_dbg(dev->dev,
++		 "CAVS output: index=%u format=%p4cc size=%ux%u stride=%u sizeimage=%u allocation=%lu\n",
++		 dst->index, &ctx->dst_fmt.pixelformat,
++		 ctx->dst_fmt.width, ctx->dst_fmt.height,
++		 ctx->dst_fmt.bytesperline, ctx->dst_fmt.sizeimage,
++		 vb2_plane_size(dst, 0));
++	dev_dbg(dev->dev,
++		 "CAVS scratch: mb=%pad/%zu mv=%pad/%zu\n",
++		 &ctx->codec.cavs.mb_dma, ctx->codec.cavs.mb_size,
++		 &ctx->codec.cavs.mv_dma, ctx->codec.cavs.mv_size);
++	for (i = 0; i < ARRAY_SIZE(f->reference_ts); i++)
++		dev_dbg(dev->dev,
++			 "CAVS reference[%u]: timestamp=%llu flags=%02x distance=%u\n",
++			 i, f->reference_ts[i], f->reference_flags[i],
++			 f->reference_distance[i]);
+ }
+ 
+ static int cedrus_cavs_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+@@ -157,40 +204,88 @@
+ 	dma_addr_t source = vb2_dma_contig_plane_dma_addr(src, 0);
+ 	struct v4l2_pix_format recon = cedrus_dst_frame_fmt(ctx);
+ 	size_t payload = vb2_get_plane_payload(src, 0);
++	bool trace = !ctx->codec.cavs.diag_logged;
++	u32 ctrl_before = 0, sequence_readback = 0;
++	const u8 *data;
+ 	unsigned int i;
+ 	int ret;
+ 
+ 	dst->codec.cavs.valid = false;
++	ctx->codec.cavs.diag_logged = true;
++	ctx->codec.cavs.diag_active = trace;
++	if (trace)
++		cedrus_cavs_dump_request(ctx, run);
+ 	ret = cedrus_cavs_validate(f);
+-	if (ret)
++	if (ret) {
++		if (trace)
++			dev_dbg(dev->dev,
++				 "CAVS setup: frame control validation fails: %d\n", ret);
+ 		return ret;
++	}
+ 	if (f->width != ctx->src_fmt.width || f->height != ctx->src_fmt.height ||
+ 	    !f->bitstream_size || f->bitstream_offset > payload ||
+ 	    f->bitstream_size > payload - f->bitstream_offset ||
+ 	    f->bitstream_offset > 0xffffff || f->bitstream_size > 0xffffff ||
+-	    (source & 15) || !vb2_plane_size(src, 0))
++	    (source & 15) || !vb2_plane_size(src, 0)) {
++		if (trace)
++			dev_dbg(dev->dev,
++				 "CAVS setup: dimensions or input bounds validation fails\n");
+ 		return -EINVAL;
++	}
+ 	for (i = 0; i < f->num_refs; i++) {
+ 		refs[i] = vb2_find_buffer(q, f->reference_ts[i]);
+ 		if (!refs[i] || refs[i] == &run->dst->vb2_buf ||
+-		    !vb2_to_cedrus_buffer(refs[i])->codec.cavs.valid)
++		    !vb2_to_cedrus_buffer(refs[i])->codec.cavs.valid) {
++			if (trace)
++				dev_dbg(dev->dev,
++					 "CAVS setup: reference %u validation fails\n", i);
+ 			return -EINVAL;
++		}
+ 	}
+ 	if (f->num_refs == 1)
+ 		refs[1] = refs[0];
++	if (trace) {
++		data = vb2_plane_vaddr(src, 0);
++		if (data) {
++			unsigned int len = min_t(u32, f->bitstream_size, 16);
++
++			data += f->bitstream_offset;
++			dev_dbg(dev->dev,
++				 "CAVS payload: first=%*ph last=%*ph\n",
++				 len, data, len, data + f->bitstream_size - len);
++		} else {
++			dev_dbg(dev->dev,
++				 "CAVS payload: CPU mapping unavailable\n");
++		}
++	}
+ 	ret = reset_control_reset(dev->rstc);
+-	if (ret)
++	if (ret) {
++		if (trace)
++			dev_dbg(dev->dev, "CAVS setup: reset fails: %d\n", ret);
+ 		return ret;
++	}
+ 	ret = cedrus_engine_enable(ctx);
+-	if (ret)
++	if (ret) {
++		if (trace)
++			dev_dbg(dev->dev, "CAVS setup: engine enable fails: %d\n", ret);
+ 		return ret;
++	}
+ 	cedrus_dst_format_set(dev, &recon);
++	if (trace)
++		ctrl_before = cedrus_read(dev, CAVS_REG(0x20));
+ 	cedrus_write(dev, CAVS_REG(4), cedrus_cavs_sequence_reg(f));
++	if (trace)
++		sequence_readback = cedrus_read(dev, CAVS_REG(4));
+ 	cedrus_write(dev, CAVS_REG(0xc), cedrus_cavs_quant1_reg(f));
+ 	cedrus_write(dev, CAVS_REG(0x10), cedrus_cavs_quant2_reg(f));
+ 	cedrus_write(dev, CAVS_REG(0x14), cedrus_cavs_picture_reg(f));
+ 	cedrus_write(dev, CAVS_REG(0x18), cedrus_cavs_distance_reg(f));
+ 	cedrus_write(dev, CAVS_REG(0x20), 0x14000407);
++	if (trace)
++		dev_dbg(dev->dev,
++			 "CAVS write: ctrl_before=%08x sequence_expected=%08x immediate=%08x ctrl_after=%08x sequence_after=%08x\n",
++			 ctrl_before, cedrus_cavs_sequence_reg(f), sequence_readback,
++			 cedrus_read(dev, CAVS_REG(0x20)), cedrus_read(dev, CAVS_REG(4)));
+ 	cedrus_write(dev, CAVS_REG(0x2c), 0);
+ 	cedrus_write(dev, CAVS_REG(0x30),
+ 		     (source & 0xffffff0) | (source >> 28) | 0x70000000);
+@@ -215,6 +310,8 @@
+ 	cedrus_write(dev, CAVS_REG(0xd8), cedrus_dst_frame_addr(ctx, refs[i], 1));
+ 	cedrus_write(dev, CAVS_REG(0xb8), 0);
+ 	ctx->codec.cavs.dst = dst;
++	if (trace)
++		cedrus_cavs_dump_regs(ctx, "setup");
+ 	return 0;
+ }
+ 
+@@ -222,6 +319,8 @@
+ {
+ 	cedrus_write(ctx->dev, CAVS_REG(0x28), CAVS_IRQ_MASK);
+ 	cedrus_write(ctx->dev, CAVS_REG(0x24), 0x17);
++	if (ctx->codec.cavs.diag_active)
++		cedrus_cavs_dump_regs(ctx, "load");
+ 	cedrus_write(ctx->dev, CAVS_REG(0x24), 0x19);
+ }
+ 
+@@ -242,6 +341,8 @@
+ {
+ 	struct cedrus_dev *dev = ctx->dev;
+ 
++	ctx->codec.cavs.diag_logged = false;
++	ctx->codec.cavs.diag_active = false;
+ 	cedrus_cavs_invalidate_buffers(ctx);
+ 	ctx->codec.cavs.mv_size = (ALIGN(ctx->src_fmt.width, 64) / 16) *
+ 				(ALIGN(ctx->src_fmt.height, 64) / 16) * 32;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+@@ -356,6 +356,57 @@
+ 	return handled;
+ }
+ 
++void cedrus_cavs_dump_regs(struct cedrus_ctx *ctx, const char *phase)
++{
++	static const u32 offsets[] = {
++		0x04, 0x14, 0x20, 0x24, 0x28, 0x2c,
++		0x30, 0x34, 0x38, 0x3c, 0xb8, 0xf0,
++		0x0c, 0x10, 0x18, 0x40, 0x50, 0x54, 0x58, 0x5c,
++		0x60, 0xac, 0xb0, 0xb4, 0xd0, 0xd4, 0xd8,
++	};
++	static const u32 top_offsets[] = {
++		VE_PRIMARY_CHROMA_BUF_LEN, VE_PRIMARY_FB_LINE_STRIDE,
++		VE_SECONDARY_FB_LINE_STRIDE, VE_CHROMA_BUF_LEN,
++		VE_PRIMARY_OUT_FMT,
++	};
++	struct cedrus_dev *dev = ctx->dev;
++	u32 regs[ARRAY_SIZE(offsets)];
++	u32 top[ARRAY_SIZE(top_offsets)];
++	u32 mode, status;
++	unsigned int i;
++
++	mode = cedrus_read(dev, VE_MODE);
++	status = cedrus_read(dev, VE_STATUS);
++	for (i = 0; i < ARRAY_SIZE(offsets); i++)
++		regs[i] = cedrus_read(dev, VE_ENGINE_DEC_H264 + offsets[i]);
++	for (i = 0; i < ARRAY_SIZE(top_offsets); i++)
++		top[i] = cedrus_read(dev, top_offsets[i]);
++
++	dev_dbg(dev->dev,
++		 "CAVS %s: mode=%08x top_status=%08x sequence=%08x picture=%08x\n",
++		 phase, mode, status, regs[0], regs[1]);
++	dev_dbg(dev->dev,
++		 "CAVS %s: ctrl=%08x trigger=%08x status=%08x mb=%u/%u\n",
++		 phase, regs[2], regs[3], regs[4], regs[5],
++		 DIV_ROUND_UP(ctx->src_fmt.width, 16) *
++		 DIV_ROUND_UP(ctx->src_fmt.height, 16));
++	dev_dbg(dev->dev,
++		 "CAVS %s: vld=%08x offset=%u bits=%u end=%08x error=%08x start=%u\n",
++		 phase, regs[6], regs[7], regs[8], regs[9], regs[10], regs[11]);
++	dev_dbg(dev->dev,
++		 "CAVS %s: quant1=%08x quant2=%08x distance=%08x rotation=%08x\n",
++		 phase, regs[12], regs[13], regs[14], regs[15]);
++	dev_dbg(dev->dev,
++		 "CAVS %s: mv=%08x mb_info=%08x mb_size=%08x size=%08x mb_addr=%08x\n",
++		 phase, regs[16], regs[17], regs[18], regs[19], regs[20]);
++	dev_dbg(dev->dev,
++		 "CAVS %s: output=%08x/%08x forward=%08x/%08x backward=%08x/%08x\n",
++		 phase, regs[21], regs[24], regs[22], regs[25], regs[23], regs[26]);
++	dev_dbg(dev->dev,
++		 "CAVS %s: chroma_len=%08x stride=%08x secondary_stride=%08x out_ctrl=%08x format=%08x\n",
++		 phase, top[0], top[1], top[2], top[3], top[4]);
++}
++
+ void cedrus_watchdog(struct work_struct *work)
+ {
+ 	struct cedrus_dev *dev;
+@@ -375,6 +426,8 @@
+ 
+ 	v4l2_err(&dev->v4l2_dev, "frame processing timed out!\n");
+ 
++	if (ctx->src_fmt.pixelformat == V4L2_PIX_FMT_CAVS_FRAME)
++		cedrus_cavs_dump_regs(ctx, "timeout");
+ 
+ 	reset_control_reset(dev->rstc);
+ 	v4l2_m2m_buf_done_and_job_finish(ctx->dev->m2m_dev, ctx->fh.m2m_ctx,
