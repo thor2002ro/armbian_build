@@ -1,0 +1,258 @@
+From: Local Builder <builder@localhost>
+Subject: [PATCH] media: cedrus: preserve H.264 visible height
+
+Keep the visible height when the encoder uses complete macroblock rows.
+Signal the hidden rows with the H.264 frame crop fields.
+
+Signed-off-by: Local Builder <builder@localhost>
+---
+ drivers/staging/media/sunxi/cedrus/cedrus_enc.c      | 10 ++++++----
+ drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c | 37 ++++++++++++++++++++-----------------
+ drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.h | 37 ++++++++++++++++++++++++++++++++-----
+ 3 files changed, 58 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
+@@ -33,10 +33,11 @@ static int cedrus_enc_try_format(struct cedrus_ctx *ctx, struct v4l2_format *f)
+ 
+ 	if (f->type == V4L2_BUF_TYPE_VIDEO_OUTPUT) {
+ 		pix->width = ALIGN(clamp_t(u32, pix->width, 96, max_width), 16);
+-		pix->height = ALIGN(clamp_t(u32, pix->height, 48, max_height), jpeg ? 8 : 16);
++		pix->height = ALIGN(clamp_t(u32, pix->height, 48, max_height), 8);
+ 		pix->pixelformat = V4L2_PIX_FMT_NV12;
+ 		pix->bytesperline = pix->width;
+-		pix->sizeimage = pix->width * pix->height * 3 / 2;
++		pix->sizeimage = pix->width *
++			(jpeg ? pix->height : cedrus_h264_coded_height(pix->height)) * 3 / 2;
+ 	} else if (f->type == V4L2_BUF_TYPE_VIDEO_CAPTURE) {
+ 		pix->width = ctx->src_fmt.width;
+ 		pix->height = ctx->src_fmt.height;
+@@ -183,7 +184,7 @@ static int cedrus_enc_enum_framesizes(struct file *file, void *priv,
+ 		.step_width = 16,
+ 		.min_height = 48,
+ 		.max_height = jpeg ? CEDRUS_JPEG_ENC_MAX_HEIGHT : 4096,
+-		.step_height = jpeg ? 8 : 16,
++		.step_height = 8,
+ 	};
+ 	return 0;
+ }
+@@ -353,10 +354,11 @@ static int cedrus_enc_buf_prepare(struct vb2_buffer *vb)
+ 	struct cedrus_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
+ 	bool output = V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type);
+ 	u32 size = output ? ctx->src_fmt.sizeimage : ctx->dst_fmt.sizeimage;
++	u32 payload = ctx->src_fmt.width * ctx->src_fmt.height * 3 / 2;
+ 
+ 	if (vb2_plane_size(vb, 0) < size)
+ 		return -EINVAL;
+-	if (output && vb2_get_plane_payload(vb, 0) < size)
++	if (output && vb2_get_plane_payload(vb, 0) < payload)
+ 		return -EINVAL;
+ 	if (!output)
+ 		vb2_set_plane_payload(vb, 0, 0);
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.h b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.h
+@@ -14,15 +14,27 @@ struct cedrus_h264_layout {
+ 	u32 subpix;
+ };
+ 
++static inline u32 cedrus_h264_coded_width(u32 width)
++{
++	return ALIGN(width, 16);
++}
++
++static inline u32 cedrus_h264_coded_height(u32 height)
++{
++	return ALIGN(height, 16);
++}
++
+ static inline int cedrus_h264_layout(u32 width, u32 height,
+ 				     struct cedrus_h264_layout *layout)
+ {
+ 	u32 mbs;
+ 
+ 	if (width < 96 || width > 4096 || height < 48 || height > 4096 ||
+-	    (width & 15) || (height & 15))
++	    (width & 15) || (height & 7))
+ 		return -EINVAL;
+ 
++	width = cedrus_h264_coded_width(width);
++	height = cedrus_h264_coded_height(height);
+ 	mbs = width / 16;
+ 	layout->luma = ALIGN(width, 32) * ALIGN(height + 8, 64);
+ 	layout->chroma = ALIGN(width, 32) * ALIGN(height, 128) / 2;
+@@ -58,7 +70,11 @@ static const struct cedrus_h264_level cedrus_h264_levels[] = {
+ 
+ static inline u32 cedrus_h264_stream_size(u32 width, u32 height, u32 requested)
+ {
+-	u32 minimum = ALIGN(width * height * 3 / 2 + 65536, 256);
++	u32 minimum;
++
++	width = cedrus_h264_coded_width(width);
++	height = cedrus_h264_coded_height(height);
++	minimum = ALIGN(width * height * 3 / 2 + 65536, 256);
+ 
+ 	if (minimum > CEDRUS_H264_STREAM_MAX)
+ 		minimum = CEDRUS_H264_STREAM_MAX;
+@@ -99,6 +115,8 @@ static inline int cedrus_h264_config(u32 width, u32 height,
+ 	d /= divisor;
+ 	if (d > 0x7fffffff)
+ 		return -ERANGE;
++	width = cedrus_h264_coded_width(width);
++	height = cedrus_h264_coded_height(height);
+ 	mbs = width / 16 * (height / 16);
+ 	if ((u64)d * mbs > (u64)n * 16711680) {
+ 		n = mbs;
+@@ -197,6 +215,9 @@ static inline void cedrus_h264_sps(struct cedrus_h264_bits *bits,
+ 				   u32 width, u32 height, u32 level,
+ 				   u32 numerator, u32 denominator)
+ {
++	u32 coded_width = cedrus_h264_coded_width(width);
++	u32 coded_height = cedrus_h264_coded_height(height);
++
+ 	if (bits->error)
+ 		return;
+ 	if (profile != CEDRUS_H264_PROFILE_BASELINE &&
+@@ -221,11 +242,18 @@ static inline void cedrus_h264_sps(struct cedrus_h264_bits *bits,
+ 	cedrus_h264_ue(bits, 0); /* Four POC bits. */
+ 	cedrus_h264_ue(bits, 1); /* One reference. */
+ 	cedrus_h264_put(bits, 0, 1);
+-	cedrus_h264_ue(bits, width / 16 - 1);
+-	cedrus_h264_ue(bits, height / 16 - 1);
++	cedrus_h264_ue(bits, coded_width / 16 - 1);
++	cedrus_h264_ue(bits, coded_height / 16 - 1);
+ 	cedrus_h264_put(bits, 1, 1); /* Progressive pictures. */
+ 	cedrus_h264_put(bits, 1, 1);
+-	cedrus_h264_put(bits, 0, 1); /* No crop. */
++	/* The engine needs full macroblocks; SPS cropping hides the padding. */
++	cedrus_h264_put(bits, coded_width != width || coded_height != height, 1);
++	if (coded_width != width || coded_height != height) {
++		cedrus_h264_ue(bits, 0);
++		cedrus_h264_ue(bits, (coded_width - width) / 2);
++		cedrus_h264_ue(bits, 0);
++		cedrus_h264_ue(bits, (coded_height - height) / 2);
++	}
+ 	cedrus_h264_put(bits, 1, 1); /* VUI. */
+ 	cedrus_h264_put(bits, 0, 2); /* Aspect ratio and overscan absent. */
+ 	cedrus_h264_put(bits, 1, 1); /* Video signal description. */
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+@@ -59,6 +59,8 @@ static int cedrus_enc_h264_registers(struct cedrus_ctx *ctx, dma_addr_t source,
+ 	struct cedrus_dev *dev = ctx->dev;
+ 	struct cedrus_enc_ctx *enc = ctx->enc;
+ 	u32 width = ctx->src_fmt.width, height = ctx->src_fmt.height;
++	u32 coded_width = cedrus_h264_coded_width(width);
++	u32 coded_height = cedrus_h264_coded_height(height);
+ 	u32 index = enc->index, reference = enc->idr ? index : index ^ 1;
+ 	u32 start, end, recon, ref, sub, subref, info, deblock = 0, qp_map = 0, motion = 0;
+ 	u32 parameter, rate_control, smart = 0, map_qp = enc->qp;
+@@ -88,15 +90,15 @@ static int cedrus_enc_h264_registers(struct cedrus_ctx *ctx, dma_addr_t source,
+ 	ret = cedrus_h264_dma(enc->subpix[reference].dma, enc->layout.subpix, &subref);
+ 	if (ret)
+ 		return ret;
+-	ret = cedrus_h264_dma(enc->mbinfo.dma, width * 8, &info);
++	ret = cedrus_h264_dma(enc->mbinfo.dma, coded_width * 8, &info);
+ 	if (ret)
+ 		return ret;
+ 	ret = cedrus_h264_dma(enc->mb_rate_control.dma,
+ 			      enc->mb_rate_control.size, &rate_control);
+ 	if (ret)
+ 		return ret;
+-	if (width >= 2048) {
+-		ret = cedrus_h264_dma(enc->deblock.dma, width * 8, &deblock);
++	if (coded_width >= 2048) {
++		ret = cedrus_h264_dma(enc->deblock.dma, coded_width * 8, &deblock);
+ 		if (ret)
+ 			return ret;
+ 	}
+@@ -121,12 +123,12 @@ static int cedrus_enc_h264_registers(struct cedrus_ctx *ctx, dma_addr_t source,
+ 			map_qp = clamp_t(u32, map_qp, enc->min_qp, enc->max_qp);
+ 		}
+ 		ret = cedrus_h264_roi_map(enc->qp_map.cpu, enc->qp_map.size,
+-					  width, height, map_qp, enc->min_qp,
++					  coded_width, coded_height, map_qp, enc->min_qp,
+ 					  enc->max_qp, enc->active_roi);
+ 		if (ret)
+ 			return ret;
+ 		if (enc->auto_map)
+-			cedrus_enc_h264_skip_map(enc, width, height);
++			cedrus_enc_h264_skip_map(enc, coded_width, coded_height);
+ 		ret = cedrus_h264_dma(enc->qp_map.dma, enc->qp_map.size,
+ 					      &qp_map);
+ 		if (ret)
+@@ -134,9 +136,9 @@ static int cedrus_enc_h264_registers(struct cedrus_ctx *ctx, dma_addr_t source,
+ 		dma_wmb();
+ 	}
+ 	cedrus_write(dev, 0xa00, (width / 8) << 16 | height / 8);
+-	cedrus_write(dev, 0xa04, (width / 16) << 16 | width / 16);
++	cedrus_write(dev, 0xa04, (coded_width / 16) << 16 | coded_width / 16);
+ 	cedrus_write(dev, 0xa08, BIT(1)); /* NV12, BT.709, no scaling. */
+-	cedrus_write(dev, 0xa14, width / 16);
++	cedrus_write(dev, 0xa14, coded_width / 16);
+ 	cedrus_write(dev, 0xa2c, (height / 8) << 16 | width / 8);
+ 	cedrus_write(dev, 0xa78, source);
+ 	cedrus_write(dev, 0xa7c, source + width * height);
+@@ -167,7 +169,7 @@ static int cedrus_enc_h264_registers(struct cedrus_ctx *ctx, dma_addr_t source,
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0x04), parameter);
+ 	/* H616 keeps 8x8 transforms disabled. */
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0x08),
+-		     BIT(27) | DIV_ROUND_UP(width / 16, 48) << 10 | enc->qp);
++		     BIT(27) | DIV_ROUND_UP(coded_width / 16, 48) << 10 | enc->qp);
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0x0c), 0);
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0x10), CEDRUS_H616_MOTION_PARA);
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0x24), 0);
+@@ -267,5 +269,7 @@ int cedrus_enc_h264_start(struct cedrus_ctx *ctx)
+ {
+ 	struct cedrus_enc_ctx *enc = ctx->enc;
++	u32 coded_width = cedrus_h264_coded_width(ctx->src_fmt.width);
++	u32 coded_height = cedrus_h264_coded_height(ctx->src_fmt.height);
+ 	unsigned int i;
+ 	int ret;
+ 
+@@ -330,27 +334,26 @@ int cedrus_enc_h264_start(struct cedrus_ctx *ctx)
+ 		if (ret)
+ 			goto error;
+ 	}
+-	ret = cedrus_enc_dma_alloc(ctx, &enc->mbinfo, ctx->src_fmt.width * 8);
++	ret = cedrus_enc_dma_alloc(ctx, &enc->mbinfo, coded_width * 8);
+ 	if (ret)
+ 		goto error;
+-	if (ctx->src_fmt.width >= 2048) {
+-		ret = cedrus_enc_dma_alloc(ctx, &enc->deblock, ctx->src_fmt.width * 8);
++	if (coded_width >= 2048) {
++		ret = cedrus_enc_dma_alloc(ctx, &enc->deblock, coded_width * 8);
+ 		if (ret)
+ 			goto error;
+ 	}
+ 	ret = cedrus_enc_dma_alloc(ctx, &enc->mb_rate_control,
+-				   (ctx->src_fmt.height / 16) * 12 + 500);
++				   (coded_height / 16) * 12 + 500);
+ 	if (ret)
+ 		goto error;
+ 	memset(enc->mb_rate_control.cpu, 0, enc->mb_rate_control.size);
+ 	dma_wmb();
+ 	ret = cedrus_enc_dma_alloc(ctx, &enc->qp_map,
+-				   (ctx->src_fmt.width / 16) *
+-					   (ctx->src_fmt.height / 16));
++				   (coded_width / 16) * (coded_height / 16));
+ 	if (ret)
+ 		goto error;
+ 	if (enc->rc_enabled && !enc->cbr) {
+-		u32 blocks = (ctx->src_fmt.width / 16) * (ctx->src_fmt.height / 16);
++		u32 blocks = (coded_width / 16) * (coded_height / 16);
+ 
+ 		ret = cedrus_enc_dma_alloc(ctx, &enc->motion_bitmap, DIV_ROUND_UP(blocks, 2));
+ 		if (ret)
+@@ -419,6 +422,7 @@ void cedrus_enc_h264_rate_feedback(struct cedrus_ctx *ctx)
+ {
+ 	struct cedrus_enc_ctx *enc = ctx->enc;
+-	u32 width = ctx->src_fmt.width / 16, height = ctx->src_fmt.height / 16;
++	u32 width = cedrus_h264_coded_width(ctx->src_fmt.width) / 16;
++	u32 height = cedrus_h264_coded_height(ctx->src_fmt.height) / 16;
+ 	u32 i, coverage = 0;
+ 
+ 	if (enc->avbr)
+-- 
+2.51.0
