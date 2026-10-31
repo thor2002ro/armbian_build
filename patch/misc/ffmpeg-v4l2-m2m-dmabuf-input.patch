@@ -1,0 +1,665 @@
+Subject: [PATCH] Local: avcodec: import DMA-BUF input in V4L2 M2M
+
+Decoded frames already live in DMA-BUF objects, but the encoder copied them through system memory.
+
+Import only layouts that match the V4L2 queue and keep a safe MMAP fallback.
+---
+--- a/libavcodec/v4l2_buffers.c
++++ b/libavcodec/v4l2_buffers.c
+@@ -570,6 +570,101 @@
+     return 0;
+ }
+ 
++static int v4l2_buffer_drmframe_to_buf(const AVFrame *frame, V4L2Buffer *out)
++{
++    const AVDRMFrameDescriptor *desc;
++    const AVDRMLayerDescriptor *layer;
++    const struct v4l2_format *fmt = &out->context->format;
++    const int multi = V4L2_TYPE_IS_MULTIPLANAR(fmt->type);
++    int memory_planes = out->num_planes;
++
++    if (frame->format != AV_PIX_FMT_DRM_PRIME || !frame->data[0])
++        return AVERROR(EINVAL);
++
++    desc = (const AVDRMFrameDescriptor *)frame->data[0];
++    if (desc->nb_layers != 1 || desc->nb_objects < 1 ||
++        desc->nb_objects > AV_DRM_MAX_PLANES)
++        return AVERROR(EINVAL);
++    layer = &desc->layers[0];
++    if (layer->nb_planes < 1 || layer->nb_planes > AV_DRM_MAX_PLANES ||
++        memory_planes < 1)
++        return AVERROR(EINVAL);
++
++    for (int i = 0; i < desc->nb_objects; i++) {
++        if (desc->objects[i].fd < 0)
++            return AVERROR(EINVAL);
++        if (desc->objects[i].format_modifier != DRM_FORMAT_MOD_LINEAR)
++            return AVERROR(ENOSYS);
++    }
++
++    /* One queue buffer is safe only when both color planes share its object. */
++    if (memory_planes == 1) {
++        int object = layer->planes[0].object_index;
++        size_t sizeimage = multi ? fmt->fmt.pix_mp.plane_fmt[0].sizeimage :
++                                   fmt->fmt.pix.sizeimage;
++        size_t pitch = multi ? fmt->fmt.pix_mp.plane_fmt[0].bytesperline :
++                               fmt->fmt.pix.bytesperline;
++        size_t height = multi ? fmt->fmt.pix_mp.height : fmt->fmt.pix.height;
++
++        if (out->context->av_pix_fmt == AV_PIX_FMT_NV12 ||
++            out->context->av_pix_fmt == AV_PIX_FMT_NV21) {
++            uint32_t expected_format = out->context->av_pix_fmt == AV_PIX_FMT_NV12 ?
++                                       DRM_FORMAT_NV12 : DRM_FORMAT_NV21;
++
++            if (layer->nb_planes != 2 ||
++                !ff_v4l2_m2m_semiplanar_layout_compatible(
++                    layer->format, expected_format, layer->nb_planes,
++                    layer->planes[0].object_index,
++                    layer->planes[0].offset, layer->planes[0].pitch,
++                    layer->planes[1].object_index, layer->planes[1].offset,
++                    layer->planes[1].pitch, pitch, height)) {
++                av_log(logger(out), AV_LOG_ERROR,
++                       "DMA-BUF layout is incompatible with %s: expected pitch %zu and chroma offset %zu; use -input_mode mmap\n",
++                       out->context->name, pitch, pitch * height);
++                return AVERROR(EINVAL);
++            }
++        }
++
++        if (object < 0 || object >= desc->nb_objects ||
++            layer->planes[0].offset || desc->objects[object].size < sizeimage)
++            return AVERROR(EINVAL);
++        for (int i = 1; i < layer->nb_planes; i++) {
++            if (layer->planes[i].object_index != object)
++                return AVERROR(EINVAL);
++        }
++
++        if (multi) {
++            out->planes[0].m.fd = desc->objects[object].fd;
++            out->planes[0].data_offset = 0;
++            out->planes[0].bytesused = sizeimage;
++            out->planes[0].length = desc->objects[object].size;
++        } else {
++            out->buf.m.fd = desc->objects[object].fd;
++            out->buf.bytesused = sizeimage;
++            out->buf.length = desc->objects[object].size;
++        }
++    } else {
++        if (!multi || layer->nb_planes != memory_planes)
++            return AVERROR(EINVAL);
++        for (int i = 0; i < memory_planes; i++) {
++            int object = layer->planes[i].object_index;
++            size_t offset = layer->planes[i].offset;
++            size_t sizeimage = fmt->fmt.pix_mp.plane_fmt[i].sizeimage;
++
++            if (object < 0 || object >= desc->nb_objects ||
++                offset > desc->objects[object].size ||
++                sizeimage > desc->objects[object].size - offset)
++                return AVERROR(EINVAL);
++            out->planes[i].m.fd = desc->objects[object].fd;
++            out->planes[i].data_offset = offset;
++            out->planes[i].bytesused = offset + sizeimage;
++            out->planes[i].length = desc->objects[object].size;
++        }
++    }
++
++    return 0;
++}
++
+ /******************************************************************************
+  *
+  *              V4L2Buffer interface
+@@ -580,6 +652,9 @@
+ {
+     v4l2_set_pts(out, frame->pts);
+ 
++    if (out->context->memory == V4L2_MEMORY_DMABUF)
++        return v4l2_buffer_drmframe_to_buf(frame, out);
++
+     return v4l2_buffer_swframe_to_buf(frame, out);
+ }
+ 
+@@ -687,7 +762,7 @@
+     V4L2Context *ctx = avbuf->context;
+     int ret, i;
+ 
+-    avbuf->buf.memory = V4L2_MEMORY_MMAP;
++    avbuf->buf.memory = ctx->memory;
+     avbuf->buf.type = ctx->type;
+     avbuf->buf.index = index;
+ 
+@@ -717,6 +792,27 @@
+         avbuf->buf.m.planes = avbuf->planes;
+     }
+ 
++    if (ctx->memory == V4L2_MEMORY_DMABUF) {
++        if (V4L2_TYPE_IS_MULTIPLANAR(ctx->type)) {
++            avbuf->num_planes = ctx->format.fmt.pix_mp.num_planes;
++            if (avbuf->num_planes < 1 || avbuf->num_planes > VIDEO_MAX_PLANES)
++                return AVERROR(EINVAL);
++            avbuf->buf.length = avbuf->num_planes;
++            for (i = 0; i < avbuf->num_planes; i++) {
++                avbuf->plane_info[i].bytesperline =
++                    ctx->format.fmt.pix_mp.plane_fmt[i].bytesperline;
++                avbuf->plane_info[i].length =
++                    ctx->format.fmt.pix_mp.plane_fmt[i].sizeimage;
++            }
++        } else {
++            avbuf->num_planes = 1;
++            avbuf->plane_info[0].bytesperline = ctx->format.fmt.pix.bytesperline;
++            avbuf->plane_info[0].length = ctx->format.fmt.pix.sizeimage;
++        }
++        avbuf->status = V4L2BUF_AVAILABLE;
++        return 0;
++    }
++
+     ret = ioctl(buf_to_m2mctx(avbuf)->fd, VIDIOC_QUERYBUF, &avbuf->buf);
+     if (ret < 0)
+         return AVERROR(errno);
+--- a/libavcodec/v4l2_buffers.h
++++ b/libavcodec/v4l2_buffers.h
+@@ -48,6 +48,9 @@
+     /* DRM descriptor */
+     AVDRMFrameDescriptor drm_frame;
+ 
++    /* Imported frame held until the driver returns this buffer. */
++    AVFrame *source_frame;
++
+     /* This object is refcounted per-plane, so we need to keep track
+      * of how many context-refs we are holding.
+      * This pointer is a RefStruct reference. */
+--- a/libavcodec/v4l2_context.c
++++ b/libavcodec/v4l2_context.c
+@@ -380,7 +380,7 @@
+ 
+ dequeue:
+         memset(&buf, 0, sizeof(buf));
+-        buf.memory = V4L2_MEMORY_MMAP;
++        buf.memory = ctx->memory;
+         buf.type = ctx->type;
+         if (V4L2_TYPE_IS_MULTIPLANAR(ctx->type)) {
+             memset(planes, 0, sizeof(planes));
+@@ -413,6 +413,7 @@
+         }
+ 
+         avbuf = &ctx->buffers[buf.index];
++        av_frame_free(&avbuf->source_frame);
+         avbuf->status = V4L2BUF_AVAILABLE;
+         avbuf->buf = buf;
+         if (V4L2_TYPE_IS_MULTIPLANAR(ctx->type)) {
+@@ -447,7 +448,7 @@
+ static int v4l2_release_buffers(V4L2Context* ctx)
+ {
+     struct v4l2_requestbuffers req = {
+-        .memory = V4L2_MEMORY_MMAP,
++        .memory = ctx->memory,
+         .type = ctx->type,
+         .count = 0, /* 0 -> unmap all buffers from the driver */
+     };
+@@ -456,6 +457,8 @@
+     for (i = 0; i < ctx->num_buffers; i++) {
+         V4L2Buffer *buffer = &ctx->buffers[i];
+ 
++        av_frame_free(&buffer->source_frame);
++
+         for (j = 0; j < buffer->num_planes; j++) {
+             struct V4L2Plane_info *p = &buffer->plane_info[j];
+ 
+@@ -621,6 +624,8 @@
+ int ff_v4l2_context_enqueue_frame(V4L2Context* ctx, const AVFrame* frame)
+ {
+     V4L2m2mContext *s = ctx_to_m2mctx(ctx);
++    const AVFrame *input_frame = frame;
++    AVFrame *transfer_frame = NULL;
+     V4L2Buffer* avbuf;
+     int ret;
+ 
+@@ -636,11 +641,40 @@
+     if (!avbuf)
+         return AVERROR(EAGAIN);
+ 
+-    ret = ff_v4l2_buffer_avframe_to_buf(frame, avbuf);
++    if (ff_v4l2_context_needs_transfer(ctx, frame)) {
++        transfer_frame = av_frame_alloc();
++        if (!transfer_frame)
++            return AVERROR(ENOMEM);
++        transfer_frame->format = ctx->av_pix_fmt;
++        ret = av_hwframe_transfer_data(transfer_frame, frame, 0);
++        if (ret < 0) {
++            av_log(logger(ctx), AV_LOG_ERROR,
++                   "Failed to transfer DRM PRIME input to software memory: %s\n",
++                   av_err2str(ret));
++            goto fail;
++        }
++        transfer_frame->pts = frame->pts;
++        input_frame = transfer_frame;
++    }
++
++    ret = ff_v4l2_buffer_avframe_to_buf(input_frame, avbuf);
+     if (ret)
+-        return ret;
++        goto fail;
+ 
+-    return ff_v4l2_buffer_enqueue(avbuf);
++    if (ctx->memory == V4L2_MEMORY_DMABUF) {
++        avbuf->source_frame = av_frame_clone(frame);
++        if (!avbuf->source_frame) {
++            ret = AVERROR(ENOMEM);
++            goto fail;
++        }
++    }
++
++    ret = ff_v4l2_buffer_enqueue(avbuf);
++    if (ret < 0)
++        av_frame_free(&avbuf->source_frame);
++fail:
++    av_frame_free(&transfer_frame);
++    return ret;
+ }
+ 
+ int ff_v4l2_context_enqueue_packet(V4L2Context* ctx, const AVPacket* pkt)
+@@ -771,9 +805,18 @@
+ 
+     memset(&req, 0, sizeof(req));
+     req.count = ctx->num_buffers;
+-    req.memory = V4L2_MEMORY_MMAP;
++    req.memory = ctx->memory;
+     req.type = ctx->type;
+     ret = ioctl(s->fd, VIDIOC_REQBUFS, &req);
++    if (ret < 0 && ff_v4l2_context_use_mmap_fallback(ctx, errno)) {
++        av_log(logger(ctx), AV_LOG_WARNING,
++               "%s DMA-BUF input is unsupported; falling back to MMAP software transfer\n",
++               ctx->name);
++        ctx->memory = V4L2_MEMORY_MMAP;
++        req.count = ctx->num_buffers;
++        req.memory = ctx->memory;
++        ret = ioctl(s->fd, VIDIOC_REQBUFS, &req);
++    }
+     if (ret < 0) {
+         av_log(logger(ctx), AV_LOG_ERROR, "%s VIDIOC_REQBUFS failed: %s\n", ctx->name, strerror(errno));
+         return AVERROR(errno);
+--- a/libavcodec/v4l2_context.h
++++ b/libavcodec/v4l2_context.h
+@@ -24,6 +24,7 @@
+ #ifndef AVCODEC_V4L2_CONTEXT_H
+ #define AVCODEC_V4L2_CONTEXT_H
+ 
++#include <errno.h>
+ #include <stdint.h>
+ #include <linux/videodev2.h>
+ 
+@@ -48,6 +49,16 @@
+     enum v4l2_buf_type type;
+ 
+     /**
++     * V4L2 memory type used for this buffer context.
++     */
++    enum v4l2_memory memory;
++
++    /**
++     * Allow an unsupported DMA-BUF queue to retry with MMAP.
++     */
++    int allow_mmap_fallback;
++
++    /**
+      * AVPixelFormat corresponding to this buffer context.
+      * AV_PIX_FMT_NONE means this is an encoded stream.
+      */
+@@ -97,6 +108,20 @@
+ 
+ } V4L2Context;
+ 
++static inline int ff_v4l2_context_use_mmap_fallback(const V4L2Context *ctx,
++                                                     int error)
++{
++    return ctx->memory == V4L2_MEMORY_DMABUF &&
++           ctx->allow_mmap_fallback && error == EINVAL;
++}
++
++static inline int ff_v4l2_context_needs_transfer(const V4L2Context *ctx,
++                                                  const AVFrame *frame)
++{
++    return ctx->memory == V4L2_MEMORY_MMAP &&
++           frame->format == AV_PIX_FMT_DRM_PRIME;
++}
++
+ /**
+  * Initializes a V4L2Context.
+  *
+--- a/libavcodec/v4l2_m2m.c
++++ b/libavcodec/v4l2_m2m.c
+@@ -363,6 +363,8 @@
+     /* populate it */
+     priv->context->capture.num_buffers = priv->num_capture_buffers;
+     priv->context->output.num_buffers  = priv->num_output_buffers;
++    priv->context->capture.memory = V4L2_MEMORY_MMAP;
++    priv->context->output.memory = V4L2_MEMORY_MMAP;
+     priv->context->self_ref = priv->context;
+     priv->context->fd = -1;
+ 
+--- a/libavcodec/v4l2_m2m.h
++++ b/libavcodec/v4l2_m2m.h
+@@ -41,6 +41,52 @@
+     { "num_output_buffers", "Number of buffers in the output context",\
+         OFFSET(num_output_buffers), AV_OPT_TYPE_INT, { .i64 = 16 }, 2, INT_MAX, FLAGS }
+ 
++enum V4L2m2mInputMode {
++    V4L2_M2M_INPUT_AUTO,
++    V4L2_M2M_INPUT_DMABUF,
++    V4L2_M2M_INPUT_MMAP,
++};
++
++static inline int ff_v4l2_m2m_dmabuf_layout_compatible(int frame_width,
++                                                        int frame_height,
++                                                        int visible_width,
++                                                        int visible_height)
++{
++    return frame_width == visible_width &&
++           frame_height == visible_height;
++}
++
++static inline int ff_v4l2_m2m_resolve_input_mode(int input_mode,
++                                                  int frame_width,
++                                                  int frame_height,
++                                                  int visible_width,
++                                                  int visible_height)
++{
++    if (ff_v4l2_m2m_dmabuf_layout_compatible(frame_width, frame_height,
++                                               visible_width, visible_height))
++        return input_mode;
++    if (input_mode == V4L2_M2M_INPUT_AUTO)
++        return V4L2_M2M_INPUT_MMAP;
++    if (input_mode == V4L2_M2M_INPUT_DMABUF)
++        return -1;
++    return input_mode;
++}
++
++static inline int ff_v4l2_m2m_semiplanar_layout_compatible(
++    uint32_t format, uint32_t expected_format, int plane_count,
++    int luma_object, size_t luma_offset, size_t luma_pitch,
++    int chroma_object, size_t chroma_offset, size_t chroma_pitch,
++    size_t expected_pitch, size_t expected_height)
++{
++    return format == expected_format &&
++           plane_count == 2 &&
++           luma_object == chroma_object &&
++           luma_offset == 0 &&
++           luma_pitch == expected_pitch &&
++           chroma_offset == expected_pitch * expected_height &&
++           chroma_pitch == expected_pitch;
++}
++
+ typedef struct V4L2m2mContext {
+     char devname[PATH_MAX];
+     int fd;
+@@ -82,6 +88,7 @@
+     int num_output_buffers;
+     int num_capture_buffers;
+     enum AVPixelFormat pix_fmt;
++    int input_mode;
+     int cedrus_h264;
+     int cedrus_avbr, cedrus_avbr_quality, cedrus_static_quality, cedrus_motion_threshold;
+     int jpeg_quality;
+--- a/libavcodec/v4l2_m2m_enc.c
++++ b/libavcodec/v4l2_m2m_enc.c
+@@ -30,6 +30,8 @@
++#include "libavutil/hwcontext.h"
+ #include "libavutil/pixfmt.h"
+ #include "libavutil/opt.h"
+ #include "codec_internal.h"
++#include "hwconfig.h"
+ #include "profiles.h"
+ #include "v4l2_context.h"
+ #include "v4l2_m2m.h"
+@@ -497,6 +499,38 @@
+         }
+     }
+ 
++    if (avctx->pix_fmt == AV_PIX_FMT_DRM_PRIME) {
++        if (!avctx->hw_frames_ctx || avctx->sw_pix_fmt == AV_PIX_FMT_NONE) {
++            av_log(avctx, AV_LOG_ERROR, "DRM PRIME input requires a hardware frame context\n");
++            return AVERROR(EINVAL);
++        }
++
++        const AVHWFramesContext *hw_frames =
++            (const AVHWFramesContext *)avctx->hw_frames_ctx->data;
++        int resolved_input_mode;
++
++        resolved_input_mode = ff_v4l2_m2m_resolve_input_mode(
++            priv->input_mode, hw_frames->width, hw_frames->height,
++            avctx->width, avctx->height);
++        if (resolved_input_mode < 0) {
++            av_log(avctx, AV_LOG_ERROR,
++                   "DMA-BUF frame size %dx%d differs from visible size %dx%d; use -input_mode mmap\n",
++                   hw_frames->width, hw_frames->height,
++                   avctx->width, avctx->height);
++            return AVERROR(EINVAL);
++        }
++        if (resolved_input_mode != priv->input_mode) {
++            av_log(avctx, AV_LOG_WARNING,
++                   "DMA-BUF frame size %dx%d differs from visible size %dx%d; using MMAP software transfer\n",
++                   hw_frames->width, hw_frames->height,
++                   avctx->width, avctx->height);
++        }
++        priv->input_mode = resolved_input_mode;
++    } else if (priv->input_mode == V4L2_M2M_INPUT_DMABUF) {
++        av_log(avctx, AV_LOG_ERROR, "DMA-BUF input requires DRM PRIME frames\n");
++        return AVERROR(EINVAL);
++    }
++
+     ret = ff_v4l2_m2m_create_context(priv, &s);
+     if (ret < 0)
+         return ret;
+@@ -510,7 +521,17 @@
+ 
+     /* output context */
+     output->av_codec_id = AV_CODEC_ID_RAWVIDEO;
+-    output->av_pix_fmt = avctx->pix_fmt;
++    if (avctx->pix_fmt == AV_PIX_FMT_DRM_PRIME) {
++        output->av_pix_fmt = avctx->sw_pix_fmt;
++        if (priv->input_mode == V4L2_M2M_INPUT_MMAP) {
++            output->memory = V4L2_MEMORY_MMAP;
++        } else {
++            output->memory = V4L2_MEMORY_DMABUF;
++            output->allow_mmap_fallback = priv->input_mode == V4L2_M2M_INPUT_AUTO;
++        }
++    } else {
++        output->av_pix_fmt = avctx->pix_fmt;
++    }
+ 
+     /* capture context */
+     capture->av_codec_id = avctx->codec_id;
+@@ -523,6 +544,12 @@
+         return ret;
+     }
+ 
++    if (avctx->pix_fmt == AV_PIX_FMT_DRM_PRIME) {
++        av_log(avctx, AV_LOG_INFO, "Using %s input for %s frames\n",
++               output->memory == V4L2_MEMORY_DMABUF ? "DMA-BUF" : "MMAP software",
++               av_get_pix_fmt_name(output->av_pix_fmt));
++    }
++
+     if (V4L2_TYPE_IS_MULTIPLANAR(output->type))
+         v4l2_fmt_output = output->format.fmt.pix_mp.pixelformat;
+     else
+@@ -543,7 +570,7 @@
+     }
+ 
+     pix_fmt_output = ff_v4l2_format_v4l2_to_avfmt(v4l2_fmt_output, AV_CODEC_ID_RAWVIDEO);
+-    if (pix_fmt_output != avctx->pix_fmt) {
++    if (pix_fmt_output != output->av_pix_fmt) {
+         const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(pix_fmt_output);
+         av_log(avctx, AV_LOG_ERROR, "Encoder requires %s pixel format.\n", desc ? desc->name : "unknown");
+         return AVERROR(EINVAL);
+@@ -560,8 +587,20 @@
+ #define OFFSET(x) offsetof(V4L2m2mPriv, x)
+ #define FLAGS AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
+ 
++#define V4L_M2M_INPUT_OPTS \
++    { "input_mode", "Select the raw frame input mode", OFFSET(input_mode), \
++      AV_OPT_TYPE_INT, { .i64 = V4L2_M2M_INPUT_AUTO }, \
++      V4L2_M2M_INPUT_AUTO, V4L2_M2M_INPUT_MMAP, FLAGS, .unit = "input_mode" }, \
++    { "auto", "Try DMA-BUF and fall back to MMAP", 0, AV_OPT_TYPE_CONST, \
++      { .i64 = V4L2_M2M_INPUT_AUTO }, 0, 0, FLAGS, .unit = "input_mode" }, \
++    { "dmabuf", "Require DMA-BUF input", 0, AV_OPT_TYPE_CONST, \
++      { .i64 = V4L2_M2M_INPUT_DMABUF }, 0, 0, FLAGS, .unit = "input_mode" }, \
++    { "mmap", "Use MMAP with a software transfer", 0, AV_OPT_TYPE_CONST, \
++      { .i64 = V4L2_M2M_INPUT_MMAP }, 0, 0, FLAGS, .unit = "input_mode" }
++
+ #define V4L_M2M_CAPTURE_OPTS \
+     V4L_M2M_DEFAULT_OPTS,\
++    V4L_M2M_INPUT_OPTS,\
+     { "num_capture_buffers", "Number of buffers in the capture context", \
+         OFFSET(num_capture_buffers), AV_OPT_TYPE_INT, {.i64 = 4 }, 4, INT_MAX, FLAGS }
+ 
+@@ -576,6 +615,7 @@
+       OFFSET(num_output_buffers), AV_OPT_TYPE_INT, { .i64 = 2 }, 1, INT_MAX, FLAGS },
+     { "num_capture_buffers", "Number of buffers in the capture context",
+       OFFSET(num_capture_buffers), AV_OPT_TYPE_INT, { .i64 = 2 }, 1, INT_MAX, FLAGS },
++    V4L_M2M_INPUT_OPTS,
+     { "quality", "JPEG quality", OFFSET(jpeg_quality), AV_OPT_TYPE_INT,
+       { .i64 = 95 }, 1, 100, FLAGS },
+     { NULL },
+@@ -629,6 +669,12 @@
+     { NULL },
+ };
+ 
++static const AVCodecHWConfigInternal *const v4l2_m2m_enc_hw_configs[] = {
++    HW_CONFIG_ENCODER_FRAMES(DRM_PRIME, V4L2REQUEST),
++    HW_CONFIG_ENCODER_FRAMES(DRM_PRIME, DRM),
++    NULL
++};
++
+ #define M2MENC_CLASS(NAME, OPTIONS_NAME) \
+     static const AVClass v4l2_m2m_ ## NAME ## _enc_class = { \
+         .class_name = #NAME "_v4l2m2m_encoder", \
+@@ -656,6 +702,7 @@
+         .caps_internal  = FF_CODEC_CAP_NOT_INIT_THREADSAFE | \
+                           FF_CODEC_CAP_INIT_CLEANUP, \
+         .p.wrapper_name = "v4l2m2m", \
++        .hw_configs     = v4l2_m2m_enc_hw_configs, \
+     }
+ 
+ M2MENC(mpeg4,"MPEG4", mpeg4_options, AV_CODEC_ID_MPEG4, AVCOL_RANGE_MPEG);
+--- a/libavcodec/v4l2_m2m.h
++++ b/libavcodec/v4l2_m2m.h
+@@ -60,9 +60,12 @@
+                                                   int frame_width,
+                                                   int frame_height,
+                                                   int visible_width,
+-                                                  int visible_height)
++                                                  int visible_height,
++                                                  int separate_planes)
+ {
+-    if (ff_v4l2_m2m_dmabuf_layout_compatible(frame_width, frame_height,
++    if ((separate_planes && frame_width == visible_width &&
++         frame_height >= visible_height) ||
++        ff_v4l2_m2m_dmabuf_layout_compatible(frame_width, frame_height,
+                                                visible_width, visible_height))
+         return input_mode;
+     if (input_mode == V4L2_M2M_INPUT_AUTO)
+@@ -87,6 +89,17 @@
+            chroma_pitch == expected_pitch;
+ }
+ 
++static inline int ff_v4l2_m2m_semiplanar_multiplanar_layout_compatible(
++    uint32_t format, uint32_t expected_format, int plane_count,
++    size_t luma_pitch, size_t chroma_pitch,
++    size_t expected_luma_pitch, size_t expected_chroma_pitch)
++{
++    return format == expected_format &&
++           plane_count == 2 &&
++           luma_pitch == expected_luma_pitch &&
++           chroma_pitch == expected_chroma_pitch;
++}
++
+ typedef struct V4L2m2mContext {
+     char devname[PATH_MAX];
+     int fd;
+--- a/libavcodec/v4l2_m2m_enc.c
++++ b/libavcodec/v4l2_m2m_enc.c
+@@ -511,7 +511,7 @@
+ 
+         resolved_input_mode = ff_v4l2_m2m_resolve_input_mode(
+             priv->input_mode, hw_frames->width, hw_frames->height,
+-            avctx->width, avctx->height);
++            avctx->width, avctx->height, 1);
+         if (resolved_input_mode < 0) {
+             av_log(avctx, AV_LOG_ERROR,
+                    "DMA-BUF frame size %dx%d differs from visible size %dx%d; use -input_mode mmap\n",
+@@ -568,6 +568,36 @@
+     }
+ 
+     if (avctx->pix_fmt == AV_PIX_FMT_DRM_PRIME) {
++        const AVHWFramesContext *hw_frames =
++            (const AVHWFramesContext *)avctx->hw_frames_ctx->data;
++        int separate_planes =
++            V4L2_TYPE_IS_MULTIPLANAR(output->type) &&
++            output->format.fmt.pix_mp.pixelformat == V4L2_PIX_FMT_NV12M &&
++            output->format.fmt.pix_mp.num_planes == 2;
++        int resolved_input_mode = ff_v4l2_m2m_resolve_input_mode(
++            priv->input_mode, hw_frames->width, hw_frames->height,
++            avctx->width, avctx->height, separate_planes);
++
++        if (resolved_input_mode < 0) {
++            av_log(avctx, AV_LOG_ERROR,
++                   "DMA-BUF frame size %dx%d requires separate encoder planes; use -input_mode mmap\n",
++                   hw_frames->width, hw_frames->height);
++            return AVERROR(EINVAL);
++        }
++        if (resolved_input_mode != priv->input_mode) {
++            av_log(avctx, AV_LOG_WARNING,
++                   "DMA-BUF frame layout requires MMAP software transfer\n");
++            ff_v4l2_context_release(output);
++            output->memory = V4L2_MEMORY_MMAP;
++            output->allow_mmap_fallback = 0;
++            ret = ff_v4l2_context_init(output);
++            if (ret < 0)
++                return ret;
++            priv->input_mode = resolved_input_mode;
++        }
++    }
++
++    if (avctx->pix_fmt == AV_PIX_FMT_DRM_PRIME) {
+         av_log(avctx, AV_LOG_INFO, "Using %s input for %s frames\n",
+                output->memory == V4L2_MEMORY_DMABUF ? "DMA-BUF" : "MMAP software",
+                av_get_pix_fmt_name(output->av_pix_fmt));
+--- a/libavcodec/v4l2_context.c
++++ b/libavcodec/v4l2_context.c
+@@ -512,6 +512,17 @@
+     if (!v4l2_fmt)
+         return AVERROR(EINVAL);
+ 
++    if (ctx->memory == V4L2_MEMORY_DMABUF &&
++        V4L2_TYPE_IS_MULTIPLANAR(ctx->type) &&
++        pixfmt == AV_PIX_FMT_NV12) {
++        fmt->fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12M;
++        fmt->type = ctx->type;
++        ret = ioctl(ctx_to_m2mctx(ctx)->fd, VIDIOC_TRY_FMT, fmt);
++        if (!ret && fmt->fmt.pix_mp.pixelformat == V4L2_PIX_FMT_NV12M &&
++            fmt->fmt.pix_mp.num_planes == 2)
++            return 0;
++    }
++
+     if (V4L2_TYPE_IS_MULTIPLANAR(ctx->type))
+         fmt->fmt.pix_mp.pixelformat = v4l2_fmt;
+     else
+--- a/libavcodec/v4l2_buffers.c
++++ b/libavcodec/v4l2_buffers.c
+@@ -645,6 +645,17 @@
+     } else {
+         if (!multi || layer->nb_planes != memory_planes)
+             return AVERROR(EINVAL);
++        if ((out->context->av_pix_fmt == AV_PIX_FMT_NV12 ||
++             out->context->av_pix_fmt == AV_PIX_FMT_NV21) &&
++            !ff_v4l2_m2m_semiplanar_multiplanar_layout_compatible(
++                layer->format,
++                out->context->av_pix_fmt == AV_PIX_FMT_NV12 ?
++                    DRM_FORMAT_NV12 : DRM_FORMAT_NV21,
++                layer->nb_planes,
++                layer->planes[0].pitch, layer->planes[1].pitch,
++                fmt->fmt.pix_mp.plane_fmt[0].bytesperline,
++                fmt->fmt.pix_mp.plane_fmt[1].bytesperline))
++            return AVERROR(EINVAL);
+         for (int i = 0; i < memory_planes; i++) {
+             int object = layer->planes[i].object_index;
+             size_t offset = layer->planes[i].offset;
