@@ -1,0 +1,89 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: avcodec: copy V4L2 M2M encoded packets
+
+A muxer can retain an encoded packet and keep its V4L2 capture buffer busy.
+
+Detach the packet first so the driver can reuse the capture buffer immediately.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/libavcodec/v4l2_buffers.c b/libavcodec/v4l2_buffers.c
+--- a/libavcodec/v4l2_buffers.c
++++ b/libavcodec/v4l2_buffers.c
+@@ -644,6 +644,29 @@ int ff_v4l2_buffer_buf_to_avpkt(AVPacket *pkt, V4L2Buffer *avbuf)
+     return 0;
+ }
+ 
++int ff_v4l2_buffer_detach_avpkt(AVPacket *pkt)
++{
++    AVBufferRef *capture_buf;
++    int ret;
++
++    if (!pkt->buf)
++        return AVERROR(EINVAL);
++
++    /* Hold the capture buffer only while the packet copies its data. */
++    capture_buf = av_buffer_ref(pkt->buf);
++    if (!capture_buf) {
++        av_packet_unref(pkt);
++        return AVERROR(ENOMEM);
++    }
++
++    ret = av_packet_make_writable(pkt);
++    av_buffer_unref(&capture_buf);
++    if (ret < 0)
++        av_packet_unref(pkt);
++
++    return ret;
++}
++
+ int ff_v4l2_buffer_avpkt_to_buf(const AVPacket *pkt, V4L2Buffer *out)
+ {
+     int ret;
+diff --git a/libavcodec/v4l2_buffers.h b/libavcodec/v4l2_buffers.h
+--- a/libavcodec/v4l2_buffers.h
++++ b/libavcodec/v4l2_buffers.h
+@@ -96,6 +96,15 @@
+ int ff_v4l2_buffer_buf_to_avpkt(AVPacket *pkt, V4L2Buffer *buf);
+ 
+ /**
++ * Copies packet data and releases its V4L2 buffer reference.
++ *
++ * @param[in,out] pkt Packet backed by a V4L2 capture buffer
++ *
++ * @returns 0 in case of success, a negative AVERROR code otherwise
++ */
++int ff_v4l2_buffer_detach_avpkt(AVPacket *pkt);
++
++/**
+  * Extracts the data from an AVPacket to a V4L2Buffer
+  *
+  * @param[in]  frame AVPacket to get the data from
+diff --git a/libavcodec/v4l2_m2m_enc.c b/libavcodec/v4l2_m2m_enc.c
+--- a/libavcodec/v4l2_m2m_enc.c
++++ b/libavcodec/v4l2_m2m_enc.c
+@@ -458,13 +458,21 @@ static int v4l2_receive_packet(AVCodecContext *avctx, AVPacket *avpkt)
+ 
+ dequeue:
+     ret = ff_v4l2_context_dequeue_packet(capture, avpkt);
+-    if (ret >= 0 && avctx->codec_id == AV_CODEC_ID_MJPEG) {
++    if (ret < 0)
++        return ret;
++    if (avctx->codec_id == AV_CODEC_ID_MJPEG)
++        priv->jpeg_pending = 0;
++
++    ret = ff_v4l2_buffer_detach_avpkt(avpkt);
++    if (ret < 0)
++        return ret;
++
++    if (avctx->codec_id == AV_CODEC_ID_MJPEG) {
+         avpkt->flags |= AV_PKT_FLAG_KEY;
+-        priv->jpeg_pending = 0;
+         if (priv->jpeg_target_bits && !(avpkt->flags & AV_PKT_FLAG_CORRUPT))
+             priv->jpeg_rc_quality = v4l2_mjpeg_rc_quality(priv, (int64_t)avpkt->size * 8);
+     }
+-    return ret;
++    return 0;
+ }
+ 
+ static av_cold int v4l2_encode_init(AVCodecContext *avctx)
