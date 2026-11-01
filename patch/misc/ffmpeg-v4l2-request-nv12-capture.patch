@@ -1,0 +1,194 @@
+From: Local <local@localhost>
+Subject: [PATCH] Local: avutil: select V4L2 Request NV12 capture
+
+Allow callers to request NV12 capture from a V4L2 Request decoder.
+Keep native source-depth selection as the default.
+Reject drivers that substitute another explicit capture format.
+
+---
+diff --git a/libavutil/hwcontext_v4l2request.c b/libavutil/hwcontext_v4l2request.c
+--- a/libavutil/hwcontext_v4l2request.c
++++ b/libavutil/hwcontext_v4l2request.c
+@@ -23,6 +23,7 @@
+ #include <linux/media.h>
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
++#include <string.h>
+ #include <unistd.h>
+ 
+ #include <drm_fourcc.h>
+@@ -44,6 +45,7 @@
+ typedef struct V4L2RequestDeviceContext {
+     V4L2RequestVideoDecoder *decoders;
+     int nb_decoders;
++    uint32_t capture_pixelformat;
+ } V4L2RequestDeviceContext;
+ 
+ typedef struct V4L2RequestFramesContext {
+@@ -205,14 +207,53 @@ static void v4l2request_device_uninit(AVHWDeviceContext *hwdev)
+     hwctx->nb_decoders = 0;
+ }
+ 
++static int v4l2request_parse_capture_format(const char *value,
++                                            uint32_t *pixelformat)
++{
++    *pixelformat = 0;
++
++    if (!value || !strcmp(value, "native"))
++        return 0;
++
++    if (!strcmp(value, "nv12")) {
++        *pixelformat = V4L2_PIX_FMT_NV12;
++        return 0;
++    }
++
++    return AVERROR(EINVAL);
++}
++
++static int v4l2request_capture_format_score(uint32_t preferred,
++                                            uint32_t candidate,
++                                            uint32_t requested_depth,
++                                            uint32_t candidate_depth)
++{
++    if (preferred)
++        return preferred == candidate;
++
++    return !requested_depth || requested_depth == candidate_depth;
++}
++
+ static int v4l2request_device_create(AVHWDeviceContext *hwdev, const char *device,
+                                      AVDictionary *opts, int flags)
+ {
+     V4L2RequestDeviceContext *hwctx = hwdev->hwctx;
++    const AVDictionaryEntry *entry;
++    int ret;
+ 
+     hwctx->decoders = NULL;
+     hwctx->nb_decoders = 0;
+ 
++    entry = av_dict_get(opts, "capture_format", NULL, 0);
++    ret = v4l2request_parse_capture_format(entry ? entry->value : NULL,
++                                           &hwctx->capture_pixelformat);
++    if (ret < 0) {
++        av_log(hwdev, AV_LOG_ERROR,
++               "Invalid V4L2 Request capture format '%s'; use native or nv12\n",
++               entry ? entry->value : "");
++        return ret;
++    }
++
+     // TODO: enumerate V4L2 Request API capable video decoders
+     //       and fill hwctx->decoders and hwctx->nb_decoders,
+     //       limit to decoders for the media 'device' when specified
+@@ -220,13 +261,25 @@ static int v4l2request_device_create(AVHWDeviceContext *hwdev, const char *device,
+     return 0;
+ }
+ 
++static int v4l2request_validate_format(uint32_t requested,
++                                       uint32_t negotiated,
++                                       int exact)
++{
++    if (exact && requested != negotiated)
++        return AVERROR(EINVAL);
++
++    return 0;
++}
++
+ static int v4l2request_set_format(AVHWFramesContext *hwfc,
+                                   enum v4l2_buf_type type,
+                                   uint32_t pixelformat,
+-                                  uint32_t buffersize)
++                                  uint32_t buffersize,
++                                  int exact_pixelformat)
+ {
+     AVV4L2RequestFramesContext *fctx = hwfc->hwctx;
+     AVV4L2RequestFramesContextInternal *fctxi = fctx->internal;
++    uint32_t negotiated;
+     struct v4l2_format format = {
+         .type = type,
+     };
+@@ -247,11 +300,23 @@ static int v4l2request_set_format(AVHWFramesContext *hwfc,
+     if (ioctl(fctxi->video_fd, VIDIOC_S_FMT, &format) < 0)
+         return AVERROR(errno);
+ 
++    negotiated = V4L2_TYPE_IS_MULTIPLANAR(type) ?
++                 format.fmt.pix_mp.pixelformat :
++                 format.fmt.pix.pixelformat;
++    if (v4l2request_validate_format(pixelformat, negotiated,
++                                    exact_pixelformat) < 0) {
++        av_log(hwfc, AV_LOG_ERROR,
++               "Driver substituted CAPTURE format %s for requested %s\n",
++               av_fourcc2str(negotiated), av_fourcc2str(pixelformat));
++        return AVERROR(EINVAL);
++    }
++
+     return 0;
+ }
+ 
+ static int v4l2request_select_capture_format(AVHWFramesContext *hwfc)
+ {
++    V4L2RequestDeviceContext *device = hwfc->device_ctx->hwctx;
+     AVV4L2RequestFramesContext *fctx = hwfc->hwctx;
+     AVV4L2RequestFramesContextInternal *fctxi = fctx->internal;
+     enum v4l2_buf_type type = fctxi->capture.format.type;
+@@ -275,19 +340,26 @@ static int v4l2request_select_capture_format(AVHWFramesContext *hwfc)
+     // Try to use the driver preferred format when it is a known format
+     for (int i = 0; i < FF_ARRAY_ELEMS(v4l2request_capture_pixelformats); i++) {
+         if (pixelformat == v4l2request_capture_pixelformats[i].pixelformat &&
+-            (fctx->bit_depth == v4l2request_capture_pixelformats[i].bit_depth ||
+-             !fctx->bit_depth))
+-            return v4l2request_set_format(hwfc, type, pixelformat, 0);
++            v4l2request_capture_format_score(
++                device->capture_pixelformat, pixelformat, fctx->bit_depth,
++                v4l2request_capture_pixelformats[i].bit_depth))
++            return v4l2request_set_format(
++                hwfc, type, pixelformat, 0,
++                device->capture_pixelformat != 0);
+     }
+ 
+     // Next try to use the first known format with matching bit depth
+     while (ioctl(fctxi->video_fd, VIDIOC_ENUM_FMT, &fmtdesc) >= 0) {
+         for (int i = 0; i < FF_ARRAY_ELEMS(v4l2request_capture_pixelformats); i++) {
+             if (fmtdesc.pixelformat == v4l2request_capture_pixelformats[i].pixelformat) {
+-                if (fctx->bit_depth == v4l2request_capture_pixelformats[i].bit_depth ||
+-                    !fctx->bit_depth)
+-                    return v4l2request_set_format(hwfc, type, fmtdesc.pixelformat, 0);
+-                else if (!fallback)
++                if (v4l2request_capture_format_score(
++                        device->capture_pixelformat, fmtdesc.pixelformat,
++                        fctx->bit_depth,
++                        v4l2request_capture_pixelformats[i].bit_depth))
++                    return v4l2request_set_format(
++                        hwfc, type, fmtdesc.pixelformat, 0,
++                        device->capture_pixelformat != 0);
++                else if (!device->capture_pixelformat && !fallback)
+                     fallback = fmtdesc.pixelformat;
+             }
+         }
+@@ -295,9 +367,16 @@ static int v4l2request_select_capture_format(AVHWFramesContext *hwfc)
+         fmtdesc.index++;
+     }
+ 
++    if (device->capture_pixelformat) {
++        av_log(hwfc, AV_LOG_ERROR,
++               "Requested V4L2 Request capture format %s is unsupported\n",
++               av_fourcc2str(device->capture_pixelformat));
++        return AVERROR(EINVAL);
++    }
++
+     // Fallback to use the first known format
+     if (fallback)
+-        return v4l2request_set_format(hwfc, type, fallback, 0);
++        return v4l2request_set_format(hwfc, type, fallback, 0, 0);
+ 
+     return AVERROR(errno);
+ }
+@@ -471,7 +550,8 @@ static int v4l2request_try_video_device(AVHWFramesContext *hwfc,
+     }
+ 
+     // Set the codec pixelformat and OUTPUT buffersize to be used
+-    ret = v4l2request_set_format(hwfc, fctxi->output.format.type, pixelformat, buffersize);
++    ret = v4l2request_set_format(hwfc, fctxi->output.format.type,
++                                 pixelformat, buffersize, 0);
+     if (ret < 0) {
+         av_log(hwfc, AV_LOG_ERROR,
+                "Failed to set OUTPUT pixelformat %s of %s: %s (%d)\n",
