@@ -1,0 +1,451 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: media: cedrus: select named DT codec clocks
+
+Map every vendor decoder and encoder codec with named DT mask bits.
+Select 696 MHz for H616 and H618 encoders.
+Keep 600 MHz for missing or unmatched policy data.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi b/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
+index 51c0445..ab19666 100644
+--- a/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
++++ b/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
+@@ -4,6 +4,7 @@
+ //   Copyright (C) 2017 Icenowy Zheng <icenowy@aosc.io>
+ 
+ #include <dt-bindings/interrupt-controller/arm-gic.h>
++#include <dt-bindings/media/allwinner-cedrus.h>
+ #include <dt-bindings/clock/sun50i-h616-ccu.h>
+ #include <dt-bindings/clock/sun50i-h6-r-ccu.h>
+ #include <dt-bindings/clock/sun6i-rtc.h>
+@@ -127,6 +128,30 @@
+ 		};
+ 	};
+ 
++	ve_opp_table: opp-table-ve {
++		compatible = "operating-points-v2";
++
++		opp-564000000 {
++			opp-hz = /bits/ 64 <564000000>;
++		};
++
++		opp-576000000 {
++			opp-hz = /bits/ 64 <576000000>;
++		};
++
++		opp-624000000 {
++			opp-hz = /bits/ 64 <624000000>;
++		};
++
++		opp-648000000 {
++			opp-hz = /bits/ 64 <648000000>;
++		};
++
++		opp-696000000 {
++			opp-hz = /bits/ 64 <696000000>;
++		};
++	};
++
+ 	osc24M: osc24M-clk {
+ 		#clock-cells = <0>;
+ 		compatible = "fixed-clock";
+@@ -338,6 +363,55 @@
+ 			resets = <&ccu RST_BUS_VE>;
+ 			interrupts = <GIC_SPI 93 IRQ_TYPE_LEVEL_HIGH>;
+ 			allwinner,sram = <&ve_sram 1>;
++			operating-points-v2 = <&ve_opp_table>;
++			/* SID, codec mask, and rate in Hz. */
++			allwinner,ve-clock-rate-map =
++				<0x0003 (CEDRUS_CODEC_DEC_ALL &
++					  ~(CEDRUS_CODEC_DEC_VP9 |
++					    CEDRUS_CODEC_DEC_H265 |
++					    CEDRUS_CODEC_DEC_AVS2)) 576000000>,
++				<0x0003 (CEDRUS_CODEC_DEC_VP9 |
++					  CEDRUS_CODEC_DEC_H265 |
++					  CEDRUS_CODEC_DEC_AVS2) 624000000>,
++				<0x0004 (CEDRUS_CODEC_DEC_ALL &
++					  ~(CEDRUS_CODEC_DEC_VP9 |
++					    CEDRUS_CODEC_DEC_H265 |
++					    CEDRUS_CODEC_DEC_AVS2)) 576000000>,
++				<0x0004 (CEDRUS_CODEC_DEC_VP9 |
++					  CEDRUS_CODEC_DEC_H265 |
++					  CEDRUS_CODEC_DEC_AVS2) 624000000>,
++				<0x0008 (CEDRUS_CODEC_DEC_ALL &
++					  ~(CEDRUS_CODEC_DEC_VP9 |
++					    CEDRUS_CODEC_DEC_H265 |
++					    CEDRUS_CODEC_DEC_AVS2)) 576000000>,
++				<0x0008 (CEDRUS_CODEC_DEC_VP9 |
++					  CEDRUS_CODEC_DEC_H265 |
++					  CEDRUS_CODEC_DEC_AVS2) 624000000>,
++				<0x5000 CEDRUS_CODEC_DEC_ALL 624000000>,
++				<0x5400 CEDRUS_CODEC_DEC_ALL 624000000>,
++				<0x6c00 CEDRUS_CODEC_DEC_ALL 624000000>,
++				<0x2000 CEDRUS_CODEC_DEC_ALL 648000000>,
++				<0x2100 CEDRUS_CODEC_DEC_ALL 648000000>,
++				<0x5c00 CEDRUS_CODEC_DEC_H265 564000000>,
++				<0x5c00 (CEDRUS_CODEC_DEC_ALL &
++					  ~CEDRUS_CODEC_DEC_H265) 624000000>,
++				<0x7c00 CEDRUS_CODEC_DEC_ALL 624000000>,
++				<0x2c00 CEDRUS_CODEC_DEC_ALL 624000000>,
++				<0x7400 CEDRUS_CODEC_DEC_ALL 624000000>,
++				<0x2400 CEDRUS_CODEC_DEC_ALL 624000000>,
++				<0x0003 CEDRUS_CODEC_ENC_ALL 696000000>,
++				<0x0004 CEDRUS_CODEC_ENC_ALL 696000000>,
++				<0x0008 CEDRUS_CODEC_ENC_ALL 696000000>,
++				<0x5000 CEDRUS_CODEC_ENC_ALL 696000000>,
++				<0x5400 CEDRUS_CODEC_ENC_ALL 696000000>,
++				<0x6c00 CEDRUS_CODEC_ENC_ALL 696000000>,
++				<0x2000 CEDRUS_CODEC_ENC_ALL 696000000>,
++				<0x2100 CEDRUS_CODEC_ENC_ALL 696000000>,
++				<0x5c00 CEDRUS_CODEC_ENC_ALL 696000000>,
++				<0x7c00 CEDRUS_CODEC_ENC_ALL 696000000>,
++				<0x2c00 CEDRUS_CODEC_ENC_ALL 696000000>,
++				<0x7400 CEDRUS_CODEC_ENC_ALL 696000000>,
++				<0x2400 CEDRUS_CODEC_ENC_ALL 696000000>;
+ 			/* Select DDR field 2; preserve each codec's reconstruction mode. */
+ 			allwinner,ve-ddr-mode = <2>;
+ 			iommus = <&iommu 2>, <&iommu 3>;
+diff --git a/drivers/staging/media/sunxi/cedrus/Kconfig b/drivers/staging/media/sunxi/cedrus/Kconfig
+index 600eb67..1deef2a 100644
+--- a/drivers/staging/media/sunxi/cedrus/Kconfig
++++ b/drivers/staging/media/sunxi/cedrus/Kconfig
+@@ -6,6 +6,7 @@
+ 	depends on HAS_DMA
+ 	depends on OF
+ 	select NVMEM
++	select PM_OPP
+ 	select MEDIA_CONTROLLER
+ 	select SUNXI_SRAM
+ 	select V4L2_VP9
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.h b/drivers/staging/media/sunxi/cedrus/cedrus.h
+index cc6242b..9b5225d 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -292,6 +292,8 @@
+ 				       struct v4l2_pix_format *pix_fmt);
+ };
+ 
++#define CEDRUS_CLOCK_RATE_CELLS	3
++
+ struct cedrus_variant {
+ 	unsigned int	capabilities;
+ 	unsigned int	mod_rate;
+@@ -311,6 +313,13 @@
+ 	struct video_device	enc_vfd;
+ 	bool			enc_registered;
+ 	u32			ddr_mode;
++	u16			soc_id;
++	bool			has_soc_id;
++	bool			has_opp_table;
++	unsigned long		current_rate;
++	u32			*clock_rates;
++	unsigned int		num_clock_rates;
++	const struct cedrus_variant *variant;
+ 	struct media_device	mdev;
+ 	struct media_pad	pad[2];
+ 	struct platform_device	*pdev;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_dec.c b/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
+index 71bc79f..70e9f74 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
+@@ -33,6 +33,13 @@
+ 
+ 	run.src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
+ 	run.dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
++	error = cedrus_hw_set_rate(ctx);
++	if (error) {
++		v4l2_err(&dev->v4l2_dev, "Failed to select job clock: %d\n", error);
++		v4l2_m2m_buf_done_and_job_finish(dev->m2m_dev, ctx->fh.m2m_ctx,
++						 VB2_BUF_STATE_ERROR);
++		return;
++	}
+ 
+ 	if (ctx->encoder) {
+ 		cedrus_enc_run(ctx);
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+index 497b1f4..a4a7acf 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+@@ -21,11 +21,18 @@
+ #include <linux/iopoll.h>
+ #include <linux/jiffies.h>
+ #include <linux/clk.h>
++#include <linux/moduleparam.h>
++#include <linux/nvmem-consumer.h>
++#include <linux/pm_opp.h>
+ #include <linux/pm_runtime.h>
++#include <linux/property.h>
+ #include <linux/regmap.h>
+ #include <linux/reset.h>
++#include <linux/slab.h>
+ #include <linux/soc/sunxi/sunxi_sram.h>
+ 
++#include <dt-bindings/media/allwinner-cedrus.h>
++
+ #include <media/videobuf2-core.h>
+ #include <media/v4l2-mem2mem.h>
+ 
+@@ -34,17 +41,21 @@
+ #include "cedrus_hw.h"
+ #include "cedrus_regs.h"
+ 
+-static int cedrus_ddr_mode_init(struct cedrus_dev *dev,
+-				const struct cedrus_variant *variant)
++static unsigned long ve_rate_override;
++module_param(ve_rate_override, ulong, 0644);
++MODULE_PARM_DESC(ve_rate_override,
++		 "Override VE clock rate in Hz; zero selects DT policy");
++
++static int cedrus_ddr_mode_init(struct cedrus_dev *dev)
+ {
+ 	struct device_node *node = dev->dev->of_node;
+ 	u32 mode;
+ 	int ret;
+ 
+-	dev->ddr_mode = variant->ddr_mode;
++	dev->ddr_mode = dev->variant->ddr_mode;
+ 	if (!of_property_present(node, "allwinner,ve-ddr-mode"))
+ 		return 0;
+-	if (!variant->ddr_mode)
++	if (!dev->variant->ddr_mode)
+ 		return dev_err_probe(dev->dev, -EINVAL,
+ 				     "VE DDR mode overrides require H616\n");
+ 
+@@ -71,6 +82,198 @@
+ 	return 0;
+ }
+ 
++static u32 cedrus_codec_mask(struct cedrus_ctx *ctx)
++{
++	if (ctx->encoder) {
++		switch (ctx->dst_fmt.pixelformat) {
++		case V4L2_PIX_FMT_H264:
++			return CEDRUS_CODEC_ENC_H264;
++		case V4L2_PIX_FMT_JPEG:
++		case V4L2_PIX_FMT_MJPEG:
++			return CEDRUS_CODEC_ENC_JPEG;
++		default:
++			return 0;
++		}
++	}
++
++	switch (ctx->src_fmt.pixelformat) {
++	case V4L2_PIX_FMT_JPEG:
++		return CEDRUS_CODEC_DEC_MJPEG;
++	case V4L2_PIX_FMT_MPEG1_SLICE:
++		return CEDRUS_CODEC_DEC_MPEG1;
++	case V4L2_PIX_FMT_MPEG2_SLICE:
++		return CEDRUS_CODEC_DEC_MPEG2;
++	case V4L2_PIX_FMT_MPEG4_FRAME:
++		return CEDRUS_CODEC_DEC_MPEG4;
++	case V4L2_PIX_FMT_H263_FRAME:
++		return CEDRUS_CODEC_DEC_H263;
++	case V4L2_PIX_FMT_SORENSON_FRAME:
++		return CEDRUS_CODEC_DEC_SORENSON_H263;
++	case V4L2_PIX_FMT_VC1_SLICE:
++		return CEDRUS_CODEC_DEC_WMV3;
++	case V4L2_PIX_FMT_VP8_FRAME:
++		return CEDRUS_CODEC_DEC_VP8;
++	case V4L2_PIX_FMT_VP9_FRAME:
++		return CEDRUS_CODEC_DEC_VP9;
++	case V4L2_PIX_FMT_H264_SLICE:
++		return CEDRUS_CODEC_DEC_H264;
++	case V4L2_PIX_FMT_HEVC_SLICE:
++		return CEDRUS_CODEC_DEC_H265;
++	case V4L2_PIX_FMT_CAVS_FRAME:
++		return CEDRUS_CODEC_DEC_AVS;
++	case V4L2_PIX_FMT_CAVS2_FRAME:
++		return CEDRUS_CODEC_DEC_AVS2;
++	default:
++		return 0;
++	}
++}
++
++static int cedrus_set_rate(struct cedrus_dev *dev, unsigned long rate)
++{
++	struct dev_pm_opp *opp;
++	unsigned long lookup_rate;
++	long rounded_rate;
++	int ret;
++
++	if (!dev->has_opp_table)
++		return clk_set_rate(dev->mod_clk, rate);
++
++	rounded_rate = clk_round_rate(dev->mod_clk, rate);
++	if (rounded_rate <= 0)
++		return rounded_rate ? rounded_rate : -EINVAL;
++	lookup_rate = rounded_rate;
++	opp = dev_pm_opp_find_freq_ceil(dev->dev, &lookup_rate);
++	if (!IS_ERR(opp)) {
++		dev_pm_opp_put(opp);
++		return dev_pm_opp_set_rate(dev->dev, rate);
++	}
++	if (PTR_ERR(opp) != -ERANGE)
++		return PTR_ERR(opp);
++
++	/* VE OPPs contain frequencies only; retain OPP state for overclocks. */
++	ret = dev_pm_opp_add(dev->dev, rounded_rate, 0);
++	if (ret)
++		return ret;
++	ret = dev_pm_opp_set_rate(dev->dev, rate);
++	dev_pm_opp_remove(dev->dev, rounded_rate);
++	return ret;
++}
++
++int cedrus_hw_set_rate(struct cedrus_ctx *ctx)
++{
++	struct cedrus_dev *dev = ctx->dev;
++	unsigned long rate;
++	u32 codec = cedrus_codec_mask(ctx);
++	unsigned int i;
++	int ret;
++
++	rate = READ_ONCE(ve_rate_override);
++	if (!rate) {
++		rate = dev->variant->mod_rate;
++		if (dev->has_opp_table && dev->has_soc_id && codec) {
++			for (i = 0; i < dev->num_clock_rates; i++) {
++				const u32 *entry =
++					&dev->clock_rates[i * CEDRUS_CLOCK_RATE_CELLS];
++
++				if (entry[0] != dev->soc_id || !(entry[1] & codec))
++					continue;
++
++				rate = entry[2];
++				break;
++			}
++		}
++	}
++
++	if (rate == dev->current_rate)
++		return 0;
++
++	ret = cedrus_set_rate(dev, rate);
++	if (ret)
++		return dev_err_probe(dev->dev, ret,
++				     "Failed to set VE rate to %lu Hz\n", rate);
++
++	dev->current_rate = rate;
++	return 0;
++}
++
++static int cedrus_clock_policy_init(struct cedrus_dev *dev)
++{
++	struct dev_pm_opp *opp;
++	unsigned int i;
++	u32 soc_id;
++	int count;
++	int ret;
++
++	if (!device_property_present(dev->dev, "allwinner,ve-clock-rate-map") ||
++	    !device_property_present(dev->dev, "operating-points-v2"))
++		return cedrus_set_rate(dev, dev->variant->mod_rate);
++
++	count = device_property_count_u32(dev->dev,
++					  "allwinner,ve-clock-rate-map");
++	if (count <= 0 || count % CEDRUS_CLOCK_RATE_CELLS)
++		return dev_err_probe(dev->dev, -EINVAL,
++				     "Invalid VE clock rate map\n");
++
++	dev->clock_rates = devm_kcalloc(dev->dev, count,
++					sizeof(*dev->clock_rates), GFP_KERNEL);
++	if (!dev->clock_rates)
++		return -ENOMEM;
++
++	ret = device_property_read_u32_array(dev->dev,
++					     "allwinner,ve-clock-rate-map",
++					     dev->clock_rates, count);
++	if (ret)
++		return dev_err_probe(dev->dev, ret,
++				     "Cannot read VE clock rate map\n");
++	dev->num_clock_rates = count / CEDRUS_CLOCK_RATE_CELLS;
++
++	ret = devm_pm_opp_set_clkname(dev->dev, "mod");
++	if (ret)
++		return ret;
++
++	ret = devm_pm_opp_of_add_table(dev->dev);
++	if (ret)
++		return ret;
++	dev->has_opp_table = true;
++
++	for (i = 0; i < dev->num_clock_rates; i++) {
++		const u32 *entry =
++			&dev->clock_rates[i * CEDRUS_CLOCK_RATE_CELLS];
++		unsigned long rate = entry[2];
++		unsigned int j;
++
++		if (entry[0] & ~0xffff || !entry[1] || entry[1] & ~CEDRUS_CODEC_ALL)
++			return dev_err_probe(dev->dev, -EINVAL,
++					     "Invalid VE clock rate map row\n");
++
++		for (j = 0; j < i; j++) {
++			const u32 *other =
++				&dev->clock_rates[j * CEDRUS_CLOCK_RATE_CELLS];
++
++			if (entry[0] == other[0] && entry[1] & other[1])
++				return dev_err_probe(dev->dev, -EINVAL,
++						     "Overlapping VE codec masks\n");
++		}
++
++		opp = dev_pm_opp_find_freq_exact(dev->dev, rate, true);
++		if (IS_ERR(opp))
++			return dev_err_probe(dev->dev, PTR_ERR(opp),
++					     "VE rate %lu is not an OPP\n", rate);
++		dev_pm_opp_put(opp);
++	}
++
++	if (!device_property_present(dev->dev, "nvmem-cells"))
++		return cedrus_set_rate(dev, dev->variant->mod_rate);
++
++	ret = nvmem_cell_read_variable_le_u32(dev->dev, "soc-id", &soc_id);
++	if (ret)
++		return dev_err_probe(dev->dev, ret, "Cannot read VE SoC ID\n");
++
++	dev->soc_id = soc_id & 0xffff;
++	dev->has_soc_id = true;
++	return cedrus_set_rate(dev, dev->variant->mod_rate);
++}
++
+ void cedrus_engine_set_mode(struct cedrus_dev *dev, u32 mode)
+ {
+ 	/* Override only DDR bits 17:16; preserve reconstruction and codec controls. */
+@@ -444,8 +647,9 @@
+ 	if (!variant)
+ 		return -EINVAL;
+ 
++	dev->variant = variant;
+ 	dev->capabilities = variant->capabilities;
+-	ret = cedrus_ddr_mode_init(dev, variant);
++	ret = cedrus_ddr_mode_init(dev);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -516,12 +720,13 @@
+ 		goto err_sram;
+ 	}
+ 
+-	ret = clk_set_rate(dev->mod_clk, variant->mod_rate);
++	ret = cedrus_clock_policy_init(dev);
+ 	if (ret) {
+ 		dev_err(dev->dev, "Failed to set clock rate\n");
+ 
+ 		goto err_sram;
+ 	}
++	dev->current_rate = variant->mod_rate;
+ 
+ 	pm_runtime_set_autosuspend_delay(dev->dev, 1000);
+ 	pm_runtime_use_autosuspend(dev->dev);
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_hw.h b/drivers/staging/media/sunxi/cedrus/cedrus_hw.h
+index ab5d8d5..6fde3eb 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.h
+@@ -17,6 +17,7 @@
+ #define _CEDRUS_HW_H_
+ 
+ int cedrus_engine_enable(struct cedrus_ctx *ctx);
++int cedrus_hw_set_rate(struct cedrus_ctx *ctx);
+ void cedrus_engine_set_mode(struct cedrus_dev *dev, u32 mode);
+ void cedrus_engine_disable(struct cedrus_dev *dev);
+ 
