@@ -2,12 +2,13 @@ From: thor2002ro <thor2002ro@gmail.com>
 Subject: [PATCH] Local: media: cedrus: share H616/H618 VE DDR mode across codecs
 
 Use one DT DDR field value for every H616 and H618 decoder and encoder.
-Default to vendor DDR field value 2.
+Default to vendor DDR field value 2 in the H616 device variant.
 Preserve each codec's reconstruction write mode.
 
 Signed-off-by: thor2002ro <thor2002ro@gmail.com>
 ---
 diff --git a/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi b/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
+index 603178d..51c0445 100644
 --- a/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
 +++ b/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
 @@ -338,6 +338,8 @@
@@ -19,10 +20,39 @@ diff --git a/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi b/arch/arm64/boot/dt
  			iommus = <&iommu 2>, <&iommu 3>;
  			nvmem-cells = <&cpu_speed_grade>;
  			nvmem-cell-names = "soc-id";
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.c b/drivers/staging/media/sunxi/cedrus/cedrus.c
+index b225440..23e9e8e 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.c
+@@ -28,6 +28,7 @@
+ #include "cedrus_video.h"
+ #include "cedrus_dec.h"
+ #include "cedrus_hw.h"
++#include "cedrus_regs.h"
+ 
+ static int cedrus_try_ctrl(struct v4l2_ctrl *ctrl)
+ {
+@@ -807,6 +808,7 @@ static const struct cedrus_variant sun50i_h616_cedrus_variant = {
+ 			  CEDRUS_CAPABILITY_VP9_DEC |
+ 			  CEDRUS_CAPABILITY_VC1_DEC,
+ 	.mod_rate	= 600000000,
++	.ddr_mode	= VE_MODE_DDR_MODE_BW_256,
+ };
+ 
+ /*
 diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.h b/drivers/staging/media/sunxi/cedrus/cedrus.h
+index 9dc2518..9a30128 100644
 --- a/drivers/staging/media/sunxi/cedrus/cedrus.h
 +++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
-@@ -305,6 +305,7 @@
+@@ -291,6 +291,7 @@ struct cedrus_dec_ops {
+ struct cedrus_variant {
+ 	unsigned int	capabilities;
+ 	unsigned int	mod_rate;
++	u32		ddr_mode;
+ 	/*
+ 	 * Newer SoCs (e.g. A523/sun55iw3) have no dedicated VE SRAM region to
+ 	 * remap via the system-control block; the VE does physical DMA from
+@@ -305,6 +306,7 @@ struct cedrus_dev {
  	struct video_device	vfd;
  	struct video_device	enc_vfd;
  	bool			enc_registered;
@@ -30,29 +60,55 @@ diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.h b/drivers/staging/media
  	struct media_device	mdev;
  	struct media_pad	pad[2];
  	struct platform_device	*pdev;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+index 4c79f5b..f9d15bf 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+@@ -229,8 +229,8 @@ int cedrus_enc_h264_setup(struct cedrus_ctx *ctx, dma_addr_t source,
+ 		return ret;
+ 	if (!cedrus_enc_h264_supported(dev))
+ 		return -EOPNOTSUPP;
+-	cedrus_write(dev, VE_MODE, VE_MODE_DISABLED | VE_MODE_DDR_MODE_BW_256 |
+-		     BIT(6) | BIT(7));
++	cedrus_engine_set_mode(dev, VE_MODE_DISABLED | VE_MODE_DDR_MODE_BW_256 |
++			       BIT(6) | BIT(7));
+ 	ret = cedrus_enc_h264_registers(ctx, source, stream, size);
+ 	if (ret)
+ 		return ret;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.c
+index e028469..3aefaae 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.c
+@@ -76,8 +76,8 @@ int cedrus_enc_jpeg_setup(struct cedrus_ctx *ctx, dma_addr_t source,
+ 	if (ret)
+ 		return ret;
+ 
+-	cedrus_write(dev, VE_MODE, VE_MODE_DISABLED | VE_MODE_DDR_MODE_BW_256 |
+-		     BIT(6) | BIT(7));
++	cedrus_engine_set_mode(dev, VE_MODE_DISABLED | VE_MODE_DDR_MODE_BW_256 |
++			       BIT(6) | BIT(7));
+ 	cedrus_write(dev, CEDRUS_JPEG_ENC_REG(0x18), 0x10000);
+ 	cedrus_write(dev, 0xa00, (width / 8) << 16 | height / 8);
+ 	cedrus_write(dev, 0xa04, (width / 16) << 16);
 diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+index 1d29dde..23aa6d0 100644
 --- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
 +++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
-@@ -33,6 +33,59 @@
+@@ -33,6 +33,54 @@
  #include "cedrus_hw.h"
  #include "cedrus_regs.h"
  
-+static int cedrus_ddr_mode_init(struct cedrus_dev *dev)
++static int cedrus_ddr_mode_init(struct cedrus_dev *dev,
++				const struct cedrus_variant *variant)
 +{
 +	struct device_node *node = dev->dev->of_node;
-+	bool h616 = of_device_is_compatible(node,
-+					  "allwinner,sun50i-h616-video-engine");
 +	u32 mode;
 +	int ret;
 +
-+	/*
-+	 * H616/H618 use vendor DDR field value 2 for every codec.
-+	 * Zero preserves existing codec defaults on other SoCs.
-+	 */
-+	dev->ddr_mode = h616 ? VE_MODE_DDR_MODE_BW_256 : 0;
++	dev->ddr_mode = variant->ddr_mode;
 +	if (!of_property_present(node, "allwinner,ve-ddr-mode"))
 +		return 0;
-+	if (!h616)
++	if (!variant->ddr_mode)
 +		return dev_err_probe(dev->dev, -EINVAL,
 +				     "VE DDR mode overrides require H616\n");
 +
@@ -93,7 +149,7 @@ diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c b/drivers/staging/me
  int cedrus_engine_enable(struct cedrus_ctx *ctx)
  {
  	u32 reg = 0;
-@@ -107,7 +160,7 @@
+@@ -107,7 +155,7 @@ int cedrus_engine_enable(struct cedrus_ctx *ctx)
  		       VE_MODE_BODYBUF_1K_ALIGNED |
  		       VE_MODE_COMPRESS_MODE_AFBC;
  
@@ -102,17 +158,18 @@ diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c b/drivers/staging/me
  
  	return 0;
  }
-@@ -384,6 +437,9 @@
+@@ -384,6 +432,9 @@ int cedrus_hw_probe(struct cedrus_dev *dev)
  		return -EINVAL;
  
  	dev->capabilities = variant->capabilities;
-+	ret = cedrus_ddr_mode_init(dev);
++	ret = cedrus_ddr_mode_init(dev, variant);
 +	if (ret)
 +		return ret;
  
  	irq_dec = platform_get_irq(dev->pdev, 0);
  	if (irq_dec <= 0)
 diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_hw.h b/drivers/staging/media/sunxi/cedrus/cedrus_hw.h
+index a6df6bd..c383902 100644
 --- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.h
 +++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.h
 @@ -17,6 +17,7 @@
@@ -124,6 +181,7 @@ diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_hw.h b/drivers/staging/me
  
  void cedrus_dst_format_set(struct cedrus_dev *dev,
 diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_regs.h b/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
+index 62dc679..5c3fb3a 100644
 --- a/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
 +++ b/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
 @@ -52,6 +52,7 @@
@@ -134,31 +192,4 @@ diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_regs.h b/drivers/staging/
  #define VE_MODE_DDR_MODE_BW_128			(0x03 << 16)
  #define VE_MODE_DDR_MODE_BW_256			(0x02 << 16)
  #define VE_MODE_BODYBUF_1K_ALIGNED		BIT(12)
-diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
---- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
-+++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
-@@ -229,8 +229,8 @@
- 		return ret;
- 	if (!cedrus_enc_h264_supported(dev))
- 		return -EOPNOTSUPP;
--	cedrus_write(dev, VE_MODE, VE_MODE_DISABLED | VE_MODE_DDR_MODE_BW_256 |
--		     BIT(6) | BIT(7));
-+	cedrus_engine_set_mode(dev, VE_MODE_DISABLED | VE_MODE_DDR_MODE_BW_256 |
-+			       BIT(6) | BIT(7));
- 	ret = cedrus_enc_h264_registers(ctx, source, stream, size);
- 	if (ret)
- 		return ret;
-diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.c
---- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.c
-+++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.c
-@@ -76,8 +76,8 @@
- 	if (ret)
- 		return ret;
- 
--	cedrus_write(dev, VE_MODE, VE_MODE_DISABLED | VE_MODE_DDR_MODE_BW_256 |
--		     BIT(6) | BIT(7));
-+	cedrus_engine_set_mode(dev, VE_MODE_DISABLED | VE_MODE_DDR_MODE_BW_256 |
-+			       BIT(6) | BIT(7));
- 	cedrus_write(dev, CEDRUS_JPEG_ENC_REG(0x18), 0x10000);
- 	cedrus_write(dev, 0xa00, (width / 8) << 16 | height / 8);
- 	cedrus_write(dev, 0xa04, (width / 16) << 16);
+
