@@ -1,0 +1,58 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: media: cedrus: autosuspend idle streams
+
+Suspend the video engine one second after the last stream stops.
+Keep the engine active between frames in one stream.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
+index 91c3570..f3741d2 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
+@@ -540,7 +540,8 @@ static void cedrus_enc_stop_streaming(struct vb2_queue *q)
+ 		cancel_work_sync(&ctx->enc->finish_work);
+ 		if (!cedrus_enc_is_jpeg(ctx))
+ 			cedrus_enc_h264_stop(ctx);
+-		pm_runtime_put(ctx->dev->dev);
++		pm_runtime_mark_last_busy(ctx->dev->dev);
++		pm_runtime_put_autosuspend(ctx->dev->dev);
+ 	}
+ 	atomic_set(&ctx->enc->force_key, 1);
+ 	cedrus_enc_flush(q, VB2_BUF_STATE_ERROR);
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+index 9e2bd3d..0784f7c 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+@@ -695,6 +695,8 @@ int cedrus_hw_probe(struct cedrus_dev *dev)
+ 	}
+ 	dev->current_rate = variant->mod_rate;
+ 
++	pm_runtime_set_autosuspend_delay(dev->dev, 1000);
++	pm_runtime_use_autosuspend(dev->dev);
+ 	pm_runtime_enable(dev->dev);
+ 	if (!pm_runtime_enabled(dev->dev)) {
+ 		ret = cedrus_hw_resume(dev->dev);
+@@ -717,6 +719,7 @@ err_mem:
+ void cedrus_hw_remove(struct cedrus_dev *dev)
+ {
+ 	pm_runtime_disable(dev->dev);
++	pm_runtime_dont_use_autosuspend(dev->dev);
+ 	if (!pm_runtime_status_suspended(dev->dev))
+ 		cedrus_hw_suspend(dev->dev);
+ 
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_video.c b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+index a0b46fd..a95f3f8 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_video.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+@@ -808,7 +808,8 @@ static void cedrus_stop_streaming(struct vb2_queue *vq)
+ 		if (ctx->current_codec->stop)
+ 			ctx->current_codec->stop(ctx);
+ 
+-		pm_runtime_put(dev->dev);
++		pm_runtime_mark_last_busy(dev->dev);
++		pm_runtime_put_autosuspend(dev->dev);
+ 	}
+ 
+ 	cedrus_queue_cleanup(vq, VB2_BUF_STATE_ERROR);
+
