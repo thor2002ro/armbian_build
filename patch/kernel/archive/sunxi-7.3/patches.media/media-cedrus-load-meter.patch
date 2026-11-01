@@ -1,0 +1,477 @@
+From: thor2002ro <thor2002ro@gmail.com>
+Subject: [PATCH] Local: media: cedrus: expose VE load and stream counts
+
+Measure execution from hardware triggers to validated completion IRQs.
+Expose module sysfs statistics without idle sampling wakeups.
+
+Signed-off-by: thor2002ro <thor2002ro@gmail.com>
+---
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.h b/drivers/staging/media/sunxi/cedrus/cedrus.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -30,6 +30,10 @@
+ #include <linux/iopoll.h>
+ #include <linux/platform_device.h>
+ #include <linux/workqueue.h>
++#include <linux/spinlock.h>
++#include <linux/atomic.h>
++
++#include "cedrus_load.h"
+ 
+ #define CEDRUS_NAME			"cedrus"
+ 
+@@ -316,6 +320,15 @@
+ };
+ 
+ struct cedrus_dev {
++	/* Protect accounting shared by triggers, IRQs, and sysfs reads. */
++	spinlock_t		load_lock;
++	struct cedrus_load	load;
++	struct cedrus_load_sample load_sample;
++	struct delayed_work	load_work;
++	bool			load_monitor_enabled;
++	struct list_head	stats_node;
++	atomic_t		decoder_streams;
++	atomic_t		encoder_streams;
+ 	struct v4l2_device	v4l2_dev;
+ 	struct video_device	vfd;
+ 	struct video_device	enc_vfd;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_cavs.c b/drivers/staging/media/sunxi/cedrus/cedrus_cavs.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_cavs.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_cavs.c
+@@ -376,6 +376,7 @@
+ 	cedrus_write(ctx->dev, CAVS_REG(0x24), 0x17);
+ 	if (ctx->codec.cavs.diag_active)
+ 		cedrus_cavs_dump_regs(ctx, "load");
++	cedrus_load_start(ctx, false);
+ 	cedrus_write(ctx->dev, CAVS_REG(0x24), 0x19);
+ }
+ 
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_cavs2.c b/drivers/staging/media/sunxi/cedrus/cedrus_cavs2.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_cavs2.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_cavs2.c
+@@ -349,6 +349,7 @@
+ 	cedrus_write(ctx->dev, CAVS2_REG(0x34), 7);
+ 	cedrus_write(ctx->dev, CAVS2_REG(0x38), 0x80100);
+ 	cedrus_write(ctx->dev, CAVS2_REG(0x3c), 0);
++	cedrus_load_start(ctx, false);
+ 	cedrus_write(ctx->dev, CAVS2_REG(0x34), 8);
+ }
+ 
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
+@@ -518,6 +518,7 @@
+ 			vb2_clear_last_buffer_dequeued(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx));
+ 		}
+ 		ctx->enc->sequence_out = 0;
++		atomic_inc(&ctx->dev->encoder_streams);
+ 	} else {
+ 		ctx->enc->sequence_cap = 0;
+ 	}
+@@ -540,6 +541,7 @@
+ 		cancel_work_sync(&ctx->enc->finish_work);
+ 		if (!cedrus_enc_is_jpeg(ctx))
+ 			cedrus_enc_h264_stop(ctx);
++		atomic_dec(&ctx->dev->encoder_streams);
+ 		pm_runtime_mark_last_busy(ctx->dev->dev);
+ 		pm_runtime_put_autosuspend(ctx->dev->dev);
+ 	}
+@@ -1124,6 +1126,8 @@
+ 
+ 	if (!(status & mask))
+ 		return IRQ_NONE;
++	cedrus_load_end(ctx->dev,
++			!!(status & (cedrus_enc_is_jpeg(ctx) ? 0x6 : 0xe)), false);
+ 	if (!ctx->enc->frames || (status & 0xe))
+ 		cedrus_enc_dump_regs(ctx, "irq");
+ 	if ((cedrus_enc_is_jpeg(ctx) && !(status & 0x6)) ||
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+@@ -492,6 +492,7 @@
+ 	if (!enc->frames)
+ 		cedrus_enc_dump_regs(ctx, "start");
+ 	cedrus_watchdog_start(dev);
++	cedrus_load_start(ctx, enc->retries != 0);
+ 	cedrus_write(dev, CEDRUS_ENC_REG(0x18), 8);
+ 	return 0;
+ }
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.c
+@@ -120,6 +120,7 @@
+ 	for (i = 0; i < ARRAY_SIZE(enc->jpeg_tables.reciprocal); i++)
+ 		cedrus_write(dev, CEDRUS_JPEG_ENC_REG(0xe4), enc->jpeg_tables.reciprocal[i]);
+ 	cedrus_watchdog_start(dev);
++	cedrus_load_start(ctx, false);
+ 	cedrus_write(dev, CEDRUS_JPEG_ENC_REG(0x18), 0x10008);
+ 	return 0;
+ }
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_h264.c b/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
+@@ -797,6 +797,7 @@
+ {
+ 	struct cedrus_dev *dev = ctx->dev;
+ 
++	cedrus_load_start(ctx, false);
+ 	cedrus_write(dev, VE_H264_TRIGGER_TYPE,
+ 		     VE_H264_TRIGGER_TYPE_AVC_SLICE_DECODE);
+ }
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_h265.c b/drivers/staging/media/sunxi/cedrus/cedrus_h265.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_h265.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_h265.c
+@@ -933,6 +933,7 @@
+ {
+ 	struct cedrus_dev *dev = ctx->dev;
+ 
++	cedrus_load_start(ctx, false);
+ 	cedrus_write(dev, VE_DEC_H265_TRIGGER, VE_DEC_H265_TRIGGER_DEC_SLICE);
+ }
+ 
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+@@ -22,6 +22,8 @@
+ #include <linux/jiffies.h>
+ #include <linux/clk.h>
+ #include <linux/moduleparam.h>
++#include <linux/ktime.h>
++#include <linux/math64.h>
+ #include <linux/nvmem-consumer.h>
+ #include <linux/pm_opp.h>
+ #include <linux/pm_runtime.h>
+@@ -46,6 +48,101 @@
+ module_param(ve_rate_override, ulong, 0644);
+ MODULE_PARM_DESC(ve_rate_override,
+ 		 "Override VE clock rate in Hz; zero selects DT policy");
++
++static LIST_HEAD(cedrus_stats_devices);
++static DEFINE_MUTEX(cedrus_stats_lock);
++static unsigned int ve_load_stat;
++static unsigned int decoder_streams_stat = 1;
++static unsigned int encoder_streams_stat = 2;
++
++static int cedrus_stats_get(char *buffer, const struct kernel_param *param)
++{
++	unsigned int kind = *(unsigned int *)param->arg;
++	struct cedrus_dev *dev;
++	unsigned long flags;
++	u64 value = 0;
++	u32 devices = 0;
++
++	mutex_lock(&cedrus_stats_lock);
++	list_for_each_entry(dev, &cedrus_stats_devices, stats_node) {
++		if (kind == 0) {
++			spin_lock_irqsave(&dev->load_lock, flags);
++			if (dev->load.active)
++				value += dev->load_sample.percent;
++			spin_unlock_irqrestore(&dev->load_lock, flags);
++			devices++;
++		} else if (kind == 1) {
++			value += atomic_read(&dev->decoder_streams);
++		} else {
++			value += atomic_read(&dev->encoder_streams);
++		}
++	}
++	mutex_unlock(&cedrus_stats_lock);
++	if (kind == 0)
++		value = devices ? div_u64(value + devices * 50ULL, devices * 100ULL) : 0;
++	return scnprintf(buffer, PAGE_SIZE, "%llu\n", value);
++}
++
++static const struct kernel_param_ops cedrus_stats_ops = {
++	.get = cedrus_stats_get,
++};
++module_param_cb(ve_load, &cedrus_stats_ops, &ve_load_stat, 0444);
++MODULE_PARM_DESC(ve_load, "Combined VE occupancy percentage");
++module_param_cb(decoder_streams, &cedrus_stats_ops, &decoder_streams_stat, 0444);
++MODULE_PARM_DESC(decoder_streams, "Started decoder output streams");
++module_param_cb(encoder_streams, &cedrus_stats_ops, &encoder_streams_stat, 0444);
++MODULE_PARM_DESC(encoder_streams, "Started encoder output streams");
++
++void cedrus_load_start(struct cedrus_ctx *ctx, bool retry)
++{
++	struct cedrus_dev *dev = ctx->dev;
++	unsigned long flags;
++	u64 now, busy;
++
++	spin_lock_irqsave(&dev->load_lock, flags);
++	now = ktime_get_ns();
++	if (!dev->load.active && dev->load_monitor_enabled) {
++		busy = dev->load.encoder_ns + dev->load.decoder_ns;
++		if (now - dev->load_sample.time_ns >= NSEC_PER_SEC)
++			cedrus_load_sample_update(&dev->load_sample, now, busy);
++		schedule_delayed_work(&dev->load_work, msecs_to_jiffies(1000));
++	}
++	cedrus_load_begin(&dev->load, now, ctx->encoder, retry);
++	spin_unlock_irqrestore(&dev->load_lock, flags);
++}
++
++void cedrus_load_end(struct cedrus_dev *dev, bool error, bool timeout)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&dev->load_lock, flags);
++	cedrus_load_finish(&dev->load, ktime_get_ns(), error, timeout);
++	cancel_delayed_work(&dev->load_work);
++	spin_unlock_irqrestore(&dev->load_lock, flags);
++}
++
++static void cedrus_load_sample_work(struct work_struct *work)
++{
++	struct cedrus_dev *dev = container_of(to_delayed_work(work),
++						     struct cedrus_dev, load_work);
++	struct cedrus_load load;
++	unsigned long flags;
++	u64 now;
++
++	spin_lock_irqsave(&dev->load_lock, flags);
++	if (!dev->load_monitor_enabled || !dev->load.active) {
++		spin_unlock_irqrestore(&dev->load_lock, flags);
++		return;
++	}
++	now = ktime_get_ns();
++	load = dev->load;
++	if (load.active)
++		cedrus_load_account(&load, now);
++	cedrus_load_sample_update(&dev->load_sample, now,
++				  load.encoder_ns + load.decoder_ns);
++	schedule_delayed_work(&dev->load_work, msecs_to_jiffies(1000));
++	spin_unlock_irqrestore(&dev->load_lock, flags);
++}
+ 
+ static int cedrus_ddr_mode_init(struct cedrus_dev *dev)
+ {
+@@ -561,6 +658,7 @@
+ 	}
+ 	if (status == CEDRUS_IRQ_NONE)
+ 		goto rearm_watchdog;
++	cedrus_load_end(dev, status == CEDRUS_IRQ_ERROR, false);
+ 
+ 	ctx->current_codec->irq_disable(ctx);
+ 	ctx->current_codec->irq_clear(ctx);
+@@ -649,6 +747,7 @@
+ 	ctx = v4l2_m2m_get_curr_priv(dev->m2m_dev);
+ 	if (!ctx)
+ 		return;
++	cedrus_load_end(dev, false, true);
+ 
+ 	if (ctx->encoder) {
+ 		cedrus_enc_timeout(ctx);
+@@ -728,6 +827,14 @@
+ 	const struct cedrus_variant *variant;
+ 	int irq_dec;
+ 	int ret;
++
++	spin_lock_init(&dev->load_lock);
++	atomic_set(&dev->decoder_streams, 0);
++	atomic_set(&dev->encoder_streams, 0);
++	dev->load.since_ns = ktime_get_ns();
++	dev->load_sample.time_ns = dev->load.since_ns;
++	INIT_DELAYED_WORK(&dev->load_work, cedrus_load_sample_work);
++	INIT_LIST_HEAD(&dev->stats_node);
+ 
+ 	variant = of_device_get_match_data(dev->dev);
+ 	if (!variant)
+@@ -822,6 +929,10 @@
+ 		if (ret)
+ 			goto err_pm;
+ 	}
++	mutex_lock(&cedrus_stats_lock);
++	dev->load_monitor_enabled = true;
++	list_add_tail(&dev->stats_node, &cedrus_stats_devices);
++	mutex_unlock(&cedrus_stats_lock);
+ 
+ 	return 0;
+ 
+@@ -837,6 +948,15 @@
+ 
+ void cedrus_hw_remove(struct cedrus_dev *dev)
+ {
++	unsigned long flags;
++
++	mutex_lock(&cedrus_stats_lock);
++	list_del_init(&dev->stats_node);
++	mutex_unlock(&cedrus_stats_lock);
++	spin_lock_irqsave(&dev->load_lock, flags);
++	dev->load_monitor_enabled = false;
++	spin_unlock_irqrestore(&dev->load_lock, flags);
++	cancel_delayed_work_sync(&dev->load_work);
+ 	pm_runtime_disable(dev->dev);
+ 	pm_runtime_dont_use_autosuspend(dev->dev);
+ 	if (!pm_runtime_status_suspended(dev->dev))
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_hw.h b/drivers/staging/media/sunxi/cedrus/cedrus_hw.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.h
+@@ -18,6 +18,8 @@
+ 
+ int cedrus_engine_enable(struct cedrus_ctx *ctx);
+ int cedrus_hw_set_rate(struct cedrus_ctx *ctx);
++void cedrus_load_start(struct cedrus_ctx *ctx, bool retry);
++void cedrus_load_end(struct cedrus_dev *dev, bool error, bool timeout);
+ void cedrus_engine_set_mode(struct cedrus_dev *dev, u32 mode);
+ void cedrus_engine_disable(struct cedrus_dev *dev);
+ 
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_jpeg.c b/drivers/staging/media/sunxi/cedrus/cedrus_jpeg.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_jpeg.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_jpeg.c
+@@ -456,6 +456,7 @@
+ 	reg = VE_DEC_MPEG_TRIGGER_HW_JPEG_VLD | VE_DEC_MPEG_TRIGGER_JPEG;
+ 	reg |= ctx->codec.jpeg.subsampling;
+ 
++	cedrus_load_start(ctx, false);
+ 	cedrus_write(dev, VE_DEC_MPEG_TRIGGER, reg);
+ }
+ 
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_load.h b/drivers/staging/media/sunxi/cedrus/cedrus_load.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_load.h
+@@ -0,0 +1,71 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _CEDRUS_LOAD_H_
++#define _CEDRUS_LOAD_H_
++
++#include <linux/types.h>
++#include <linux/math64.h>
++
++struct cedrus_load {
++	u64 since_ns, start_ns;
++	u64 encoder_ns, decoder_ns, failed_ns;
++	u64 executions, completions, errors, timeouts, retries;
++	bool active, encoder;
++};
++
++struct cedrus_load_sample {
++	u64 time_ns, busy_ns;
++	u32 percent;
++};
++
++static inline void cedrus_load_sample_update(struct cedrus_load_sample *sample,
++					     u64 now, u64 busy)
++{
++	u64 elapsed = now - sample->time_ns;
++	u64 percent = elapsed ?
++		mul_u64_u64_div_u64(busy - sample->busy_ns, 10000, elapsed) : 0;
++
++	sample->percent = percent > 10000 ? 10000 : percent;
++	sample->time_ns = now;
++	sample->busy_ns = busy;
++}
++
++/* Call under the device load lock. Times use the monotonic clock. */
++static inline void cedrus_load_begin(struct cedrus_load *load, u64 now,
++				     bool encoder, bool retry)
++{
++	if (load->active)
++		return;
++	load->start_ns = now;
++	load->active = true;
++	load->encoder = encoder;
++	load->executions++;
++	load->retries += retry;
++}
++
++static inline void cedrus_load_account(struct cedrus_load *load, u64 now)
++{
++	u64 duration = now - load->start_ns;
++
++	if (load->encoder)
++		load->encoder_ns += duration;
++	else
++		load->decoder_ns += duration;
++}
++
++static inline void cedrus_load_finish(struct cedrus_load *load, u64 now,
++				      bool error, bool timeout)
++{
++	if (!load->active)
++		return;
++	cedrus_load_account(load, now);
++	if (error || timeout) {
++		load->failed_ns += now - load->start_ns;
++		load->errors += error;
++		load->timeouts += timeout;
++	} else {
++		load->completions++;
++	}
++	load->active = false;
++}
++
++#endif
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_mpeg2.c b/drivers/staging/media/sunxi/cedrus/cedrus_mpeg2.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_mpeg2.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_mpeg2.c
+@@ -238,6 +238,7 @@
+ 		       VE_DEC_MPEG_TRIGGER_MPEG2) |
+ 	      VE_DEC_MPEG_TRIGGER_MB_BOUNDARY;
+ 
++	cedrus_load_start(ctx, false);
+ 	cedrus_write(dev, VE_DEC_MPEG_TRIGGER, reg);
+ }
+ 
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_mpeg4.c b/drivers/staging/media/sunxi/cedrus/cedrus_mpeg4.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_mpeg4.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_mpeg4.c
+@@ -130,6 +130,7 @@
+ 	cedrus_write(dev, MP4_REG(0x2c), ctx->codec.mpeg4.offset);
+ 	length = ALIGN(f->bitstream_size * 8 - ctx->codec.mpeg4.offset, 32);
+ 	cedrus_write(dev, MP4_REG(0x30), length);
++	cedrus_load_start(ctx, false);
+ 	cedrus_write(dev, MP4_REG(0x18), BIT(26) | (first ? BIT(31) : 0) |
+ 		     ctx->codec.mpeg4.count << 8 | 0xd);
+ }
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c b/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c
+@@ -841,6 +841,7 @@
+ 	struct cedrus_dev *dev = ctx->dev;
+ 
+ 
++	cedrus_load_start(ctx, false);
+ 	cedrus_write(dev, VE_DEC_VC1_TRIGGER_TYPE,
+ 		     VE_DEC_VC1_TRIGGER_TYPE_DECODE);
+ }
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_video.c b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_video.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+@@ -787,6 +787,7 @@
+ 			if (ret)
+ 				goto err_pm;
+ 		}
++		atomic_inc(&dev->decoder_streams);
+ 	}
+ 
+ 	return 0;
+@@ -807,6 +808,7 @@
+ 	if (V4L2_TYPE_IS_OUTPUT(vq->type)) {
+ 		if (ctx->current_codec->stop)
+ 			ctx->current_codec->stop(ctx);
++		atomic_dec(&dev->decoder_streams);
+ 
+ 		pm_runtime_mark_last_busy(dev->dev);
+ 		pm_runtime_put_autosuspend(dev->dev);
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_vp8.c b/drivers/staging/media/sunxi/cedrus/cedrus_vp8.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_vp8.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_vp8.c
+@@ -870,6 +870,7 @@
+ {
+ 	struct cedrus_dev *dev = ctx->dev;
+ 
++	cedrus_load_start(ctx, false);
+ 	cedrus_write(dev, VE_H264_TRIGGER_TYPE,
+ 		     VE_H264_TRIGGER_TYPE_VP8_SLICE_DECODE);
+ }
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_vp9.c b/drivers/staging/media/sunxi/cedrus/cedrus_vp9.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_vp9.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_vp9.c
+@@ -1099,6 +1099,7 @@
+ 	cedrus_write(dev, VE_DEC_VP9_DEC_CTB_NUM, 0);
+ 	cedrus_write(dev, VE_DEC_COUNTER, 0);
+ 	cedrus_write(dev, VE_DEC_COUNTER, VE_DEC_COUNTER_EN);
++	cedrus_load_start(ctx, false);
+ 	cedrus_write(dev, VE_DEC_VP9_TRIGGER, VE_DEC_VP9_TRIGGER_DEC_FRAME);
+ }
+ 
