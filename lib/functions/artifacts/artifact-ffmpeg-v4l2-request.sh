@@ -19,6 +19,7 @@ function artifact_ffmpeg-v4l2-request_prepare_version() {
 		"compilation/packages/ffmpeg-v4l2-request-deb.sh" \
 		"${SRC}/packages/ffmpeg-v4l2-request/build.sh" \
 		"${SRC}/patch/misc/ffmpeg-v4l2-request.patch" \
+		"${SRC}/patch/misc/ffmpeg-v4l2-request-nv12-capture.patch" \
 		"${SRC}/patch/misc/ffmpeg-mjpeg-v4l2m2m.patch" \
 		"${SRC}/patch/misc/ffmpeg-cavs2-v4l2-request.patch" \
 		"${SRC}/patch/misc/ffmpeg-cavs-v4l2-request.patch" \
