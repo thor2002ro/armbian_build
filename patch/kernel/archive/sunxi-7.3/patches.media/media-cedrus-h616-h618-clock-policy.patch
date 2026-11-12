@@ -212,7 +212,7 @@ index 497b1f4..a4a7acf 100644
  		return dev_err_probe(dev->dev, -EINVAL,
  				     "VE DDR mode overrides require H616\n");
  
-@@ -71,6 +82,198 @@
+@@ -71,6 +82,199 @@
  	return 0;
  }
  
@@ -404,6 +404,7 @@ index 497b1f4..a4a7acf 100644
 +		return dev_err_probe(dev->dev, ret, "Cannot read VE SoC ID\n");
 +
 +	dev->soc_id = soc_id & 0xffff;
++	dev_info(dev->dev, "VE SID: 0x%04x\n", dev->soc_id);
 +	dev->has_soc_id = true;
 +	return cedrus_set_rate(dev, dev->variant->mod_rate);
 +}
@@ -411,7 +412,7 @@ index 497b1f4..a4a7acf 100644
  void cedrus_engine_set_mode(struct cedrus_dev *dev, u32 mode)
  {
  	/* Override only DDR bits 17:16; preserve reconstruction and codec controls. */
-@@ -444,8 +647,9 @@
+@@ -444,8 +648,9 @@
  	if (!variant)
  		return -EINVAL;
  
@@ -422,7 +423,7 @@ index 497b1f4..a4a7acf 100644
  	if (ret)
  		return ret;
  
-@@ -516,12 +720,13 @@
+@@ -516,12 +721,13 @@
  		goto err_sram;
  	}
  
