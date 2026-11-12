@@ -1543,7 +1543,7 @@ diff --git a/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi b/arch/arm64/boot/dt
 @@ -338,6 +338,8 @@
  			resets = <&ccu RST_BUS_VE>;
  			interrupts = <GIC_SPI 93 IRQ_TYPE_LEVEL_HIGH>;
- 			allwinner,sram = <&ve_sram 1>;
+ 			allwinner,sram = <&ve_sram 1>, <&sram_c 1>;
 +			nvmem-cells = <&cpu_speed_grade>;
 +			nvmem-cell-names = "soc-id";
  		};

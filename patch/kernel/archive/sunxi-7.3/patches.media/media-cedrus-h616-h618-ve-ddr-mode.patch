@@ -14,10 +14,10 @@ index 603178d..51c0445 100644
 @@ -338,6 +338,8 @@
  			resets = <&ccu RST_BUS_VE>;
  			interrupts = <GIC_SPI 93 IRQ_TYPE_LEVEL_HIGH>;
- 			allwinner,sram = <&ve_sram 1>;
+ 			iommus = <&iommu 3>, <&iommu 2>;
+ 			allwinner,sram = <&ve_sram 1>, <&sram_c 1>;
 +			/* Select DDR field 2; preserve each codec's reconstruction mode. */
 +			allwinner,ve-ddr-mode = <2>;
- 			iommus = <&iommu 2>, <&iommu 3>;
  			nvmem-cells = <&cpu_speed_grade>;
  			nvmem-cell-names = "soc-id";
 diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.c b/drivers/staging/media/sunxi/cedrus/cedrus.c
