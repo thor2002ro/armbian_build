@@ -23,10 +23,7 @@ diff --git a/Documentation/devicetree/bindings/media/allwinner,sun4i-a10-video-e
 index 7b236bf..cf1167a 100644
 --- a/Documentation/devicetree/bindings/media/allwinner,sun4i-a10-video-engine.yaml
 +++ b/Documentation/devicetree/bindings/media/allwinner,sun4i-a10-video-engine.yaml
-@@ -66,6 +66,16 @@
-       H616 and H618 default to mode 2 when this property is absent.
-       This property does not configure SRAM routing or the external DRAM controller.
- 
+@@ -77,1 +77,11 @@
 +  allwinner,ve-clock-rate-map:
 +    $ref: /schemas/types.yaml#/definitions/uint32-array
 +    minItems: 3
@@ -38,8 +35,6 @@ index 7b236bf..cf1167a 100644
 +      Every row has three cells. Every rate must exist in operating-points-v2.
 +
    iommus:
-     minItems: 1
-     maxItems: 2
 @@ -82,6 +92,8 @@
        CMA pool to use for buffers allocation instead of the default
        CMA pool.
@@ -49,21 +44,15 @@ index 7b236bf..cf1167a 100644
    # FIXME: This should be made required eventually once every SoC will
    # have the MBUS declared.
    interconnects:
-@@ -103,11 +115,15 @@
-           minItems: 2
-           maxItems: 2
+@@ -137,2 +149,4 @@
        dependentRequired:
 +        allwinner,ve-clock-rate-map:
 +          [ operating-points-v2, nvmem-cells, nvmem-cell-names ]
          nvmem-cells: [ nvmem-cell-names ]
-         nvmem-cell-names: [ nvmem-cells ]
-     else:
-       properties:
+@@ -143,2 +157,4 @@
          allwinner,ve-ddr-mode: false
 +        allwinner,ve-clock-rate-map: false
 +        operating-points-v2: false
-         iommus:
-           maxItems: 1
          nvmem-cells: false
 diff --git a/include/dt-bindings/media/allwinner-cedrus.h b/include/dt-bindings/media/allwinner-cedrus.h
 new file mode 100644

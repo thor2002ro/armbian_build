@@ -1,52 +1,81 @@
 From: thor2002ro <thor2002ro@gmail.com>
-Subject: [PATCH] Local: media: cedrus: enable H616/H618 IOMMU buffers
+Subject: [PATCH] Local: media: cedrus: align H6 and H616 memory ports
 
-Use IOMMU-backed video buffers on H616 and H618.
-Preserve bypass for unassigned DMA masters.
+Use the upstream two-port IOMMU and two-SRAM binding contract.
+Keep the upstream H616 port order and SRAM claims.
 
 Signed-off-by: thor2002ro <thor2002ro@gmail.com>
 ---
 diff --git a/Documentation/devicetree/bindings/media/allwinner,sun4i-a10-video-engine.yaml b/Documentation/devicetree/bindings/media/allwinner,sun4i-a10-video-engine.yaml
 --- a/Documentation/devicetree/bindings/media/allwinner,sun4i-a10-video-engine.yaml
 +++ b/Documentation/devicetree/bindings/media/allwinner,sun4i-a10-video-engine.yaml
-@@ -57,7 +57,8 @@
-     description: Phandle to the device SRAM
+@@ -49,13 +49,20 @@
+   allwinner,sram:
+     $ref: /schemas/types.yaml#/definitions/phandle-array
++    minItems: 1
+     items:
+       - items:
+           - description: phandle to SRAM
+           - description: register value for device
+-    description: Phandle to the device SRAM
++      - items:
++          - description: phandle to SRAM alias
++          - description: register value for device
++    description: Phandle to the device SRAM(s)
  
    iommus:
 -    maxItems: 1
 +    minItems: 1
-+    maxItems: 2
++    items:
++      - description: VE port on IOMMU
++      - description: VE_R port on IOMMU
  
    nvmem-cells:
      maxItems: 1
-@@ -87,11 +88,17 @@
-         compatible:
-           const: allwinner,sun50i-h616-video-engine
-     then:
+@@ -83,4 +90,36 @@
+ allOf:
++  - if:
++      properties:
++        compatible:
++          contains:
++            enum:
++              - allwinner,sun50i-h6-video-engine
++              - allwinner,sun50i-h616-video-engine
++    then:
 +      properties:
 +        iommus:
 +          minItems: 2
-+          maxItems: 2
-       dependentRequired:
-         nvmem-cells: [ nvmem-cell-names ]
-         nvmem-cell-names: [ nvmem-cells ]
-     else:
-       properties:
++    else:
++      properties:
 +        iommus:
 +          maxItems: 1
-         nvmem-cells: false
-         nvmem-cell-names: false
- 
-diff --git a/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi b/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
---- a/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
-+++ b/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
-@@ -338,6 +338,7 @@
- 			resets = <&ccu RST_BUS_VE>;
- 			interrupts = <GIC_SPI 93 IRQ_TYPE_LEVEL_HIGH>;
- 			allwinner,sram = <&ve_sram 1>;
-+			iommus = <&iommu 2>, <&iommu 3>;
- 			nvmem-cells = <&cpu_speed_grade>;
- 			nvmem-cell-names = "soc-id";
- 		};
++
++  - if:
++      properties:
++        compatible:
++          contains:
++            enum:
++              - allwinner,sun50i-h6-video-engine
++              - allwinner,sun50i-h616-video-engine
++    then:
++      properties:
++        allwinner,sram:
++          minItems: 2
++    else:
++      properties:
++        allwinner,sram:
++          maxItems: 1
++
+   - if:
+       properties:
+         compatible:
+diff --git a/arch/arm64/boot/dts/allwinner/sun50i-h6.dtsi b/arch/arm64/boot/dts/allwinner/sun50i-h6.dtsi
+--- a/arch/arm64/boot/dts/allwinner/sun50i-h6.dtsi
++++ b/arch/arm64/boot/dts/allwinner/sun50i-h6.dtsi
+@@ -255,2 +255,2 @@
+-			allwinner,sram = <&ve_sram 1>;
+-			iommus = <&iommu 3>;
++			allwinner,sram = <&ve_sram 1>, <&de2_sram 1>;
++			iommus = <&iommu 3>, <&iommu 1>;
 -- 
 Armbian
